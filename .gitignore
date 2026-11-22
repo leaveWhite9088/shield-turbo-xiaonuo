@@ -1,0 +1,24 @@
+# 运行过程数据与本地草稿（不进版本库）
+runs/
+draft/
+.sessions/
+leaderboard/objective-cache/
+
+# Python 缓存与虚拟环境
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# 本地数据库与临时文件
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+*.log
+*.tmp

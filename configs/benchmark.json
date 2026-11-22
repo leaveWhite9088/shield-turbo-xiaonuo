@@ -1,0 +1,87 @@
+{
+  "name": "shield-turbo-xiaonuo",
+  "title": "疾风铁盾 · 性能压榨与安全加固基准",
+  "version": "xiaonuo-v1.0",
+  "description": "多租户实时风控决策与企业级合规文档检索网关（AegisGate）性能极限压榨与红队实弹安全加固同仓闭环评测基准",
+  "scoring": {
+    "weights": {
+      "A_performance": 30.0,
+      "B_conservation_efficiency": 15.0,
+      "C_redteam_security": 25.0,
+      "D_engineering_judgment": 30.0
+    },
+    "A_detail": {
+      "A1_batch_search_speedup_max": 12.0,
+      "A1_target_speedup": 30.0,
+      "A1_min_speedup": 1.05,
+      "A2_concurrency_throughput_max": 10.0,
+      "A2_rps_subweight": 5.0,
+      "A2_p95_subweight": 5.0,
+      "A2_target_rps_ratio": 18.0,
+      "A2_target_p95_ms": 15.0,
+      "A2_degraded_p95_ms": 220.0,
+      "A2_global_lock_serialization_penalty_ratio": 2.5,
+      "A2_global_lock_min_blocked_ms": 25.0,
+      "A3_resource_efficiency_max": 8.0,
+      "A3_query_reduction_subweight": 4.0,
+      "A3_memory_reduction_subweight": 4.0,
+      "A3_target_query_reduction": 0.90,
+      "A3_target_memory_reduction": 0.78
+    },
+    "B_detail": {
+      "B1_accuracy_max": 5.0,
+      "B2_time_max": 10.0,
+      "B2_full_score_minutes": 8.0,
+      "B2_half_life_minutes": 10.0,
+      "accuracy_penalty_exponent": 4.0,
+      "quality_cap_denominator": 55.0
+    },
+    "C_detail": {
+      "C1_injection_traversal_idor_cache_max": 9.0,
+      "C1_subweights": {
+        "sql_injection": 1.5,
+        "path_traversal": 1.5,
+        "secret_leakage": 1.5,
+        "idor_and_chinese_wall": 2.0,
+        "concurrent_revoke_cache_poison": 2.5
+      },
+      "C2_concurrency_toctou_replay_max": 8.0,
+      "C2_subweights": {
+        "quota_and_token_30way_toctou": 3.0,
+        "webhook_replay_and_concurrent_nonce": 2.5,
+        "batch_rollback_and_type_overflow": 2.5
+      },
+      "C3_asymmetric_dos_max": 8.0,
+      "C3_subweights": {
+        "redos_multi_variant_bomb": 2.0,
+        "deep_json_and_ast_bomb": 2.0,
+        "query_amplification_bomb": 1.5,
+        "cache_busting_flood_and_p95_shield": 2.5
+      },
+      "C3_bomb_reject_max_ms": 45.0,
+      "C3_normal_p95_max_ms": 60.0,
+      "C3_cache_bust_avg_max_ms": 18.0
+    },
+    "D_detail": {
+      "D1_max": 11.0,
+      "D2_max": 10.0,
+      "D3_max": 9.0,
+      "level5_mediocre_cap_total": 15.0
+    }
+  },
+  "workload": {
+    "seed": 20261122,
+    "b1_tenants": 3,
+    "b1_docs_per_tenant": 32,
+    "b1_tx_per_tenant": 100,
+    "perf_tenants": 4,
+    "perf_docs_per_tenant": 110,
+    "perf_tx_per_tenant": 900,
+    "perf_audit_rows_per_tenant": 1400,
+    "perf_search_queries": 12,
+    "perf_batch_eval_size": 40,
+    "perf_concurrent_threads": 12,
+    "perf_concurrent_ops_per_thread": 6,
+    "redteam_toctou_threads": 30
+  }
+}
