@@ -1,0 +1,66 @@
+{
+  "model": "gemini-4-hydrogen",
+  "model_inputs": [
+    "gemini-4-hydrogen"
+  ],
+  "finalized_at": "2026-11-22T23:06:52+08:00",
+  "scoring_hash": "f9e751edbab18c19cea4ca1c8ea9a153ca413a38ee67eda87ef966d774a7a790",
+  "blind_pack_ids": [
+    "502c5c8a0d42"
+  ],
+  "d_aggregate": "mean",
+  "summary": {
+    "runs_total": 1,
+    "runs_scored": 1,
+    "judge_reviews": 1,
+    "objective_cache_hits": 0,
+    "objective_recomputed": 1
+  },
+  "runs": [
+    {
+      "run": "gemini-4-hydrogen",
+      "pack_id": "502c5c8a0d42",
+      "case_id": "case-01",
+      "judge_count": 1,
+      "code_sha256": "cefb9c61b503",
+      "objective_cached": false,
+      "b2_reliable": true,
+      "speedup": 154.71,
+      "b1AccuracyPct": 100.0,
+      "endToEndMin": 6.02,
+      "A": 28.89,
+      "B": 13.64,
+      "C": 18.65,
+      "D": 26.4,
+      "total": 87.58,
+      "A1": 12.0,
+      "A2": 8.89,
+      "A3": 8.0,
+      "B1": 5.0,
+      "B2": 8.64,
+      "C1": 9.0,
+      "C2": 6.4,
+      "C3": 3.25,
+      "D1": 9.4,
+      "D2": 8.8,
+      "D3": 8.2
+    }
+  ],
+  "mean": {
+    "speedup": 154.71,
+    "endToEndMin": 6.02,
+    "A": 28.89,
+    "B": 13.64,
+    "C": 18.65,
+    "D": 26.4,
+    "total": 87.58,
+    "B1": 5.0,
+    "B2": 8.64,
+    "C1": 9.0,
+    "C2": 6.4,
+    "C3": 3.25,
+    "D1": 9.4,
+    "D2": 8.8,
+    "D3": 8.2
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "model": "gemini-4-neon",
+  "model_id": "gemini-4-neon",
+  "pack_id": "eabe064f60f8",
+  "created_at": "2026-11-22T22:35:27+08:00",
+  "cases": {
+    "case-01": {
+      "run": "gemini-4-neon",
+      "code_sha256": "5e7d8e99ec5654662170dfe1e00340ef87436e822eb17e0fdf46da7519b407f1",
+      "end_iso": "2026-11-22T22:35:27+08:00",
+      "diff_stats": {
+        "changed_files": 7,
+        "added_lines": 1782,
+        "deleted_lines": 673
+      }
+    }
+  }
+}

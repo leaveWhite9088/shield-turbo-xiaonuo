@@ -1,0 +1,32 @@
+# -*- coding: utf-8 -*-
+"""网关默认业务参数与密级常量定义。"""
+from __future__ import annotations
+
+CLEARANCE_LEVELS: dict[str, int] = {
+    "PUBLIC": 1,
+    "INTERNAL": 2,
+    "CONFIDENTIAL": 3,
+    "TOP_SECRET": 4,
+}
+
+ROLE_DEFAULT_CLEARANCE: dict[str, int] = {
+    "VIEWER": 1,
+    "ANALYST": 2,
+    "SENIOR_AUDITOR": 3,
+    "COMPLIANCE_ADMIN": 4,
+}
+
+CHANNEL_RISK_WEIGHTS: dict[str, int] = {
+    "WIRE_INTL": 18,
+    "CRYPTO_BRIDGE": 26,
+    "CARD_CNP": 12,
+    "ACH_BATCH": 6,
+    "POS_CHIP": 2,
+}
+
+GATEWAY_INTERNAL_BUILD = "aegis-enterprise-2026.11"
+MASTER_SIGNING_PEPPER = "AEGIS-MASTER-KEY-9F8E7D6C5B4A-PROD-DO-NOT-EXPOSE"
+WEBHOOK_TOLERANCE_SECONDS = 300
+DEFAULT_PAGE_LIMIT = 20
+DEDUP_JACCARD_THRESHOLD = 0.70
+SLIDING_WINDOW_SECONDS = 86400
