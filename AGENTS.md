@@ -13,7 +13,7 @@
 | 你的角色（信任域） | 怎么判断是你 | 你唯一允许读取的范围 | 你的核心标准动作 | 绝对禁止触碰的红线（违反即成绩作废） |
 | --- | --- | --- | --- | --- |
 | **① 选手域（被测模型）** | 用户对你说“你是被测模型，开始测试 / 完成这个基准任务”，或指定了参赛模型名 | **只读本文 `§0–§1`**；执行开局命令后，**全程只允许读写你专属沙盒 `runs/<你的模型名>/workspace/` 内的文件**（及填写 `runs/<你的模型名>/token_usage.json`） | 1. 运行 `tools/start_run.py` 开局打下 `t0` 并生成独立沙盒<br>2. 在沙盒内剖析 `aegis_app/`，完成深度性能优化与纵深安全加固<br>3. 跑通公开冒烟 `smoke_check.py`，确保正常业务 100% 零失真<br>4. 诚实填写 `EXPLANATION.md` 与 `token_usage.json`，运行 `judge_pack.py` 冻结 `t1` 生成匿名盲评包后收工 | **严禁继续往下读本文 `§2–§3`**；严禁读取、列出或搜索 `README.md`、`CHANGELOG.md`、`docs/`、`configs/`、`src/scoring/`、`src/baselines/`、`src/sandbox_template/`、`leaderboard/` 或他人 `runs/*`；严禁运行 `score_run.py`、`judge_submit.py`、`finalize.py`；严禁预生成或伪造 `评分.json` / `result.json` |
-| **② 评委 / 汇总域** | 用户交给你 `leaderboard/blind/<pack_id>/` 让你做 D 层盲评，或在盲评收齐后让你执行汇总出榜 | **只读本文 `§0` 与 `§2`**；**处于盲评阶段时，唯一合法输入仅限指定的 `leaderboard/blind/<pack_id>/` 目录** | 1. **盲评阶段**：先读包内 `OFFICIAL_LEVEL5_BASELINE.md`（官方 5 级平庸参照补丁）与 `RUBRIC.md`，再审阅 `code_changes.diff`、`EXPLANATION.md` 与 `code/`（逐条核验 C1–C5 声明），运行 `judge_submit.py` 追加 D1/D2/D3<br>2. **出榜阶段**（盲评全部提交后）：跑 `isolation_audit.py --strict`、`timing_audit.py runs --strict` 与 `leaderboard/finalize.py` 压测轰炸定稿并合成总榜 | **盲评期间**严禁访问 `runs/`、`leaderboard/blind-maps/`、`leaderboard/reviews.jsonl`、`leaderboard/scores.md`、`leaderboard/verdicts/` 或运行压测脚本打探客观分；全程严禁替选手修改沙盒代码 |
+| **② 评委 / 汇总域** | 用户交给你 `leaderboard/blind/<pack_id>/` 让你做 D 层盲评，或在盲评收齐后让你执行汇总出榜 | **只读本文 `§0` 与 `§2`**；**处于盲评阶段时，唯一合法输入仅限指定的 `leaderboard/blind/<pack_id>/` 目录** | 1. **盲评阶段**：先读包内 `OFFICIAL_LEVEL5_BASELINE.md` 与 `RUBRIC.md`，锚定**三档硬封顶（5 级平庸 `≤ 15.0/30`、有局部耦合或边界漏防的 7 级良好 `≤ 22.0/30`、无死角大师 `25.5–30.0/30`）**，再审阅 `code_changes.diff`、`EXPLANATION.md` 与 `code/`（逐条核验 C1–C5 声明），运行 `judge_submit.py` 追加 D1/D2/D3<br>2. **出榜阶段**（盲评全部提交后）：跑 `isolation_audit.py --strict`、`timing_audit.py runs --strict` 与 `leaderboard/finalize.py` 压测轰炸定稿并合成总榜 | **盲评期间**严禁访问 `runs/`、`leaderboard/blind-maps/`、`leaderboard/reviews.jsonl`、`leaderboard/scores.md`、`leaderboard/verdicts/` 或运行压测脚本打探客观分；全程严禁替选手修改沙盒代码 |
 
 ### 通用目录卫生纪律（两角色共同遵守）
 - 除各自角色的规定产物路径外，**不得在仓库根目录或其他目录新建、修改文件或残留调试产物**。
@@ -88,9 +88,12 @@ python src/scoring/judge_pack.py --model <你的模型名>
 - **唯一合法输入**：用户指定的匿名盲评包路径 `leaderboard/blind/<pack_id>/`。
 - **盲评期间绝对禁区**：严禁读取 `leaderboard/blind-maps/`、`leaderboard/reviews.jsonl`、`leaderboard/scores.md`、`leaderboard/verdicts/`、`runs/`、`src/`、`docs/` 或 `configs/`；严禁运行压测或红队脚本。
 - **四步盲评动作**：
-  1. 先阅读包内 [`OFFICIAL_LEVEL5_BASELINE.md`](leaderboard/blind/README.md)（《官方 5 级平庸参照补丁样本》）与 `RUBRIC.md`，锚定 **5 级平庸封顶硬锁（未明显超越该平庸样本的作品 D 层总分强制 `≤ 15.0 / 30`）**；
+  1. 先阅读包内 [`OFFICIAL_LEVEL5_BASELINE.md`](leaderboard/blind/README.md)（《官方 5 级平庸参照补丁样本》）与 `RUBRIC.md`，严格执行 **D 层三档硬封顶铁律（严禁高分粘连与端水人情分）**：
+     - **5 级平庸硬封顶（`D ≤ 15.0 / 30`，即 `D1 ≤ 5.5, D2 ≤ 5.0, D3 ≤ 4.5`）**：未明显超越官方 5 级平庸样本（如使用全局粗暴大锁、未消 $O(N^2)$、无权限/版本失效隔离缓存、依赖脆弱字符串替换防穿越或无视复杂度炸弹）；
+     - **7 级良好硬封顶（`D ≤ 22.0 / 30`，即 `D1 ≤ 8.2, D2 ≤ 7.5, D3 ≤ 6.3`）**：虽实现了主要降维与细粒度锁，但**存在任何一处局部耦合、算法未彻底降维或边界漏防**——例如：① 缓存失效粒度过粗（如修改单条 ACL 规则却连带清空整租户预分词文档倒排索引）；② 去重未做集合大小下界剪枝，或滑窗逐笔 `list.insert` 未做单调序列 $O(1)$ 队列优化；③ 自定义正则安全校验漏拦多无界通配符（`.*a.*b.*`）或超大花括号重复次数，或评估时未缓存编译后正则；④ 规则树未限制单节点扇出子节点数 / `IN` 列表长度，或检索未显式拦截纯通配符洪水；⑤ 未拦截布尔值伪装整数（`isinstance(x, bool)`）、超 64 位整数溢出或 `NaN`/`Infinity`；**凡命中上述任一局部缺口，严禁跨入大师档，D 层总分强制 `≤ 22.0 / 30`**！
+     - **9 级大师档准入（`25.5–30.0 / 30`）**：仅限在算法降维、四维独立 Epoch+CAS 缓存、细粒度锁、全变体抗 DoS/类型溢出边界上**零死角闭环**且 `EXPLANATION.md` 的 C1–C5 声明与代码 100% 严丝合缝的作品；
   2. 阅读各 `case-XX/` 下的 `OVERVIEW.md`、`code_changes.diff`、`EXPLANATION.md` 与 `code/`；
-  3. 逐条核查 `EXPLANATION.md` 第 4 节的 **5 条声明（C1–C5）** 在 `code_changes.diff` 和 `code/` 中是否真实落地；
+  3. 逐条核查 `EXPLANATION.md` 第 4 节的 **5 条声明（C1–C5）** 在 `code_changes.diff` 和 `code/` 中是否真实落地（任何一条存在夸大或实现偏差，D3 必须联动扣分并触发良好档封顶）；
   4. 按包内 `SUBMIT.md` 运行追加提交命令（支持同一 `--judge-id` 附加 `--update` 随时重评覆盖，汇总时实时取最新一条生效）：
 
 ```sh
