@@ -44,13 +44,13 @@ class TestScoringAndIsolationUnits(unittest.TestCase):
         sc_damaged = metrics.compute_objective_scores(
             b1_report={"total_checks": 50, "passed_checks": 25},  # acc = 0.5 -> 0.5^4 = 0.0625
             perf_report={
-                "a1_speedup_ratio": 50.0,
-                "a2_rps_ratio": 30.0,
+                "a1_speedup_ratio": 200.0,
+                "a2_rps_ratio": 200.0,
                 "a2_concurrent_read_p95_ms": 2.0,
                 "a2_probe_read_p80_ms": 2.0,
                 "a2_cross_tenant_block_ratio": 1.1,
                 "a2_error_rate": 0.0,
-                "a3_sql_reduction_ratio": 0.98,
+                "a3_sql_reduction_ratio": 0.99,
                 "a3_mem_reduction_ratio": 0.95,
             },
             redteam_report={"C1_score": 9.0, "C2_score": 8.0, "C3_score": 8.0},

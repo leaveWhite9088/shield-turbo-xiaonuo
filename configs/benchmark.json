@@ -12,12 +12,12 @@
     },
     "A_detail": {
       "A1_batch_search_speedup_max": 12.0,
-      "A1_target_speedup": 30.0,
+      "A1_target_speedup": 150.0,
       "A1_min_speedup": 1.05,
       "A2_concurrency_throughput_max": 10.0,
       "A2_rps_subweight": 5.0,
       "A2_p95_subweight": 5.0,
-      "A2_target_rps_ratio": 18.0,
+      "A2_target_rps_ratio": 150.0,
       "A2_target_p95_ms": 15.0,
       "A2_degraded_p95_ms": 220.0,
       "A2_global_lock_serialization_penalty_ratio": 2.5,
@@ -25,8 +25,8 @@
       "A3_resource_efficiency_max": 8.0,
       "A3_query_reduction_subweight": 4.0,
       "A3_memory_reduction_subweight": 4.0,
-      "A3_target_query_reduction": 0.90,
-      "A3_target_memory_reduction": 0.78
+      "A3_target_query_reduction": 0.985,
+      "A3_target_memory_reduction": 0.88
     },
     "B_detail": {
       "B1_accuracy_max": 5.0,
@@ -66,7 +66,8 @@
       "D1_max": 11.0,
       "D2_max": 10.0,
       "D3_max": 9.0,
-      "level5_mediocre_cap_total": 15.0
+      "level5_mediocre_cap_total": 15.0,
+      "level7_flawed_good_cap_total": 22.0
     }
   },
   "workload": {

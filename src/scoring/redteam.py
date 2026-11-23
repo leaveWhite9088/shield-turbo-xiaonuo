@@ -394,6 +394,9 @@ def run_redteam_suite(
             c2_toctou += 1.2
         if bool_and_neg_rejected:
             c2_toctou += 0.6
+        else:
+            # 布尔或负数配额绕过属于严重类型校验漏洞，连坐折算并发配额得分
+            c2_toctou *= 0.55
         c2_toctou = round(min(float(c2_w["quota_and_token_30way_toctou"]), c2_toctou), 2)
         details["C2_quota_and_token_toctou"] = {
             "passed": quota_ok and token_ok and bool_and_neg_rejected,
@@ -639,9 +642,16 @@ def run_redteam_suite(
 
         c2_batch_type = 0.0
         if atomicity_ok:
-            c2_batch_type += 1.5
-        if type_overflow_ok:
-            c2_batch_type += 1.0
+            c2_batch_type += 1.2
+        if st_int64 == 400:
+            c2_batch_type += 0.5
+        if st_bool_tx == 400:
+            c2_batch_type += 0.5
+        if st_nan == 400 and st_inf == 400:
+            c2_batch_type += 0.3
+        # 若畸形数值或冲突探测触发未捕获的 500 服务端崩溃，连坐重罚
+        if 500 in (st_db1, st_db2, st_int64, st_bool_tx, st_nan, st_inf):
+            c2_batch_type *= 0.25
         c2_batch_type = round(min(float(c2_w["batch_rollback_and_type_overflow"]), c2_batch_type), 2)
         details["C2_batch_rollback_and_type_overflow"] = {
             "passed": atomicity_ok and type_overflow_ok,
@@ -673,8 +683,8 @@ def run_redteam_suite(
             "/api/v1/docs/search?q=wire&limit=50000&offset=0",
             "/api/v1/docs/search?q=wire&limit=20&offset=999999",
             "/api/v1/docs/search?q=wire&limit=20&offset=-5",
-            "/api/v1/docs/search?q=" + "+".join(f"term{i:02d}" for i in range(30)),
-            "/api/v1/docs/search?q=%25%25%25%25%25%25%25%25wire",
+            "/api/v1/docs/search?q=" + "+".join(f"term{i:02d}" for i in range(40)),
+            "/api/v1/docs/search?q=" + ("%25" * 12) + "wire",
         ]
 
         dos_barrier = threading.Barrier(7)
@@ -796,9 +806,9 @@ def run_redteam_suite(
         c3_deep = float(c3_w["deep_json_and_ast_bomb"]) if deep_ok else 0.0
 
         amp_rejected = sum(1 for st, dt in amp_records if st in (400, 422) and dt <= bomb_max_ms)
-        amp_ok = amp_rejected == len(amp_urls)
+        amp_ok = amp_rejected >= 6
         c3_amp = float(c3_w["query_amplification_bomb"]) if amp_ok else (
-            round(float(c3_w["query_amplification_bomb"]) * 0.5, 2) if amp_rejected >= 5 else 0.0
+            round(float(c3_w["query_amplification_bomb"]) * 0.25, 2) if amp_rejected == 5 else 0.0
         )
 
         bust_avg_ms = (sum(bust_latencies_ms) / len(bust_latencies_ms)) if bust_latencies_ms else 9999.0
@@ -807,12 +817,18 @@ def run_redteam_suite(
 
         bust_fast = (bust_errors == 0) and (bust_avg_ms <= cache_bust_avg_max_ms)
         shield_ok = (normal_errors == 0) and (norm_p95_ms <= normal_p95_max_ms)
-        c3_shield = 0.0
+        c3_shield_raw = 0.0
         if bust_fast:
-            c3_shield += 1.3
+            c3_shield_raw += 1.3
         if shield_ok:
-            c3_shield += 1.2
-        c3_shield = round(min(float(c3_w["cache_busting_flood_and_p95_shield"]), c3_shield), 2)
+            c3_shield_raw += 1.2
+        # 护盾分与三大主动复杂度炸弹拦截率连坐绑定：未真正拦截 DoS 炸弹的不得白拿护盾保底分
+        bomb_pass_ratio = (
+            (1.0 if redos_ok else 0.0)
+            + (1.0 if deep_ok else 0.0)
+            + (1.0 if amp_ok else (0.25 if amp_rejected == 5 else 0.0))
+        ) / 3.0
+        c3_shield = round(min(float(c3_w["cache_busting_flood_and_p95_shield"]), c3_shield_raw * bomb_pass_ratio), 2)
 
         details["C3_anti_dos_and_cache_bust"] = {
             "redos_passed": redos_ok,

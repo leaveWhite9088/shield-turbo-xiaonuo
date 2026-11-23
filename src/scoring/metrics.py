@@ -174,7 +174,7 @@ def compute_objective_scores(
     c3_final = round(c3_raw * avail_gate, 2)
     c_total = round(c1_final + c2_final + c3_final, 2)
 
-    # 4. B2 端到端优化耗时（受 (A + C) / 55 质量得分率封顶与 B1^4 守恒封顶双重约束）
+    # 4. B2 端到端优化耗时（受 (A + C) / 55 质量得分率、(C / 25)^2 安全完整度因子与 B1^4 守恒封顶三重约束）
     e2e_min = max(0.0, float(e2e_seconds) / 60.0)
     b2_unbounded = score_b2_wall_clock(
         e2e_min,
@@ -183,7 +183,13 @@ def compute_objective_scores(
         half_life_minutes=float(b_cfg["B2_half_life_minutes"]),
     )
     qual_denom = float(b_cfg.get("quality_cap_denominator", 55.0))
-    b2_quality_cap = float(b_cfg["B2_time_max"]) * min(1.0, (a_total + c_total) / max(1e-6, qual_denom))
+    c_max = float(sc_cfg.get("weights", {}).get("C_redteam_security", 25.0))
+    security_integrity_factor = min(1.0, max(0.0, c_total / max(1e-6, c_max))) ** 2
+    b2_quality_cap = (
+        float(b_cfg["B2_time_max"])
+        * min(1.0, (a_total + c_total) / max(1e-6, qual_denom))
+        * security_integrity_factor
+    )
     b2_final = round(min(b2_unbounded, b2_quality_cap) * conservation_factor, 2)
 
     b_total = round(b1_score + b2_final, 2)
