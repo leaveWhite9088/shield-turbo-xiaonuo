@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""客观分（A/B/C）双指纹防篡改缓存与核验（对齐 silicon-rider-xiaonuo）。
+"""客观分（A/B/C）双指纹防篡改缓存与核验（xiaonuo-v2.0）。
 
 核心职责：
 1. 计算两项独立 SHA-256 指纹：
-   - scoring_hash：评分配置（configs/benchmark.json）、初始模板与客观压测/红队脚本的整体哈希；
+   - scoring_hash：评分配置（configs/benchmark.json）、16 模块初始模板与客观压测/红队脚本的整体哈希；
    - deliverables_hash：单局冻结交付物（protocol.json 关键承诺 + 冻结沙盒源码 code_sha256）的整体哈希。
 2. 生成与核验定稿客观分记录（绑定两项指纹的 attestation 防伪签名），
    确保客观分与盲评分物理分离存储，绝不混入任何 D 层盲评字段。
@@ -18,8 +18,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 
-CACHE_SCHEMA_VERSION = 1
-SECRET_ATTESTATION_TAG = "shield-turbo-xiaonuo-v1-objective-seal"
+CACHE_SCHEMA_VERSION = 2
+SECRET_ATTESTATION_TAG = "shield-turbo-xiaonuo-v2-objective-seal"
 
 SCORING_TRACKED_FILES = (
     "configs/benchmark.json",
@@ -28,12 +28,22 @@ SCORING_TRACKED_FILES = (
     "src/scoring/redteam.py",
     "src/scoring/score_run.py",
     "src/scoring/objective_cache.py",
+    "src/sandbox_template/aegis_app/__init__.py",
     "src/sandbox_template/aegis_app/config.py",
     "src/sandbox_template/aegis_app/db.py",
+    "src/sandbox_template/aegis_app/legacy_compat.py",
+    "src/sandbox_template/aegis_app/delegation.py",
+    "src/sandbox_template/aegis_app/acl_wall.py",
     "src/sandbox_template/aegis_app/auth.py",
-    "src/sandbox_template/aegis_app/rule_engine.py",
+    "src/sandbox_template/aegis_app/doc_indexer.py",
+    "src/sandbox_template/aegis_app/doc_writer.py",
     "src/sandbox_template/aegis_app/search_service.py",
+    "src/sandbox_template/aegis_app/contagion_graph.py",
+    "src/sandbox_template/aegis_app/window_stats.py",
+    "src/sandbox_template/aegis_app/rule_engine.py",
+    "src/sandbox_template/aegis_app/ledger_ops.py",
     "src/sandbox_template/aegis_app/audit_export.py",
+    "src/sandbox_template/aegis_app/middleware.py",
     "src/sandbox_template/aegis_app/server.py",
 )
 

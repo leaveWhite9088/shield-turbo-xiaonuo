@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""计分公式、防篡改双指纹缓存、盲评随时重评与隔离审计单元测试。"""
+"""计分公式（xiaonuo-v2.0）、常驻堆内存预算、防篡改双指纹缓存、盲评重评与隔离审计单元测试。"""
 from __future__ import annotations
 
 import json
@@ -33,49 +33,59 @@ class TestScoringAndIsolationUnits(unittest.TestCase):
         with self.assertRaises(ValueError):
             sanitize_run_name("../evil")
 
-    def test_log_speedup_curve_and_conservation_cap(self) -> None:
-        # 提速 1 倍得 0 分，提速 3 倍仅约 3.76 分，提速 30+ 倍满分 12 分
-        self.assertEqual(metrics.score_log_speedup(1.0, 12.0, 30.0, 1.05), 0.0)
-        s3 = metrics.score_log_speedup(3.0, 12.0, 30.0, 1.05)
-        self.assertTrue(3.0 <= s3 <= 4.5, f"Unexpected 3x score: {s3}")
-        self.assertEqual(metrics.score_log_speedup(35.0, 12.0, 30.0, 1.05), 12.0)
+    def test_piecewise_speedup_heap_budget_and_conservation_cap(self) -> None:
+        self.assertEqual(metrics.score_piecewise_log_speedup(1.0, 12.0, 200.0, knee_ratio=60.0, knee_score=9.0), 0.0)
+        self.assertAlmostEqual(
+            metrics.score_piecewise_log_speedup(60.0, 12.0, 200.0, knee_ratio=60.0, knee_score=9.0),
+            9.0,
+            places=2,
+        )
+        self.assertEqual(metrics.score_piecewise_log_speedup(220.0, 12.0, 200.0, knee_ratio=60.0, knee_score=9.0), 12.0)
 
-        # 验证 B1 < 100% 时的 B1_acc ** 4 毁灭性封顶
+        # 常驻堆内存预算：<= 6MB 满分 2.0，>= 24MB 得 0 分
+        self.assertEqual(metrics.score_heap_budget(2.5, 2.0, 6.0, 24.0), 2.0)
+        self.assertAlmostEqual(metrics.score_heap_budget(15.0, 2.0, 6.0, 24.0), 1.0, places=2)
+        self.assertEqual(metrics.score_heap_budget(30.0, 2.0, 6.0, 24.0), 0.0)
+
+        # 验证 B1 < 100% 时的 B1_acc ** 5 毁灭性封顶（0.5^5 = 0.03125）
         sc_damaged = metrics.compute_objective_scores(
-            b1_report={"total_checks": 50, "passed_checks": 25},  # acc = 0.5 -> 0.5^4 = 0.0625
+            b1_report={"total_checks": 80, "passed_checks": 40},
             perf_report={
-                "a1_speedup_ratio": 200.0,
+                "a1_speedup_ratio": 250.0,
                 "a2_rps_ratio": 200.0,
                 "a2_concurrent_read_p95_ms": 2.0,
+                "a2_concurrent_read_p99_ms": 4.0,
                 "a2_probe_read_p80_ms": 2.0,
                 "a2_cross_tenant_block_ratio": 1.1,
                 "a2_error_rate": 0.0,
                 "a3_sql_reduction_ratio": 0.99,
                 "a3_mem_reduction_ratio": 0.95,
+                "a3_resident_heap_mb": 1.5,
             },
             redteam_report={"C1_score": 9.0, "C2_score": 8.0, "C3_score": 8.0},
             e2e_seconds=180.0,
             cfg=self.cfg,
         )
-        self.assertAlmostEqual(sc_damaged["A_performance"], round(30.0 * (0.5 ** 4), 2), places=1)
-        self.assertLess(sc_damaged["B_detail"]["B2_time10"], 1.0)
+        self.assertAlmostEqual(sc_damaged["A_performance"], round(30.0 * (0.5 ** 5), 2), places=1)
+        self.assertLess(sc_damaged["B_detail"]["B2_time10"], 0.5)
 
     def test_b2_wall_clock_decay_and_white_paper_cap(self) -> None:
-        self.assertAlmostEqual(metrics.score_b2_wall_clock(7.5, 10.0, 8.0, 10.0), 10.0)
-        self.assertAlmostEqual(metrics.score_b2_wall_clock(18.0, 10.0, 8.0, 10.0), 5.0)
+        self.assertAlmostEqual(metrics.score_b2_wall_clock(5.5, 10.0, 6.0, 8.0), 10.0)
+        self.assertAlmostEqual(metrics.score_b2_wall_clock(14.0, 10.0, 6.0, 8.0), 5.0)
 
-        # 交白卷秒退（A=0, C=1）：B2 必须被 (A+C)/55 封顶压在极低分
         sc_lazy = metrics.compute_objective_scores(
-            b1_report={"total_checks": 58, "passed_checks": 58},
+            b1_report={"total_checks": 80, "passed_checks": 80},
             perf_report={
                 "a1_speedup_ratio": 1.0,
                 "a2_rps_ratio": 1.0,
                 "a2_concurrent_read_p95_ms": 500.0,
+                "a2_concurrent_read_p99_ms": 600.0,
                 "a2_probe_read_p80_ms": 120.0,
                 "a2_cross_tenant_block_ratio": 8.0,
                 "a2_error_rate": 0.0,
                 "a3_sql_reduction_ratio": 0.0,
                 "a3_mem_reduction_ratio": 0.0,
+                "a3_resident_heap_mb": 0.5,
             },
             redteam_report={"C1_score": 0.0, "C2_score": 1.0, "C3_score": 0.0},
             e2e_seconds=5.0,
@@ -95,14 +105,13 @@ class TestScoringAndIsolationUnits(unittest.TestCase):
                     "judge_model": "judge-alpha",
                     "pack_id": "aabbccddeeff",
                     "case_id": "case-01",
-                    "D1": 5.0,
+                    "D1": 4.8,
                     "D2": 4.5,
                     "D3": 4.0,
                     "evidence": "initial review evidence",
                     "note": "mediocre lock",
                 },
             )
-            # 同一评委重评更新
             _, prior = review_log.append_review(
                 log_file,
                 {
@@ -141,41 +150,39 @@ class TestScoringAndIsolationUnits(unittest.TestCase):
         }
         sealed = objective_cache.build_objective_record(
             raw,
-            run_summary={"speedupRatio": 40.0},
+            run_summary={"speedupRatio": 90.0},
             code_sha256="abc123def456",
             t0_source="process",
             b2_reliable=True,
-            scoring_hash="shash_001",
-            deliverables_hash="dhash_001",
+            scoring_hash="shash_002",
+            deliverables_hash="dhash_002",
         )
         ok, reason = objective_cache.verify_objective_cache(
             sealed,
             expected_code_sha256="abc123def456",
-            scoring_hash="shash_001",
-            deliverables_hash="dhash_001",
+            scoring_hash="shash_002",
+            deliverables_hash="dhash_002",
         )
         self.assertTrue(ok, reason)
 
-        # 篡改客观分数值 -> 立即被防伪签名识破
         tampered = dict(sealed)
         tampered["A_performance"] = 30.0
         ok2, reason2 = objective_cache.verify_objective_cache(
             tampered,
             expected_code_sha256="abc123def456",
-            scoring_hash="shash_001",
-            deliverables_hash="dhash_001",
+            scoring_hash="shash_002",
+            deliverables_hash="dhash_002",
         )
         self.assertFalse(ok2)
         self.assertEqual(reason2, "tampered")
 
-        # 混入盲评字段 -> 立即拒绝
         contaminated = dict(sealed)
         contaminated["D"] = 28.0
         ok3, reason3 = objective_cache.verify_objective_cache(
             contaminated,
             expected_code_sha256="abc123def456",
-            scoring_hash="shash_001",
-            deliverables_hash="dhash_001",
+            scoring_hash="shash_002",
+            deliverables_hash="dhash_002",
         )
         self.assertFalse(ok3)
         self.assertEqual(reason3, "contains_blind_fields")

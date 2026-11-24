@@ -1,14 +1,27 @@
 # -*- coding: utf-8 -*-
-"""C1 / C2 / C3 实战深水区红队攻击引擎（15 大复合攻击向量 + 四大性能—安全两难狙击）。
+"""C1 / C2 / C3 地狱级实战红队攻击引擎（xiaonuo-v2.0 十八路复合攻击向量 + 五大两难狙击）。
 
 核心考核面：
-- C1（9 分）：多参数 SQL 盲注、多编码/空字节路径穿越、诊断/异常密钥泄露、横向/纵向越权 + Chinese Wall 利益冲突隔离墙双路穿透（含共享缓存串味）、高并发“撤权/隔离 vs 慢读回填”缓存毒化竞态；
-- C2（8 分）：30 路屏障齐射配额/单次令牌 TOCTOU + 负数/布尔伪装整数刷配额、12 路并发同 Nonce 齐射重放 Webhook、部分失败批次的数据库/内存滑动窗口双原子回滚验证、SQLite 64 位大整数溢出与 NaN/Infinity 类型混淆炸服；
-- C3（8 分）：多变体 ReDoS（嵌套量词 + 重叠交替分支 + 多通配链）、1400 层原始 JSON 炸弹 + 深层/宽扇出规则树、SQLite LIMIT -1 慢查询放大、以及 100% 穿透查询结果缓存的随机合法查询洪泛 + 并发正常租户 P95 护盾。
+- C1（9 分）：
+  1) 一阶多参数 SQL 盲注 + 跨模块二阶持久化 SQL 注入（report-template -> render-report）；
+  2) 双重 URL 编码、嵌套折叠、反斜杠与空字节路径穿越；
+  3) 诊断/异常密钥预言机 + Python .format() 属性反射窃取进程内主密钥（{env.master_pepper}）；
+  4) 横向/纵向越权 + 三级利益冲突隔离墙（最近组织节点优先级覆盖 + 个人显式豁免覆盖 + 同密级共享缓存串味）；
+  5) 借调委托时间窗越界绕过 + “委托人角色被撤回”级联失效绕过（含已缓存检索结果残留检查）+ 12 路并发“撤权 vs 慢读回填”缓存毒化竞态；
+- C2（8 分）：
+  1) 30 路屏障齐射配额/单次令牌 TOCTOU + 负数/布尔伪装整数刷配额；
+  2) 24 路高并发双向跨池配额调拨（RESERVE_BUFFER_POOL <-> REALTIME_ALERT_POOL）AB-BA 死锁/锁升级超时探测与总额守恒校验；
+  3) 12 路并发同 Nonce 齐射重放 Webhook + 伪造签名 + 滞后/超前时间窗；
+  4) 部分失败批次强原子回滚（同时校验数据库、滑动窗口统计量与三跳制裁传染图零残留）+ 超 64 位整数溢出与 NaN/Infinity 类型混淆炸服；
+- C3（8 分）：
+  1) 多变体 ReDoS（嵌套量词 + 重叠分支 + 多段通配链 + 花括号超大有界量词炸弹）；
+  2) 1400 层原始 JSON 栈溢出炸弹 + 1150 层深层规则树 + 宽扇出膨胀树 + 超长 IN 列表炸弹；
+  3) SQLite LIMIT -1 慢查询放大、超界分页与纯通配符洪水；
+  4) 穿插实时文档 Upsert 的 32 路 100% 缓存穿透随机查询洪泛 + 并发正常租户 P95 护盾。
 """
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import hashlib
 import hmac
 import json
@@ -51,9 +64,10 @@ def run_redteam_suite(
     c2_w = c_cfg["C2_subweights"]
     c3_w = c_cfg["C3_subweights"]
     bomb_max_ms = float(c_cfg.get("C3_bomb_reject_max_ms", 45.0))
-    normal_p95_max_ms = float(c_cfg.get("C3_normal_p95_max_ms", 60.0))
-    cache_bust_avg_max_ms = float(c_cfg.get("C3_cache_bust_avg_max_ms", 18.0))
+    normal_p95_max_ms = float(c_cfg.get("C3_normal_p95_max_ms", 55.0))
+    cache_bust_avg_max_ms = float(c_cfg.get("C3_cache_bust_avg_max_ms", 16.0))
     toctou_threads = int(cfg["workload"].get("redteam_toctou_threads", 30))
+    transfer_threads = int(cfg["workload"].get("redteam_transfer_threads", 24))
 
     tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="st_redteam_"))
     try:
@@ -66,7 +80,7 @@ def run_redteam_suite(
             storage_dir,
             seed=int(cfg["workload"]["seed"]) + 404,
             num_tenants=2,
-            docs_per_tenant=48,
+            docs_per_tenant=50,
             tx_per_tenant=80,
             audit_rows_per_tenant=60,
         )
@@ -87,16 +101,18 @@ def run_redteam_suite(
         ]
 
         h_alpha_admin = _headers("tenant_alpha", t_alpha["users"]["admin"])
+        h_alpha_auditor = _headers("tenant_alpha", t_alpha["users"]["auditor"])
         h_alpha_analyst = _headers("tenant_alpha", t_alpha["users"]["analyst"])
+        h_alpha_specialist = _headers("tenant_alpha", t_alpha["users"]["specialist"])
         h_alpha_researcher = _headers("tenant_alpha", t_alpha["users"]["researcher"])
         h_alpha_viewer = _headers("tenant_alpha", t_alpha["users"]["viewer"])
         h_bravo_admin = _headers("tenant_bravo", t_bravo["users"]["admin"])
 
         details: dict[str, Any] = {}
 
-        # ==================== 波次一：C1 边界防御、Chinese Wall 与并发缓存毒化 ====================
+        # ==================== 波次一：C1 一/二阶注入、反射窃密、三级隔离墙与级联委托毒化 ====================
 
-        # C1.1 多向量 SQL 注入
+        # C1.1 一阶多参数 SQL 盲注 + 跨模块二阶持久化报表模板 SQL 注入
         st_legit, _, _ = gw.request(
             "GET",
             "/api/v1/docs/search?q=wire&tag_filter=tag_aml_1&sort_by=score&sort_dir=desc&limit=10",
@@ -122,11 +138,60 @@ def run_redteam_suite(
             "/api/v1/audit/export-digest?severity=HIGH'+OR+'1'='1",
             headers=h_alpha_admin,
         )
-        sqli_1_ok = (sqli_1_st == 400) or (sqli_1_st == 200 and int(sqli_1_body.get("returned_count", 99)) == 0)
-        sqli_4_ok = (sqli_4_st == 400) or (sqli_4_st == 200 and int(sqli_4_body.get("total_records", 99)) == 0)
-        sqli_ok = st_legit == 200 and sqli_1_ok and sqli_2_st == 400 and sqli_3_st == 400 and sqli_4_ok
-        c1_sqli = float(c1_w["sql_injection"]) if sqli_ok else 0.0
-        details["C1_sql_injection"] = {"passed": sqli_ok, "score": c1_sqli}
+        first_order_sqli_ok = (
+            st_legit == 200
+            and ((sqli_1_st == 400) or (sqli_1_st == 200 and int(sqli_1_body.get("returned_count", 99)) == 0))
+            and sqli_2_st == 400
+            and sqli_3_st == 400
+            and ((sqli_4_st == 400) or (sqli_4_st == 200 and int(sqli_4_body.get("total_records", 99)) == 0))
+        )
+
+        # 二阶 SQL 注入：通过 report-template 写入恶意 extra_event_filter（UNION 读取 system_secrets 或跨租户 OR 1=1），再触发 render-report！
+        second_sqli_payloads = [
+            "RISK_EVAL' OR tenant_id='tenant_bravo' OR '1'='1",
+            "NONE' UNION SELECT 999999,'tenant_alpha','x',secret_value,'CRITICAL',999,secret_key,1760000000,'{}' FROM system_secrets--",
+        ]
+        second_sqli_blocked = 0
+        for s_idx, s_flt in enumerate(second_sqli_payloads):
+            tpl_name = f"tpl_sqli_2nd_{s_idx}"
+            st_put, _, _ = gw.request(
+                "PUT",
+                "/api/v1/audit/report-template",
+                headers=h_alpha_auditor,
+                body={
+                    "template_id": tpl_name,
+                    "title_format": "[{tenant_id}] Report ({total_records})",
+                    "extra_event_filter": s_flt,
+                    "sample_limit": 20,
+                },
+            )
+            if st_put == 400:
+                second_sqli_blocked += 1
+            elif st_put == 200:
+                st_ren, _, ren_body = gw.request(
+                    "GET",
+                    f"/api/v1/audit/render-report?template_id={tpl_name}",
+                    headers=h_alpha_auditor,
+                )
+                ren_total = int((ren_body.get("digest") or {}).get("total_records", 999))
+                if (
+                    (st_ren == 400 or (st_ren == 200 and ren_total == 0))
+                    and not _contains_any_secret(ren_body, forbidden_markers)
+                ):
+                    second_sqli_blocked += 1
+
+        second_order_sqli_ok = second_sqli_blocked == len(second_sqli_payloads)
+        c1_sqli = 0.0
+        if first_order_sqli_ok and second_order_sqli_ok:
+            c1_sqli = float(c1_w["sql_injection_first_and_second_order"])
+        elif first_order_sqli_ok:
+            c1_sqli = round(float(c1_w["sql_injection_first_and_second_order"]) * 0.4, 2)
+        details["C1_sql_injection_first_and_second_order"] = {
+            "passed": first_order_sqli_ok and second_order_sqli_ok,
+            "first_order_ok": first_order_sqli_ok,
+            "second_order_ok": second_order_sqli_ok,
+            "score": c1_sqli,
+        }
 
         # C1.2 多编码、反斜杠与空字节路径穿越
         st_snap_ok, _, _ = gw.request(
@@ -160,46 +225,98 @@ def run_redteam_suite(
             "score": c1_trav,
         }
 
-        # C1.3 敏感密钥与错误回显预言机探测
+        # C1.3 诊断/异常回显预言机 + Python .format() 模板对象属性反射主密钥泄露（{env.master_pepper}）
         _, _, h_dbg = gw.request("GET", "/api/v1/health?debug=1")
         st_diag, _, diag_body = gw.request("GET", "/api/v1/internal/diagnostics", headers=h_alpha_analyst)
         _, _, err_b1 = gw.request("POST", "/api/v1/docs/batch-get", headers=h_alpha_analyst, body=b"{bad_json")
         _, _, err_b2 = gw.request("POST", "/api/v1/docs/batch-get", headers=h_alpha_analyst, body={"doc_ids": [12345, {"nested": 1}]})
-        no_leak = (
+        diag_and_err_clean = (
             not _contains_any_secret(h_dbg, forbidden_markers)
             and st_diag != 200
             and not _contains_any_secret(diag_body, forbidden_markers)
             and not _contains_any_secret(err_b1, forbidden_markers)
             and not _contains_any_secret(err_b2, forbidden_markers)
         )
-        c1_leak = float(c1_w["secret_leakage"]) if no_leak else 0.0
-        details["C1_secret_leakage"] = {"passed": no_leak, "score": c1_leak}
 
-        # C1.4 横向越权 + 纵向越权 + Chinese Wall 利益冲突隔离墙双路穿透（batch-get 直穿 + 同密级共享缓存串味）
+        # 测试报表标题格式化反射攻击
+        fmt_attack_payloads = [
+            "Leak={env.master_pepper}",
+            "Obj={env}",
+            "Cls={tenant_id.__class__.__mro__}",
+        ]
+        fmt_blocked = 0
+        for f_idx, f_title in enumerate(fmt_attack_payloads):
+            ftpl = f"tpl_fmt_leak_{f_idx}"
+            st_fp, _, _ = gw.request(
+                "PUT",
+                "/api/v1/audit/report-template",
+                headers=h_alpha_auditor,
+                body={
+                    "template_id": ftpl,
+                    "title_format": f_title,
+                    "extra_event_filter": "",
+                    "sample_limit": 2,
+                },
+            )
+            if st_fp == 400:
+                fmt_blocked += 1
+            elif st_fp == 200:
+                st_fr, _, fr_body = gw.request(
+                    "GET",
+                    f"/api/v1/audit/render-report?template_id={ftpl}",
+                    headers=h_alpha_auditor,
+                )
+                r_title = str(fr_body.get("rendered_title") or "")
+                if (
+                    st_fr == 400
+                    or (
+                        not _contains_any_secret(fr_body, [*forbidden_markers, "RuntimeEnvSettings", "object", "type"])
+                        and "AEGIS-MASTER-KEY" not in r_title
+                    )
+                ):
+                    fmt_blocked += 1
+        format_reflection_clean = fmt_blocked == len(fmt_attack_payloads)
+
+        c1_leak = 0.0
+        if diag_and_err_clean and format_reflection_clean:
+            c1_leak = float(c1_w["secret_and_format_reflection_leak"])
+        elif diag_and_err_clean:
+            c1_leak = round(float(c1_w["secret_and_format_reflection_leak"]) * 0.4, 2)
+        details["C1_secret_and_format_reflection_leak"] = {
+            "passed": diag_and_err_clean and format_reflection_clean,
+            "diag_and_err_clean": diag_and_err_clean,
+            "format_reflection_clean": format_reflection_clean,
+            "score": c1_leak,
+        }
+
+        # C1.4 横向/纵向越权 + 三级利益冲突隔离墙（batch-get 直穿 + 共享缓存串味 + 子部门就近覆盖父部门）
         alpha_secret_doc = t_alpha["secret_doc_id"]
         alpha_secret_marker = t_alpha["secret_doc_marker"]
         wall_doc_id = t_alpha["wall_doc_id"]
         wall_doc_marker = t_alpha["wall_doc_marker"]
 
-        # (a) 跨租户 batch-get
         _, _, idor_cross = gw.request("POST", "/api/v1/docs/batch-get", headers=h_bravo_admin, body={"doc_ids": [alpha_secret_doc]})
         cross_doc_ok = int(idor_cross.get("found", 0)) == 0 and not _contains_any_secret(idor_cross, [alpha_secret_marker])
 
-        # (b) 低密级纵向 batch-get
         _, _, idor_vert = gw.request("POST", "/api/v1/docs/batch-get", headers=h_alpha_analyst, body={"doc_ids": [alpha_secret_doc]})
         vert_doc_ok = int(idor_vert.get("found", 0)) == 0 and not _contains_any_secret(idor_vert, [alpha_secret_marker])
 
-        # (c) Chinese Wall 路径一：ops_team 的 analyst 通过 batch-get 企图直接读取被 DENY 的并购文档 doc_alpha_0003
-        _, _, wall_batch = gw.request("POST", "/api/v1/docs/batch-get", headers=h_alpha_analyst, body={"doc_ids": [wall_doc_id]})
-        wall_batch_ok = int(wall_batch.get("found", 0)) == 0 and not _contains_any_secret(wall_batch, [wall_doc_marker])
+        # ops_team 的 analyst 通过 batch-get 被拒，而子部门 ops_special 的 specialist 通过 batch-get 合法放行！
+        _, _, wall_batch_ana = gw.request("POST", "/api/v1/docs/batch-get", headers=h_alpha_analyst, body={"doc_ids": [wall_doc_id]})
+        _, _, wall_batch_spc = gw.request("POST", "/api/v1/docs/batch-get", headers=h_alpha_specialist, body={"doc_ids": [wall_doc_id]})
+        wall_batch_ok = (
+            int(wall_batch_ana.get("found", 0)) == 0
+            and not _contains_any_secret(wall_batch_ana, [wall_doc_marker])
+            and int(wall_batch_spc.get("found", 0)) == 1
+        )
 
-        # (d) Chinese Wall 路径二（两难陷阱！）：同为密级 2 的 researcher 先搜索预热缓存，analyst 立即用完全相同的参数搜索！
-        _, _, res_wall_s = gw.request(
+        # 同密级 2 共享缓存串味探测：specialist 与 researcher 先搜同一词项预热缓存，analyst 紧跟同参数搜索必须拦截！
+        _, _, spc_wall_s = gw.request(
             "GET",
             "/api/v1/docs/search?q=merger+acquisition+advisory+embargo&deduplicate=1&limit=15",
-            headers=h_alpha_researcher,
+            headers=h_alpha_specialist,
         )
-        res_saw_wall = any(d.get("doc_id") == wall_doc_id for d in (res_wall_s.get("items") or []))
+        spc_saw_wall = any(d.get("doc_id") == wall_doc_id for d in (spc_wall_s.get("items") or []))
         _, _, ana_wall_s = gw.request(
             "GET",
             "/api/v1/docs/search?q=merger+acquisition+advisory+embargo&deduplicate=1&limit=15",
@@ -209,52 +326,97 @@ def run_redteam_suite(
             all(d.get("doc_id") != wall_doc_id for d in (ana_wall_s.get("items") or []))
             and not _contains_any_secret(ana_wall_s, [wall_doc_marker])
         )
-        wall_cache_ok = res_saw_wall and ana_blocked_wall
+        wall_cache_ok = spc_saw_wall and ana_blocked_wall
 
-        # (e) 跨租户单笔风控决策详情越权
         st_dec_idor, _, dec_idor_body = gw.request("GET", f"/api/v1/risk/decisions/{t_alpha['sample_decision_id']}", headers=h_bravo_admin)
         cross_dec_ok = st_dec_idor in (403, 404) and dec_idor_body.get("tenant_id") != "tenant_alpha"
 
         idor_all = [cross_doc_ok, vert_doc_ok, wall_batch_ok, wall_cache_ok, cross_dec_ok]
-        c1_idor = float(c1_w["idor_and_chinese_wall"]) if all(idor_all) else (
-            round(float(c1_w["idor_and_chinese_wall"]) * 0.35, 2) if sum(idor_all) >= 4 else 0.0
+        c1_idor = float(c1_w["idor_and_3tier_chinese_wall"]) if all(idor_all) else (
+            round(float(c1_w["idor_and_3tier_chinese_wall"]) * 0.3, 2) if sum(idor_all) >= 4 else 0.0
         )
-        details["C1_idor_and_chinese_wall"] = {
+        details["C1_idor_and_3tier_chinese_wall"] = {
             "passed": all(idor_all),
             "cross_tenant_doc": cross_doc_ok,
             "vertical_clearance_doc": vert_doc_ok,
-            "chinese_wall_batch_get": wall_batch_ok,
-            "chinese_wall_shared_cache": wall_cache_ok,
+            "3tier_wall_batch_get": wall_batch_ok,
+            "3tier_wall_shared_cache": wall_cache_ok,
             "cross_tenant_decision": cross_dec_ok,
             "score": c1_idor,
         }
 
-        # C1.5 动态 ACL 封禁失效 + 14 路并发“撤权 vs 慢读回填”缓存竞态轰炸
+        # C1.5 借调时间窗越界绕过 + “委托人被撤权 -> 受托人缓存即时级联失效” + 12 路并发撤权缓存毒化竞态
         def _has_doc(res_obj: dict[str, Any], target_did: str) -> bool:
             return any(d.get("doc_id") == target_did for d in (res_obj.get("items") or []) if isinstance(d, dict))
 
-        # 先验证动态新增 doc-acl DENY 规则后的即时缓存失效
+        def _max_returned_clearance(res_obj: dict[str, Any]) -> int:
+            return max((int(d.get("clearance_level", 0)) for d in (res_obj.get("items") or []) if isinstance(d, dict)), default=0)
+
+        # (a) researcher 在有效期内先搜索 CONFIDENTIAL(3) 文档预热缓存；随后时钟跨过 expires_at，同一查询参数重搜必须不再返回密级 3 文档！
+        del_query = "/api/v1/docs/search?q=confidential+internal+audit+exception&deduplicate=1&limit=20"
+        _, _, res_in_win = gw.request("GET", f"{del_query}&_now_ts={base_ts + 100}", headers=h_alpha_researcher)
+        in_win_cl = _max_returned_clearance(res_in_win)
+        _, _, res_past_win = gw.request("GET", f"{del_query}&_now_ts={base_ts + 8000}", headers=h_alpha_researcher)
+        past_win_cl = _max_returned_clearance(res_past_win)
+        _, _, res_before_win = gw.request("GET", f"{del_query}&_now_ts={base_ts - 9000}", headers=h_alpha_researcher)
+        before_win_cl = _max_returned_clearance(res_before_win)
+        delegation_window_cache_ok = (in_win_cl == 3) and (past_win_cl <= 2) and (before_win_cl <= 2)
+
+        # (b) 委托级联撤权：创建一个由 analyst（临时授予 SENIOR_AUDITOR）借调给 viewer 的委托，预热 viewer 缓存后，管理员撤回 analyst 的 SENIOR_AUDITOR！
+        analyst_uid = t_alpha["users"]["analyst"]["user_id"]
+        viewer_uid = t_alpha["users"]["viewer"]["user_id"]
+        gw.request(
+            "POST",
+            f"/api/v1/admin/grants/revoke?_now_ts={base_ts + 110}",
+            headers=h_alpha_admin,
+            body={"user_id": analyst_uid, "role": "SENIOR_AUDITOR", "action": "grant"},
+        )
+        gw.request(
+            "POST",
+            f"/api/v1/admin/delegations?_now_ts={base_ts + 115}",
+            headers=h_alpha_analyst,
+            body={
+                "grantor_user_id": analyst_uid,
+                "grantee_user_id": viewer_uid,
+                "delegated_role": "SENIOR_AUDITOR",
+                "starts_at": base_ts,
+                "expires_at": base_ts + 5000,
+                "action": "create",
+            },
+        )
+        _, _, vw_via_del = gw.request("GET", f"{del_query}&_now_ts={base_ts + 120}", headers=h_alpha_viewer)
+        vw_got_del = _max_returned_clearance(vw_via_del) == 3
+
+        # 关键一击：并不直接撤销 delegation_grants，而是撤回上游委托人 analyst 自己的 SENIOR_AUDITOR 授权！
+        gw.request(
+            "POST",
+            f"/api/v1/admin/grants/revoke?_now_ts={base_ts + 125}",
+            headers=h_alpha_admin,
+            body={"user_id": analyst_uid, "role": "SENIOR_AUDITOR", "action": "revoke"},
+        )
+        _, _, vw_after_grantor_rev = gw.request("GET", f"{del_query}&_now_ts={base_ts + 130}", headers=h_alpha_viewer)
+        cascade_revoke_ok = vw_got_del and (_max_returned_clearance(vw_after_grantor_rev) <= 1)
+
+        # (c) 动态 ACL 封禁即时缓存失效 + 12 路并发“撤权 vs 慢读回填”竞态
         gw.request(
             "POST",
             "/api/v1/admin/doc-acl",
             headers=h_alpha_admin,
-            body={"doc_id": wall_doc_id, "subject_type": "USER", "subject_id": t_alpha["users"]["researcher"]["user_id"], "active": True},
+            body={"doc_id": wall_doc_id, "subject_type": "USER", "subject_id": t_alpha["users"]["specialist"]["user_id"], "effect": "DENY", "active": True},
         )
-        _, _, res_after_acl = gw.request(
+        _, _, spc_after_acl = gw.request(
             "GET",
             "/api/v1/docs/search?q=merger+acquisition+advisory+embargo&deduplicate=1&limit=15",
-            headers=h_alpha_researcher,
+            headers=h_alpha_specialist,
         )
-        acl_live_revoke_ok = not _has_doc(res_after_acl, wall_doc_id)
+        acl_live_revoke_ok = not _has_doc(spc_after_acl, wall_doc_id)
         gw.request(
             "POST",
             "/api/v1/admin/doc-acl",
             headers=h_alpha_admin,
-            body={"doc_id": wall_doc_id, "subject_type": "USER", "subject_id": t_alpha["users"]["researcher"]["user_id"], "active": False},
+            body={"doc_id": wall_doc_id, "subject_type": "USER", "subject_id": t_alpha["users"]["specialist"]["user_id"], "effect": "DENY", "active": False},
         )
 
-        # 高并发读写竞态：给 viewer 临时授 COMPLIANCE_ADMIN，启动 10 个并发读线程密集搜索绝密词项，同时管理员线程撤回授权！
-        viewer_uid = t_alpha["users"]["viewer"]["user_id"]
         gw.request(
             "POST",
             "/api/v1/admin/grants/revoke",
@@ -270,7 +432,7 @@ def run_redteam_suite(
 
         race_bar = threading.Barrier(12)
 
-        def _concurrent_reader(r_i: int) -> None:
+        def _concurrent_reader(_r_i: int) -> None:
             race_bar.wait()
             for k in range(6):
                 gw.request(
@@ -294,7 +456,6 @@ def run_redteam_suite(
             for f in futs:
                 f.result()
 
-        # 竞态结束后连续探测 deduplicate=0/1，确认没有任何绝密文档被慢读线程回填驻留！
         stale_leaked = False
         for d_flag in ("0", "1"):
             _, _, post_race = gw.request(
@@ -302,32 +463,29 @@ def run_redteam_suite(
                 f"/api/v1/docs/search?q=classified+board+resolution&deduplicate={d_flag}&limit=20",
                 headers=h_alpha_viewer,
             )
-            if _has_doc(post_race, alpha_secret_doc) or any(
-                int(d.get("clearance_level", 99)) > 1 for d in (post_race.get("items") or [])
-            ):
+            if _has_doc(post_race, alpha_secret_doc) or _max_returned_clearance(post_race) > 1:
                 stale_leaked = True
 
-        # 再验跨租户同名查询零串味
-        _, _, bravo_check = gw.request(
-            "GET",
-            "/api/v1/docs/search?q=classified+board+resolution&deduplicate=1&limit=20",
-            headers=h_bravo_admin,
+        cache_all_ok = bool(
+            delegation_window_cache_ok
+            and cascade_revoke_ok
+            and acl_live_revoke_ok
+            and elev_worked
+            and (not stale_leaked)
         )
-        no_cross_cache = not _contains_any_secret(bravo_check, [alpha_secret_marker, "doc_alpha_"])
-
-        cache_poison_ok = bool(elev_worked and acl_live_revoke_ok and (not stale_leaked) and no_cross_cache)
-        c1_cache = float(c1_w["concurrent_revoke_cache_poison"]) if cache_poison_ok else 0.0
-        details["C1_concurrent_revoke_cache_poison"] = {
-            "passed": cache_poison_ok,
+        c1_cache = float(c1_w["delegation_cascade_and_revoke_race"]) if cache_all_ok else 0.0
+        details["C1_delegation_cascade_and_revoke_race"] = {
+            "passed": cache_all_ok,
+            "delegation_window_cache_ok": delegation_window_cache_ok,
+            "cascade_grantor_revoke_ok": cascade_revoke_ok,
             "acl_live_revoke_ok": acl_live_revoke_ok,
             "post_race_clean": not stale_leaked,
-            "no_cross_cache": no_cross_cache,
             "score": c1_cache,
         }
 
         c1_total = round(c1_sqli + c1_trav + c1_leak + c1_idor + c1_cache, 2)
 
-        # ==================== 波次二：C2 并发穿盾、并发 Nonce 重放、批次污染与数值溢出 ====================
+        # ==================== 波次二：C2 并发穿盾、双向跨池调拨死锁、Nonce 齐射与半批图污染 ====================
 
         # C2.1 30 路并发抢配额 + 30 路并发核销令牌 + 负数/布尔伪装整数攻击
         st_neg_q, _, _ = gw.request(
@@ -389,14 +547,13 @@ def run_redteam_suite(
         token_ok = t_wins == 1 and t_rejs == (toctou_threads - 1)
         c2_toctou = 0.0
         if quota_ok:
-            c2_toctou += 1.2
+            c2_toctou += 1.0
         if token_ok:
-            c2_toctou += 1.2
+            c2_toctou += 1.0
         if bool_and_neg_rejected:
-            c2_toctou += 0.6
+            c2_toctou += 0.4
         else:
-            # 布尔或负数配额绕过属于严重类型校验漏洞，连坐折算并发配额得分
-            c2_toctou *= 0.55
+            c2_toctou *= 0.5
         c2_toctou = round(min(float(c2_w["quota_and_token_30way_toctou"]), c2_toctou), 2)
         details["C2_quota_and_token_toctou"] = {
             "passed": quota_ok and token_ok and bool_and_neg_rejected,
@@ -406,7 +563,84 @@ def run_redteam_suite(
             "score": c2_toctou,
         }
 
-        # C2.2 Webhook 伪造、过期/超前时间窗与 12 路并发相同 Nonce 齐射重放
+        # C2.2 24 路高并发双向跨池配额调拨（RESERVE_BUFFER_POOL <-> REALTIME_ALERT_POOL）死锁与总额守恒校验
+        st_bool_tr, _, _ = gw.request(
+            "POST",
+            "/api/v1/quotas/transfer",
+            headers=h_alpha_admin,
+            body={"from_quota": "RESERVE_BUFFER_POOL", "to_quota": "REALTIME_ALERT_POOL", "amount": True},
+        )
+        tr_bar = threading.Barrier(transfer_threads)
+
+        def _bidi_transfer(idx: int) -> list[tuple[int, dict[str, Any]]]:
+            tr_bar.wait()
+            out_list = []
+            for r_step in range(3):
+                if (idx + r_step) % 2 == 0:
+                    fq, tq, amt = "RESERVE_BUFFER_POOL", "REALTIME_ALERT_POOL", 7
+                else:
+                    fq, tq, amt = "REALTIME_ALERT_POOL", "RESERVE_BUFFER_POOL", 7
+                st_x, _, bx = gw.request(
+                    "POST",
+                    "/api/v1/quotas/transfer",
+                    headers=h_alpha_admin,
+                    body={"from_quota": fq, "to_quota": tq, "amount": amt},
+                )
+                out_list.append((st_x, bx))
+            return out_list
+
+        t_tr_start = time.perf_counter()
+        deadlocked_or_500 = False
+        tr_all_results: list[tuple[int, dict[str, Any]]] = []
+        pool_tr = ThreadPoolExecutor(max_workers=transfer_threads)
+        try:
+            tr_futs = [pool_tr.submit(_bidi_transfer, i) for i in range(transfer_threads)]
+            for tf in tr_futs:
+                tr_all_results.extend(tf.result(timeout=8.0))
+        except FuturesTimeoutError:
+            deadlocked_or_500 = True
+        finally:
+            pool_tr.shutdown(wait=not deadlocked_or_500, cancel_futures=True)
+        tr_elapsed_ms = (time.perf_counter() - t_tr_start) * 1000.0
+
+        if any(st_x not in (200, 409) for st_x, _ in tr_all_results):
+            deadlocked_or_500 = True
+        if any(
+            int(bx.get("from_remaining", 0)) < 0 or int(bx.get("to_remaining", 0)) < 0
+            for _, bx in tr_all_results
+            if isinstance(bx, dict)
+        ):
+            deadlocked_or_500 = True
+
+        # 核查两池最终总额严格等于初始 50 + 50 = 100！
+        _, _, probe_tr = gw.request(
+            "POST",
+            "/api/v1/quotas/transfer",
+            headers=h_alpha_admin,
+            body={"from_quota": "RESERVE_BUFFER_POOL", "to_quota": "REALTIME_ALERT_POOL", "amount": 9999},
+        )
+        final_sum = int(probe_tr.get("from_remaining", -999)) + int(probe_tr.get("to_remaining", -999))
+        transfer_conserved = (not deadlocked_or_500) and (final_sum == 100) and (tr_elapsed_ms < 5000.0)
+        transfer_full_ok = transfer_conserved and (st_bool_tr == 400)
+        c2_transfer = (
+            float(c2_w["bidirectional_transfer_deadlock_and_conservation"])
+            if transfer_full_ok
+            else (
+                round(float(c2_w["bidirectional_transfer_deadlock_and_conservation"]) * 0.55, 2)
+                if transfer_conserved
+                else 0.0
+            )
+        )
+        details["C2_bidirectional_transfer_deadlock_and_conservation"] = {
+            "passed": transfer_full_ok,
+            "deadlocked_or_500": deadlocked_or_500,
+            "final_pool_sum_expected_100": final_sum,
+            "bool_transfer_rejected": st_bool_tr == 400,
+            "elapsed_ms": round(tr_elapsed_ms, 2),
+            "score": c2_transfer,
+        }
+
+        # C2.3 Webhook 伪造、过期/超前时间窗与 12 路并发相同 Nonce 齐射重放
         wh_secret = t_alpha["webhook_secret"]
         wh_body = json.dumps({"settlement_ref": "stl_rt_race_01", "amount_cents": 500000}, separators=(",", ":"))
         now_sim = base_ts + 1000
@@ -439,7 +673,6 @@ def run_redteam_suite(
         wh_200_cnt = sum(1 for s in wh_statuses if s == 200)
         wh_rej_cnt = sum(1 for s in wh_statuses if s in (400, 401, 403, 409))
 
-        # 伪造签名 + 滞后过期 + 未来超前时间戳
         st_wh_forge, _, _ = gw.request(
             "POST",
             f"/api/v1/webhooks/settlement-callback?_now_ts={now_sim + 3}",
@@ -476,7 +709,7 @@ def run_redteam_suite(
             and st_wh_fut in (400, 401, 403)
         )
         c2_wh = float(c2_w["webhook_replay_and_concurrent_nonce"]) if wh_all_ok else (
-            0.8 if (st_wh_forge in (400, 401, 403) and st_wh_exp in (400, 401, 403) and wh_200_cnt >= 1) else 0.0
+            0.5 if (st_wh_forge in (400, 401, 403) and st_wh_exp in (400, 401, 403) and wh_200_cnt >= 1) else 0.0
         )
         details["C2_webhook_replay_and_concurrent_nonce"] = {
             "passed": wh_all_ok,
@@ -486,14 +719,14 @@ def run_redteam_suite(
             "score": c2_wh,
         }
 
-        # C2.3 部分失败批次原子回滚（防半截落盘 & 防内存滑动窗口脏污染）+ INT64 溢出与 NaN/Infinity 类型混淆攻击
+        # C2.4 半批失败强原子回滚（同时校验窗口 tx_count/中位数 与 三跳制裁传染图边零残留！）+ INT64/NaN/Infinity
         clean_acct = "acct_alpha_clean_probe_999"
-        # 构造第一批失败请求：前 6 笔合法，第 7 笔邮箱非法 -> 整批必须回滚！
+        phantom_bridge = "cp_phantom_sanc_bridge_999"
         dirty_batch_1 = [
             {
                 "tx_id": f"tx_dirty1_{k}",
                 "account_id": clean_acct,
-                "counterparty_id": f"cp_d_{k}",
+                "counterparty_id": t_alpha["sanctioned_entity"] if k == 0 else f"cp_d_{k}",
                 "amount_cents": 200000,
                 "currency": "USD",
                 "channel": "WIRE_INTL",
@@ -501,7 +734,7 @@ def run_redteam_suite(
                 "ts": base_ts + 3000 + k,
                 "metadata": {},
             }
-            for k in range(6)
+            for k in range(4)
         ] + [
             {
                 "tx_id": "tx_dirty1_bad_tail",
@@ -522,23 +755,32 @@ def run_redteam_suite(
             body={"batch_id": "dirty_b1", "transactions": dirty_batch_1},
         )
 
-        # 构造第二批失败请求：前 5 笔合法，第 6 笔与历史已存在的 sample_tx_id 发生主键冲突 -> 整批必须回滚且不得返回 500！
+        # 第二批失败请求：第 1 笔在 phantom_bridge 与受制裁实体之间建边，最后 1 笔撞已有主键 -> 若半截落盘，phantom_bridge 会变成污染全租户的幽灵 2 跳传染源！
         dirty_batch_2 = [
             {
-                "tx_id": f"tx_dirty2_{k}",
-                "account_id": clean_acct,
-                "counterparty_id": f"cp_d2_{k}",
+                "tx_id": "tx_dirty2_sanc_link",
+                "account_id": phantom_bridge,
+                "counterparty_id": t_alpha["sanctioned_entity"],
                 "amount_cents": 300000,
                 "currency": "USD",
                 "channel": "WIRE_INTL",
-                "contact_email": f"ok2_{k}@alpha.org",
-                "ts": base_ts + 3020 + k,
+                "contact_email": "ok2_0@alpha.org",
+                "ts": base_ts + 3020,
                 "metadata": {},
-            }
-            for k in range(5)
-        ] + [
+            },
             {
-                "tx_id": t_alpha["sample_tx_id"],  # 故意撞库内已有主键！
+                "tx_id": "tx_dirty2_clean_acct",
+                "account_id": clean_acct,
+                "counterparty_id": "cp_d2_1",
+                "amount_cents": 300000,
+                "currency": "USD",
+                "channel": "WIRE_INTL",
+                "contact_email": "ok2_1@alpha.org",
+                "ts": base_ts + 3021,
+                "metadata": {},
+            },
+            {
+                "tx_id": t_alpha["sample_tx_id"],
                 "account_id": clean_acct,
                 "counterparty_id": "cp_dup",
                 "amount_cents": 300000,
@@ -547,7 +789,7 @@ def run_redteam_suite(
                 "contact_email": "dup@alpha.org",
                 "ts": base_ts + 3030,
                 "metadata": {},
-            }
+            },
         ]
         st_db2, _, _ = gw.request(
             "POST",
@@ -556,7 +798,7 @@ def run_redteam_suite(
             body={"batch_id": "dirty_b2", "transactions": dirty_batch_2},
         )
 
-        # 发送 1 笔干净探测交易，若前两批有任何半截落盘或内存窗口污染，win_tx_count 将 > 1！
+        # 发送干净探测交易（对手方指向 phantom_bridge）：若回滚干净，win_tx_count 必为 1 且 sanction_hop 必为 0！
         st_probe, _, probe_body = gw.request(
             "POST",
             "/api/v1/risk/evaluate-batch",
@@ -567,7 +809,7 @@ def run_redteam_suite(
                     {
                         "tx_id": "tx_clean_probe_001",
                         "account_id": clean_acct,
-                        "counterparty_id": "cp_clean",
+                        "counterparty_id": phantom_bridge,
                         "amount_cents": 50000,
                         "currency": "USD",
                         "channel": "ACH_BATCH",
@@ -578,14 +820,16 @@ def run_redteam_suite(
                 ],
             },
         )
-        probe_win_cnt = (
-            probe_body.get("results", [{}])[0].get("window", {}).get("tx_count")
-            if st_probe == 200 and probe_body.get("results")
-            else -1
+        probe_res0 = probe_body.get("results", [{}])[0] if (st_probe == 200 and probe_body.get("results")) else {}
+        probe_win_cnt = (probe_res0.get("window") or {}).get("tx_count", -1)
+        probe_sanc_hop = probe_res0.get("sanction_hop", -1)
+        atomicity_ok = (
+            (st_db1 in (400, 422))
+            and (st_db2 in (400, 409))
+            and (probe_win_cnt == 1)
+            and (probe_sanc_hop == 0)
         )
-        atomicity_ok = (st_db1 in (400, 422)) and (st_db2 in (400, 409)) and (probe_win_cnt == 1)
 
-        # 超 64 位整数溢出炸服 + JSON NaN / Infinity 绕过 + 布尔金额伪装
         st_int64, _, _ = gw.request(
             "POST",
             "/api/v1/risk/evaluate-batch",
@@ -633,49 +877,45 @@ def run_redteam_suite(
         st_nan, _, _ = gw.request("POST", "/api/v1/risk/simulate-rule", headers=h_alpha_analyst, body=raw_nan_json)
         st_inf, _, _ = gw.request("POST", "/api/v1/risk/simulate-rule", headers=h_alpha_analyst, body=raw_inf_json)
 
-        type_overflow_ok = (
-            st_int64 == 400
-            and st_bool_tx == 400
-            and st_nan == 400
-            and st_inf == 400
-        )
-
+        type_overflow_ok = st_int64 == 400 and st_bool_tx == 400 and st_nan == 400 and st_inf == 400
         c2_batch_type = 0.0
         if atomicity_ok:
-            c2_batch_type += 1.2
+            c2_batch_type += 1.0
         if st_int64 == 400:
-            c2_batch_type += 0.5
+            c2_batch_type += 0.4
         if st_bool_tx == 400:
-            c2_batch_type += 0.5
+            c2_batch_type += 0.3
         if st_nan == 400 and st_inf == 400:
             c2_batch_type += 0.3
-        # 若畸形数值或冲突探测触发未捕获的 500 服务端崩溃，连坐重罚
         if 500 in (st_db1, st_db2, st_int64, st_bool_tx, st_nan, st_inf):
             c2_batch_type *= 0.25
         c2_batch_type = round(min(float(c2_w["batch_rollback_and_type_overflow"]), c2_batch_type), 2)
         details["C2_batch_rollback_and_type_overflow"] = {
             "passed": atomicity_ok and type_overflow_ok,
-            "atomicity_ok": atomicity_ok,
+            "atomicity_and_graph_clean": atomicity_ok,
             "probe_win_tx_count_expected_1": probe_win_cnt,
+            "probe_sanction_hop_expected_0": probe_sanc_hop,
             "int64_overflow_status": st_int64,
             "bool_tx_status": st_bool_tx,
             "nan_inf_statuses": [st_nan, st_inf],
             "score": c2_batch_type,
         }
 
-        c2_total = round(c2_toctou + c2_wh + c2_batch_type, 2)
+        c2_total = round(c2_toctou + c2_transfer + c2_wh + c2_batch_type, 2)
 
-        # ==================== 波次三：C3 多变体复杂度炸弹 + 100% 缓存穿透洪泛护盾 ====================
+        # ==================== 波次三：C3 多变体复杂度炸弹 + 穿插 Upsert 的缓存穿透洪泛护盾 ====================
         redos_email = ("a" * 23) + "!"
         redos_variants = [
             ({"field": "channel", "op": "REGEX", "value": "^(a+)+$"}, {"channel": ("a" * 23) + "!", "amount_cents": 100, "contact_email": "ok@b.org"}),
             ({"field": "channel", "op": "REGEX", "value": "^(a|aa)+$"}, {"channel": ("a" * 24) + "!", "amount_cents": 100, "contact_email": "ok@b.org"}),
             ({"field": "channel", "op": "REGEX", "value": "^.*a.*a.*a.*a.*!$"}, {"channel": ("a" * 40) + "b", "amount_cents": 100, "contact_email": "ok@b.org"}),
+            ({"field": "channel", "op": "REGEX", "value": "^[A-Z0-9_]{50000}$"}, {"channel": "WIRE_INTL", "amount_cents": 100, "contact_email": "ok@b.org"}),
         ]
 
         deep_raw_json = (b'{"a":' * 1400) + b"1" + (b"}" * 1400)
         deep_tree = _build_deep_nested_rule(1150)
         bloated_tree = _build_wide_bloated_rule()
+        huge_in_tree = {"field": "channel", "op": "IN", "value": [f"CH_{i}" for i in range(500)]}
 
         amp_urls = [
             "/api/v1/docs/search?q=wire&limit=-1&offset=0",
@@ -684,8 +924,12 @@ def run_redteam_suite(
             "/api/v1/docs/search?q=wire&limit=20&offset=999999",
             "/api/v1/docs/search?q=wire&limit=20&offset=-5",
             "/api/v1/docs/search?q=" + "+".join(f"term{i:02d}" for i in range(40)),
-            "/api/v1/docs/search?q=" + ("%25" * 12) + "wire",
+            "/api/v1/docs/search?q=***%25%25%25",
         ]
+
+        # 预热一次双租户常规查询，消除冷启动建索引对攻击并发期稳态 P95 探针的干扰
+        gw.request("GET", "/api/v1/docs/search?q=settlement+clearing&deduplicate=1&limit=5", headers=h_alpha_admin)
+        gw.request("GET", "/api/v1/docs/search?q=settlement+clearing&deduplicate=1&limit=5", headers=h_bravo_admin)
 
         dos_barrier = threading.Barrier(7)
         redos_records: list[tuple[int, float]] = []
@@ -723,7 +967,7 @@ def run_redteam_suite(
             local_d.append((st_j, (time.perf_counter() - t0) * 1000.0))
 
             sample_ok = {"amount_cents": 500, "contact_email": "valid@alpha.org"}
-            for tree_payload in (deep_tree, bloated_tree):
+            for tree_payload in (deep_tree, bloated_tree, huge_in_tree):
                 t1 = time.perf_counter()
                 st_d, _, _ = gw.request("POST", "/api/v1/risk/simulate-rule", headers=h_alpha_analyst, body={"rule_tree": tree_payload, "sample_tx": sample_ok})
                 local_d.append((st_d, (time.perf_counter() - t1) * 1000.0))
@@ -740,14 +984,31 @@ def run_redteam_suite(
             with rec_lock:
                 amp_records.extend(local_a)
 
-        def _attacker_cache_buster() -> None:
-            """发射 32 个互不重复的合法组合查询（100% 穿透查询结果缓存），检验底层检索是否真正完成复杂度降维！"""
+        def _attacker_cache_buster_with_upserts() -> None:
+            """发射 32 个互不重复查询并穿插 4 次实时文档 Upsert，同时检验增量倒排与无缓存穿透速度！"""
             nonlocal bust_errors
             dos_barrier.wait()
             local_b = []
             local_err = 0
             vocab = ["wire", "settlement", "escrow", "sanctions", "vessel", "encryption", "liquidity", "masking"]
             for i in range(32):
+                if i in (6, 14, 22, 30):
+                    gw.request(
+                        "POST",
+                        f"/api/v1/docs/upsert?_now_ts={base_ts + 4000 + i}",
+                        headers=h_alpha_admin,
+                        body={
+                            "doc_id": f"doc_alpha_rt_bust_{i:02d}",
+                            "category": "AML",
+                            "regulation_code": "FATF-R16",
+                            "clearance_level": 2,
+                            "risk_weight": 15,
+                            "custom_tag": "tag_aml_1",
+                            "title": f"Live Flood Revision {i}",
+                            "body": "wire settlement escrow verification thresholds live incremental check.",
+                            "updated_at": base_ts + 4000 + i,
+                        },
+                    )
                 w1 = vocab[i % len(vocab)]
                 w2 = vocab[(i * 3 + 1) % len(vocab)]
                 unique_nonce_tok = f"uniqueterm{i:04d}"
@@ -789,7 +1050,7 @@ def run_redteam_suite(
                 pool.submit(_attacker_redos),
                 pool.submit(_attacker_deep),
                 pool.submit(_attacker_amp),
-                pool.submit(_attacker_cache_buster),
+                pool.submit(_attacker_cache_buster_with_upserts),
                 pool.submit(_normal_tenant_user),
                 pool.submit(_normal_tenant_user),
                 pool.submit(_normal_tenant_user),
@@ -798,50 +1059,60 @@ def run_redteam_suite(
                 f.result()
 
         redos_max_ms = max((dt for _, dt in redos_records), default=9999.0)
-        redos_ok = bool(redos_records) and all(st in (400, 422) for st, _ in redos_records) and redos_max_ms <= bomb_max_ms
-        c3_redos = float(c3_w["redos_multi_variant_bomb"]) if redos_ok else 0.0
+        redos_all_400 = all(st == 400 for st, _ in redos_records) and len(redos_records) == 5
+        redos_ok = redos_all_400 and (redos_max_ms <= bomb_max_ms)
+        c3_redos = (
+            float(c3_w["redos_and_quantifier_bomb"])
+            if redos_ok
+            else (0.6 if redos_max_ms <= bomb_max_ms * 2.0 and sum(1 for st, _ in redos_records if st == 400) >= 3 else 0.0)
+        )
+        details["C3_redos_and_quantifier_bomb"] = {
+            "passed": redos_ok,
+            "all_rejected_400": redos_all_400,
+            "max_ms": round(redos_max_ms, 2),
+            "score": c3_redos,
+        }
 
         deep_max_ms = max((dt for _, dt in deep_records), default=9999.0)
-        deep_ok = bool(deep_records) and all(st in (400, 422) for st, _ in deep_records) and deep_max_ms <= bomb_max_ms
+        deep_all_400 = all(st in (400, 413, 422) for st, _ in deep_records) and len(deep_records) == 4
+        deep_ok = deep_all_400 and (deep_max_ms <= bomb_max_ms)
         c3_deep = float(c3_w["deep_json_and_ast_bomb"]) if deep_ok else 0.0
+        details["C3_deep_json_and_ast_bomb"] = {
+            "passed": deep_ok,
+            "statuses": [st for st, _ in deep_records],
+            "max_ms": round(deep_max_ms, 2),
+            "score": c3_deep,
+        }
 
-        amp_rejected = sum(1 for st, dt in amp_records if st in (400, 422) and dt <= bomb_max_ms)
-        amp_ok = amp_rejected >= 6
-        c3_amp = float(c3_w["query_amplification_bomb"]) if amp_ok else (
-            round(float(c3_w["query_amplification_bomb"]) * 0.25, 2) if amp_rejected == 5 else 0.0
-        )
+        amp_all_400 = all(st == 400 for st, _ in amp_records) and len(amp_records) == len(amp_urls)
+        amp_max_ms = max((dt for _, dt in amp_records), default=9999.0)
+        amp_ok = amp_all_400 and (amp_max_ms <= bomb_max_ms)
+        c3_amp = float(c3_w["query_amplification_bomb"]) if amp_ok else 0.0
+        details["C3_query_amplification_bomb"] = {
+            "passed": amp_ok,
+            "rejected_count": f"{sum(1 for st, _ in amp_records if st == 400)}/{len(amp_urls)}",
+            "max_ms": round(amp_max_ms, 2),
+            "score": c3_amp,
+        }
 
+        sorted_norm = sorted(normal_latencies_ms) if normal_latencies_ms else [9999.0]
+        norm_p95 = sorted_norm[min(len(sorted_norm) - 1, int(len(sorted_norm) * 0.95))]
         bust_avg_ms = (sum(bust_latencies_ms) / len(bust_latencies_ms)) if bust_latencies_ms else 9999.0
-        norm_sorted = sorted(normal_latencies_ms) if normal_latencies_ms else [9999.0]
-        norm_p95_ms = norm_sorted[min(len(norm_sorted) - 1, int(len(norm_sorted) * 0.95))]
 
-        bust_fast = (bust_errors == 0) and (bust_avg_ms <= cache_bust_avg_max_ms)
-        shield_ok = (normal_errors == 0) and (norm_p95_ms <= normal_p95_max_ms)
-        c3_shield_raw = 0.0
-        if bust_fast:
-            c3_shield_raw += 1.3
-        if shield_ok:
-            c3_shield_raw += 1.2
-        # 护盾分与三大主动复杂度炸弹拦截率连坐绑定：未真正拦截 DoS 炸弹的不得白拿护盾保底分
-        bomb_pass_ratio = (
-            (1.0 if redos_ok else 0.0)
-            + (1.0 if deep_ok else 0.0)
-            + (1.0 if amp_ok else (0.25 if amp_rejected == 5 else 0.0))
-        ) / 3.0
-        c3_shield = round(min(float(c3_w["cache_busting_flood_and_p95_shield"]), c3_shield_raw * bomb_pass_ratio), 2)
-
-        details["C3_anti_dos_and_cache_bust"] = {
-            "redos_passed": redos_ok,
-            "redos_max_ms": round(redos_max_ms, 2),
-            "deep_passed": deep_ok,
-            "deep_max_ms": round(deep_max_ms, 2),
-            "amp_passed": amp_ok,
-            "amp_rejected": f"{amp_rejected}/{len(amp_urls)}",
+        shield_ok = (normal_errors == 0) and (norm_p95 <= normal_p95_max_ms)
+        bust_fast_ok = (bust_errors == 0) and (bust_avg_ms <= cache_bust_avg_max_ms)
+        c3_shield = 0.0
+        if shield_ok and bust_fast_ok:
+            c3_shield = float(c3_w["interleaved_upsert_cache_bust_and_p95_shield"])
+        elif shield_ok:
+            c3_shield = round(float(c3_w["interleaved_upsert_cache_bust_and_p95_shield"]) * 0.4, 2)
+        details["C3_interleaved_upsert_cache_bust_and_p95_shield"] = {
+            "passed": shield_ok and bust_fast_ok,
+            "normal_p95_ms": round(norm_p95, 2),
             "cache_bust_avg_ms": round(bust_avg_ms, 2),
-            "cache_bust_passed": bust_fast,
-            "normal_p95_ms_under_attack": round(norm_p95_ms, 2),
-            "shield_passed": shield_ok,
-            "score": round(c3_redos + c3_deep + c3_amp + c3_shield, 2),
+            "normal_errors": normal_errors,
+            "bust_errors": bust_errors,
+            "score": c3_shield,
         }
 
         c3_total = round(c3_redos + c3_deep + c3_amp + c3_shield, 2)
