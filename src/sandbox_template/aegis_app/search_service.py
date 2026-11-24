@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
-"""企业合规文档检索、相关性打分、利益冲突墙校验与近似修订簇折叠服务。"""
+"""企业合规文档多维检索、邻近度相关性打分、双轨法规簇折叠与密级管控编排服务。"""
 from __future__ import annotations
 
 from collections import Counter
-import re
 import time
 from typing import Any
 
@@ -15,16 +14,12 @@ from .auth import (
 )
 from .config import DEDUP_JACCARD_THRESHOLD, DEFAULT_PAGE_LIMIT
 from .db import open_connection
-
-TOKEN_RE = re.compile(r"[a-z0-9_]{2,}")
-
-
-def tokenize_text(text: str) -> list[str]:
-    if not text:
-        return []
-    # 逐字符归一化空白与标点后切分词项
-    cleaned = re.sub(r"[^a-zA-Z0-9_]+", " ", text).lower()
-    return [tok for tok in TOKEN_RE.findall(cleaned) if len(tok) >= 2]
+from .doc_indexer import (
+    compute_phrase_proximity_bonus,
+    jaccard_similarity_from_texts,
+    tokenize_text,
+)
+from .legacy_compat import canonicalize_regulation_code
 
 
 def _get_doc_citation_count(db_path: str, doc_id: str) -> int:
@@ -37,26 +32,6 @@ def _get_doc_citation_count(db_path: str, doc_id: str) -> int:
         return len([dict(r) for r in rows])
     finally:
         conn.close()
-
-
-def _jaccard_similarity_from_texts(title_a: str, body_a: str, title_b: str, body_b: str) -> float:
-    tokens_a = tokenize_text(title_a) + tokenize_text(body_a)
-    tokens_b = tokenize_text(title_b) + tokenize_text(body_b)
-    uniq_a: list[str] = []
-    for t in tokens_a:
-        if t not in uniq_a:
-            uniq_a.append(t)
-    uniq_b: list[str] = []
-    for t in tokens_b:
-        if t not in uniq_b:
-            uniq_b.append(t)
-    if not uniq_a and not uniq_b:
-        return 1.0
-    inter_cnt = sum(1 for t in uniq_a if t in uniq_b)
-    union_cnt = len(uniq_a) + sum(1 for t in uniq_b if t not in uniq_a)
-    if union_cnt == 0:
-        return 0.0
-    return inter_cnt / union_cnt
 
 
 def search_documents(
@@ -72,7 +47,7 @@ def search_documents(
     limit: int = DEFAULT_PAGE_LIMIT,
     offset: int = 0,
 ) -> dict[str, Any]:
-    """执行多关键词合规文档检索，按调用者实时密级与利益冲突墙过滤，并折叠近似修订版。"""
+    """执行合规文档检索：融合委托有效密级、三级利益冲突墙、词距邻近度加成与历史双轨法规号折叠。"""
     sql_sort_col = "updated_at" if sort_by == "score" else sort_by
     sql_sort_dir = sort_dir if sort_dir else "DESC"
 
@@ -105,8 +80,12 @@ def search_documents(
     candidates: list[dict[str, Any]] = []
 
     for row in raw_rows:
-        # 实时核验操作员最高密级与部门利益冲突隔离墙（Chinese Wall）
-        _, live_clearance = resolve_effective_permissions(db_path, caller.tenant_id, caller.user_id)
+        _, live_clearance = resolve_effective_permissions(
+            db_path,
+            caller.tenant_id,
+            caller.user_id,
+            at_ts=caller.request_ts,
+        )
         if int(row["clearance_level"]) > live_clearance:
             continue
         if is_doc_blocked_by_acl(db_path, caller.tenant_id, caller.user_id, row["doc_id"]):
@@ -125,18 +104,21 @@ def search_documents(
                 3.5 * min(title_tf.get(t, 0), 5) + 1.0 * min(body_tf.get(t, 0), 12)
                 for t in query_terms
             )
+            prox_bonus = compute_phrase_proximity_bonus(body_tokens, query_terms)
         else:
             term_score = 0.0
+            prox_bonus = 0.0
 
         cite_cnt = _get_doc_citation_count(db_path, row["doc_id"])
         risk_w = int(row["risk_weight"])
-        total_score = round(term_score + 0.25 * cite_cnt + 0.1 * risk_w, 4)
+        total_score = round(term_score + prox_bonus + 0.25 * cite_cnt + 0.1 * risk_w, 4)
 
         candidates.append(
             {
                 "doc_id": row["doc_id"],
                 "category": row["category"],
                 "regulation_code": row["regulation_code"],
+                "_canon_reg": canonicalize_regulation_code(row["regulation_code"]),
                 "clearance_level": int(row["clearance_level"]),
                 "risk_weight": risk_w,
                 "custom_tag": row["custom_tag"],
@@ -162,10 +144,10 @@ def search_documents(
             for j in range(i + 1, len(candidates)):
                 if consumed[j]:
                     continue
-                same_reg = bool(rep["regulation_code"]) and (
-                    rep["regulation_code"] == candidates[j]["regulation_code"]
+                same_reg = bool(rep["_canon_reg"]) and (
+                    rep["_canon_reg"] == candidates[j]["_canon_reg"]
                 )
-                sim = _jaccard_similarity_from_texts(
+                sim = jaccard_similarity_from_texts(
                     rep["title"],
                     rep["_raw_body"],
                     candidates[j]["title"],
@@ -192,7 +174,6 @@ def search_documents(
         final_list.sort(key=lambda d: (d[sort_field], d["doc_id"]))
 
     total_matched = len(final_list)
-
     if limit < 0:
         sliced = final_list[max(0, offset):]
     else:
@@ -262,9 +243,8 @@ def set_document_quarantine(
     doc_id: str,
     quarantined: bool,
 ) -> dict[str, Any]:
-    """由合规管理员将指定合规文档置为隔离下架或解除隔离状态。"""
     require_admin(caller)
-    now_ts = int(time.time())
+    now_ts = int(caller.request_ts or int(time.time()))
     q_val = 1 if quarantined else 0
     conn = open_connection(db_path)
     try:

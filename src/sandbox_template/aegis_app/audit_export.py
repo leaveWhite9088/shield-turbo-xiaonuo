@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""合规审计流水汇总摘要导出与租户季度归档快照读取服务。"""
+"""合规审计流水汇总摘要导出、自定义报表模板渲染与季度归档快照读取服务。"""
 from __future__ import annotations
 
 import copy
@@ -7,52 +7,20 @@ import hashlib
 import json
 import os
 import pathlib
+import time
 import urllib.parse
 from typing import Any
 
-from .auth import CallerContext
+from .auth import CallerContext, require_admin
+from .config import RUNTIME_ENV
 from .db import open_connection
 
 
-def export_audit_digest(
-    db_path: str,
-    caller: CallerContext,
-    *,
-    start_ts: int | None = None,
-    end_ts: int | None = None,
-    severity: str = "",
-    sample_limit: int = 10,
+def _compute_digest_from_records(
+    tenant_id: str,
+    raw_rows: list[Any],
+    sample_limit: int,
 ) -> dict[str, Any]:
-    """统计指定时间窗口内的审计事件分布并计算顺序滚动完整性校验哈希。
-
-    滚动摘要规则：按 log_id 升序遍历匹配记录，依次向 SHA-256 更新
-    f"{log_id}|{event_type}|{severity}|{amount_cents}|{masked_account}|{ts}\\n"。
-    """
-    clauses = ["tenant_id = ?"]
-    params: list[Any] = [caller.tenant_id]
-    if start_ts is not None:
-        clauses.append("ts >= ?")
-        params.append(int(start_ts))
-    if end_ts is not None:
-        clauses.append("ts <= ?")
-        params.append(int(end_ts))
-    if severity:
-        clauses.append("severity = ?")
-        params.append(severity)
-
-    sql = (
-        "SELECT log_id, tenant_id, actor_id, event_type, severity, amount_cents, "
-        "masked_account, ts, payload_json "
-        f"FROM audit_logs WHERE {' AND '.join(clauses)} ORDER BY log_id ASC"
-    )
-
-    conn = open_connection(db_path)
-    try:
-        raw_rows = conn.execute(sql, tuple(params)).fetchall()
-    finally:
-        conn.close()
-
-    # 构建完整内存对象快照列表以便汇总核对
     expanded_records: list[dict[str, Any]] = []
     for r in raw_rows:
         item = {
@@ -100,13 +68,148 @@ def export_audit_digest(
     ]
 
     return {
-        "tenant_id": caller.tenant_id,
+        "tenant_id": tenant_id,
         "total_records": len(archive_mirror),
         "total_amount_cents": total_amount_cents,
         "severity_breakdown": dict(sorted(severity_counts.items())),
         "event_breakdown": dict(sorted(event_counts.items())),
         "rolling_sha256": hasher.hexdigest(),
         "samples": samples,
+    }
+
+
+def export_audit_digest(
+    db_path: str,
+    caller: CallerContext,
+    *,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+    severity: str = "",
+    sample_limit: int = 10,
+) -> dict[str, Any]:
+    """统计指定时间窗口内的审计事件分布并计算顺序滚动完整性校验哈希。"""
+    clauses = ["tenant_id = ?"]
+    params: list[Any] = [caller.tenant_id]
+    if start_ts is not None:
+        clauses.append("ts >= ?")
+        params.append(int(start_ts))
+    if end_ts is not None:
+        clauses.append("ts <= ?")
+        params.append(int(end_ts))
+    if severity:
+        clauses.append("severity = ?")
+        params.append(severity)
+
+    sql = (
+        "SELECT log_id, tenant_id, actor_id, event_type, severity, amount_cents, "
+        "masked_account, ts, payload_json "
+        f"FROM audit_logs WHERE {' AND '.join(clauses)} ORDER BY log_id ASC"
+    )
+
+    conn = open_connection(db_path)
+    try:
+        raw_rows = conn.execute(sql, tuple(params)).fetchall()
+    finally:
+        conn.close()
+
+    return _compute_digest_from_records(caller.tenant_id, raw_rows, sample_limit)
+
+
+def save_report_template(
+    db_path: str,
+    caller: CallerContext,
+    *,
+    template_id: str,
+    title_format: str,
+    extra_event_filter: str = "",
+    sample_limit: int = 10,
+) -> dict[str, Any]:
+    """保存租户自定义审计汇总报表配置模板（供周期性渲染报表复用）。
+
+    合法 title_format 支持占位符 {tenant_id}、{total_records}、{total_amount_cents}；
+    extra_event_filter 为空字符串或目标事件类型名称（如 RISK_EVAL、DOC_ACCESS）。
+    """
+    if "SENIOR_AUDITOR" not in caller.effective_roles and "COMPLIANCE_ADMIN" not in caller.effective_roles:
+        require_admin(caller)
+    tpl_id = str(template_id or "").strip()
+    t_fmt = str(title_format or "").strip()
+    evt_flt = str(extra_event_filter or "").strip()
+    s_lim = max(0, min(int(sample_limit), 50))
+    if not tpl_id or not t_fmt or len(t_fmt) > 200:
+        raise ValueError("Valid template_id and title_format are required")
+
+    now_ts = int(caller.request_ts or int(time.time()))
+    conn = open_connection(db_path)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO report_templates("
+            "tenant_id, template_id, title_format, extra_event_filter, sample_limit, created_by, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (caller.tenant_id, tpl_id, t_fmt, evt_flt, s_lim, caller.user_id, now_ts),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "tenant_id": caller.tenant_id,
+        "template_id": tpl_id,
+        "title_format": t_fmt,
+        "extra_event_filter": evt_flt,
+        "sample_limit": s_lim,
+    }
+
+
+def render_saved_report(
+    db_path: str,
+    caller: CallerContext,
+    *,
+    template_id: str,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+) -> dict[str, Any]:
+    """读取已保存的报表模板并渲染生成带格式化标题的审计汇总报告。"""
+    conn = open_connection(db_path)
+    try:
+        tpl = conn.execute(
+            "SELECT template_id, title_format, extra_event_filter, sample_limit "
+            "FROM report_templates WHERE tenant_id = ? AND template_id = ?",
+            (caller.tenant_id, template_id),
+        ).fetchone()
+        if not tpl:
+            raise LookupError(f"Report template not found: {template_id}")
+
+        clauses = [f"tenant_id = '{caller.tenant_id}'"]
+        params: list[Any] = []
+        if start_ts is not None:
+            clauses.append("ts >= ?")
+            params.append(int(start_ts))
+        if end_ts is not None:
+            clauses.append("ts <= ?")
+            params.append(int(end_ts))
+        if tpl["extra_event_filter"]:
+            clauses.append(f"event_type = '{tpl['extra_event_filter']}'")
+
+        sql = (
+            "SELECT log_id, tenant_id, actor_id, event_type, severity, amount_cents, "
+            "masked_account, ts, payload_json "
+            f"FROM audit_logs WHERE {' AND '.join(clauses)} ORDER BY log_id ASC"
+        )
+        raw_rows = conn.execute(sql, tuple(params)).fetchall()
+    finally:
+        conn.close()
+
+    digest = _compute_digest_from_records(caller.tenant_id, raw_rows, int(tpl["sample_limit"]))
+    rendered_title = str(tpl["title_format"]).format(
+        tenant_id=caller.tenant_id,
+        total_records=digest["total_records"],
+        total_amount_cents=digest["total_amount_cents"],
+        env=RUNTIME_ENV,
+    )
+    return {
+        "template_id": tpl["template_id"],
+        "rendered_title": rendered_title,
+        "digest": digest,
     }
 
 
@@ -119,7 +222,6 @@ def read_compliance_snapshot(
     if not snapshot_name:
         raise ValueError("snapshot_name is required")
 
-    # 清理相对路径跳转标记后读取快照内容
     decoded_once = urllib.parse.unquote(snapshot_name)
     sanitized_rel = decoded_once.replace("../", "")
     base_dir = os.path.join(storage_dir, caller.tenant_id, "snapshots")

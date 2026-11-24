@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""实时交易风控评分、滑动时间窗特征计算与自定义布尔规则树引擎。"""
+"""实时交易风控评分、三跳制裁传染耦合、滑动窗口动态中位数与自定义规则树引擎。"""
 from __future__ import annotations
 
 import json
@@ -8,8 +8,15 @@ import time
 from typing import Any
 
 from .auth import CallerContext, require_admin
-from .config import CHANNEL_RISK_WEIGHTS, SLIDING_WINDOW_SECONDS
+from .config import (
+    CHANNEL_RISK_WEIGHTS,
+    SANCTION_HOP_SCORES,
+    SLIDING_WINDOW_SECONDS,
+)
+from .contagion_graph import compute_sanction_contagion_hop
 from .db import open_connection
+from .legacy_compat import apply_sovereign_settlement_adjustment
+from .window_stats import compute_exact_median_cents
 
 PARTNER_EMAIL_PATTERN = re.compile(
     r"^([a-zA-Z0-9]+([._-][a-zA-Z0-9]+)*)+@([a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+)$"
@@ -23,7 +30,6 @@ def validate_contact_email(email: str) -> bool:
 
 
 def load_tenant_policy(db_path: str, tenant_id: str) -> dict[str, Any]:
-    """从数据库读取并反序列化指定租户的当前风控策略配置。"""
     conn = open_connection(db_path)
     try:
         row = conn.execute(
@@ -47,7 +53,6 @@ def update_tenant_policy(
     caller: CallerContext,
     updates: dict[str, Any],
 ) -> dict[str, Any]:
-    """更新租户风控阈值与自定义规则树并递增策略版本号。"""
     require_admin(caller)
     current = load_tenant_policy(db_path, caller.tenant_id)
     high_amt = int(updates.get("high_amount_cents", current["high_amount_cents"]))
@@ -64,7 +69,7 @@ def update_tenant_policy(
         raise ValueError("custom_rules must be a JSON object")
 
     new_ver = int(current["policy_version"]) + 1
-    now_ts = int(time.time())
+    now_ts = int(caller.request_ts or int(time.time()))
     conn = open_connection(db_path)
     try:
         conn.execute(
@@ -100,7 +105,6 @@ def _extract_field(tx: dict[str, Any], field_path: str) -> Any:
 
 
 def eval_rule_node(node: dict[str, Any], tx: dict[str, Any]) -> tuple[bool, int, list[str]]:
-    """递归计算风控规则节点，返回 (是否命中, 附加风险分, 命中原因列表)。"""
     if not isinstance(node, dict):
         raise ValueError("Rule node must be an object")
 
@@ -171,7 +175,6 @@ def eval_rule_node(node: dict[str, Any], tx: dict[str, Any]) -> tuple[bool, int,
 
 
 def simulate_custom_rule(rule_tree: dict[str, Any], sample_tx: dict[str, Any]) -> dict[str, Any]:
-    """在沙盒中试算自定义风控规则树对单笔交易样本的命中结果。"""
     if not isinstance(sample_tx, dict):
         raise ValueError("sample_tx must be an object")
     email = sample_tx.get("contact_email")
@@ -185,22 +188,32 @@ def simulate_custom_rule(rule_tree: dict[str, Any], sample_tx: dict[str, Any]) -
     }
 
 
-def _compute_single_tx_decision(
+def compute_single_tx_decision(
     tx: dict[str, Any],
     policy: dict[str, Any],
     *,
     win_tx_count: int,
     win_amount_cents: int,
     win_unique_cps: int,
+    win_median_cents: int,
+    sanction_hop: int,
 ) -> tuple[int, str, list[str]]:
+    """根据滑动窗口四维指标、三跳制裁传染等级、主权结算兼容规则与自定义规则树计算风险分。"""
     score = 0
     reasons: list[str] = []
 
     amount_cents = int(tx["amount_cents"])
     channel = str(tx.get("channel") or "POS_CHIP")
 
-    ch_weight = CHANNEL_RISK_WEIGHTS.get(channel, 8)
-    score += ch_weight
+    raw_ch_weight = CHANNEL_RISK_WEIGHTS.get(channel, 8)
+    adj_ch_weight, exempt_fanout, compat_tag = apply_sovereign_settlement_adjustment(
+        tx,
+        policy,
+        raw_ch_weight,
+    )
+    score += adj_ch_weight
+    if compat_tag:
+        reasons.append(compat_tag)
 
     high_amt = int(policy["high_amount_cents"])
     if amount_cents >= high_amt:
@@ -219,9 +232,19 @@ def _compute_single_tx_decision(
         score += 18
         reasons.append("VELOCITY_AMOUNT_SPIKE")
 
-    if win_unique_cps > int(policy["counterparty_fanout_limit"]):
+    if not exempt_fanout and win_unique_cps > int(policy["counterparty_fanout_limit"]):
         score += 14
         reasons.append("COUNTERPARTY_FANOUT")
+
+    # 动态中位数突变检测：窗口满 3 笔且当前交易金额达到窗口中位数的 3 倍及以上
+    if win_tx_count >= 3 and win_median_cents > 0 and amount_cents >= 3 * win_median_cents:
+        score += 11
+        reasons.append("MEDIAN_DEVIATION_SPIKE")
+
+    # 三跳受制裁实体传染加分
+    if sanction_hop in SANCTION_HOP_SCORES:
+        score += SANCTION_HOP_SCORES[sanction_hop]
+        reasons.append(f"SANCTION_HOP_{sanction_hop}")
 
     custom_tree = policy.get("custom_rules")
     if isinstance(custom_tree, dict) and custom_tree:
@@ -250,10 +273,7 @@ def evaluate_transaction_batch(
     batch_id: str,
     transactions: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """按输入顺序逐笔评估实时交易批次并持久化交易及风控决策记录。
-
-    同一批次必须是原子整体：若批次中任意一笔输入非法或交易号冲突，整批均不得落库生效。
-    """
+    """按输入顺序逐笔评估实时交易批次并持久化交易及风控决策记录。"""
     if not batch_id or not isinstance(transactions, list) or len(transactions) == 0:
         raise ValueError("batch_id and non-empty transactions list are required")
 
@@ -277,6 +297,13 @@ def evaluate_transaction_batch(
             raise ValueError(f"Invalid contact_email in transaction {tx_id}")
 
         policy = load_tenant_policy(db_path, caller.tenant_id)
+        sanction_hop = compute_sanction_contagion_hop(
+            db_path,
+            caller.tenant_id,
+            account_id,
+            counterparty_id,
+            ts,
+        )
 
         conn = open_connection(db_path)
         try:
@@ -289,17 +316,22 @@ def evaluate_transaction_batch(
             win_start = ts - SLIDING_WINDOW_SECONDS
             win_tx_count = 1
             win_amount_cents = amount_cents
+            win_amounts_list: list[int] = [amount_cents]
             cp_list: list[str] = [counterparty_id]
 
             for hr in hist_rows:
                 _ = json.loads(hr["metadata_json"])
                 if hr["account_id"] == account_id and win_start <= int(hr["ts"]) <= ts:
+                    h_amt = int(hr["amount_cents"])
                     win_tx_count += 1
-                    win_amount_cents += int(hr["amount_cents"])
+                    win_amount_cents += h_amt
+                    win_amounts_list.append(h_amt)
                     if hr["counterparty_id"] not in cp_list:
                         cp_list.append(hr["counterparty_id"])
 
             win_unique_cps = len(cp_list)
+            win_median_cents = compute_exact_median_cents(win_amounts_list)
+
             tx_eval_obj = {
                 "tx_id": tx_id,
                 "account_id": account_id,
@@ -311,12 +343,14 @@ def evaluate_transaction_batch(
                 "ts": ts,
                 "metadata": metadata,
             }
-            risk_score, decision, reasons = _compute_single_tx_decision(
+            risk_score, decision, reasons = compute_single_tx_decision(
                 tx_eval_obj,
                 policy,
                 win_tx_count=win_tx_count,
                 win_amount_cents=win_amount_cents,
                 win_unique_cps=win_unique_cps,
+                win_median_cents=win_median_cents,
+                sanction_hop=sanction_hop,
             )
 
             decision_id = f"dec_{tx_id}"
@@ -342,8 +376,9 @@ def evaluate_transaction_batch(
             conn.execute(
                 "INSERT INTO risk_decisions("
                 "decision_id, tx_id, tenant_id, account_id, risk_score, decision, "
-                "win_tx_count, win_amount_cents, win_unique_counterparties, reasons_json, evaluated_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "win_tx_count, win_amount_cents, win_unique_counterparties, win_median_cents, "
+                "sanction_hop, reasons_json, evaluated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     decision_id,
                     tx_id,
@@ -354,6 +389,8 @@ def evaluate_transaction_batch(
                     win_tx_count,
                     win_amount_cents,
                     win_unique_cps,
+                    win_median_cents,
+                    sanction_hop,
                     json.dumps(reasons),
                     ts,
                 ),
@@ -370,10 +407,12 @@ def evaluate_transaction_batch(
                 "account_id": account_id,
                 "risk_score": risk_score,
                 "decision": decision,
+                "sanction_hop": sanction_hop,
                 "window": {
                     "tx_count": win_tx_count,
                     "amount_cents": win_amount_cents,
                     "unique_counterparties": win_unique_cps,
+                    "median_cents": win_median_cents,
                 },
                 "reasons": reasons,
             }
@@ -393,12 +432,12 @@ def get_risk_decision_detail(
     caller: CallerContext,
     decision_id: str,
 ) -> dict[str, Any]:
-    """根据决策单号查询单笔实时风控评估详情。"""
     conn = open_connection(db_path)
     try:
         row = conn.execute(
             "SELECT decision_id, tx_id, tenant_id, account_id, risk_score, decision, "
-            "win_tx_count, win_amount_cents, win_unique_counterparties, reasons_json, evaluated_at "
+            "win_tx_count, win_amount_cents, win_unique_counterparties, win_median_cents, "
+            "sanction_hop, reasons_json, evaluated_at "
             "FROM risk_decisions WHERE decision_id = ?",
             (decision_id,),
         ).fetchone()
@@ -411,10 +450,12 @@ def get_risk_decision_detail(
             "account_id": row["account_id"],
             "risk_score": int(row["risk_score"]),
             "decision": row["decision"],
+            "sanction_hop": int(row["sanction_hop"]),
             "window": {
                 "tx_count": int(row["win_tx_count"]),
                 "amount_cents": int(row["win_amount_cents"]),
                 "unique_counterparties": int(row["win_unique_counterparties"]),
+                "median_cents": int(row["win_median_cents"]),
             },
             "reasons": json.loads(row["reasons_json"]),
             "evaluated_at": int(row["evaluated_at"]),
