@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
-"""高性能合规文档检索引擎：共享预分词倒排表 + Chinese Wall 隔离签名 + 双检纪元有界 LRU 缓存。"""
+"""高性能合规文档检索引擎：单篇 O(L) 写时复制增量倒排表 + 双指针词距加成 + 五维纪元有界 LRU。"""
 from __future__ import annotations
 
-from collections import Counter, OrderedDict
-from dataclasses import dataclass
+from collections import OrderedDict
 import re
 import threading
 import time
@@ -25,67 +24,150 @@ from .db import (
     get_tenant_epochs,
     get_thread_connection,
     normalize_db_key,
+    register_cache_reset_hook,
     require_strict_int,
 )
+from .doc_indexer import (
+    IndexedDoc,
+    build_indexed_doc,
+    compute_phrase_proximity_bonus_indexed,
+    tokenize_text,
+)
 
-TOKEN_RE = re.compile(r"[a-z0-9_]{2,}")
 ALLOWED_SORT_FIELDS = {"score", "updated_at", "risk_weight"}
 ALLOWED_SORT_DIRS = {"asc", "desc"}
 SAFE_TAG_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
-MAX_SEARCH_CACHE_ENTRIES = 512
-
-
-@dataclass(frozen=True)
-class IndexedDoc:
-    doc_id: str
-    category: str
-    regulation_code: str
-    clearance_level: int
-    risk_weight: int
-    custom_tag: str
-    title: str
-    snippet: str
-    citation_count: int
-    base_score: float
-    updated_at: int
-    title_tf: dict[str, int]
-    body_tf: dict[str, int]
-    token_set: frozenset[str]
-    token_set_len: int
+MAX_SEARCH_CACHE_ENTRIES = 256
 
 
 class TenantDocIndex:
-    def __init__(self, docs: list[IndexedDoc], postings: dict[str, list[int]]) -> None:
-        self.docs = docs
+    """不可变快照式租户文档倒排结构，支持无锁并发读取与单篇写时复制增量演进。"""
+
+    __slots__ = ("doc_epoch", "docs_by_id", "postings")
+
+    def __init__(
+        self,
+        *,
+        doc_epoch: int,
+        docs_by_id: dict[str, IndexedDoc],
+        postings: dict[str, frozenset[str]],
+    ) -> None:
+        self.doc_epoch = doc_epoch
+        self.docs_by_id = docs_by_id
         self.postings = postings
 
 
 _INDEX_CACHE_LOCK = threading.Lock()
-_TENANT_INDEX_CACHE: dict[tuple[str, str, int], TenantDocIndex] = {}
+# 仅保留每个 (db_key, tenant_id) 最新一代索引快照，杜绝多代历史拷贝驻留堆内存
+_TENANT_INDEX_CACHE: dict[tuple[str, str], TenantDocIndex] = {}
 
 _RESULT_CACHE_LOCK = threading.Lock()
 _SEARCH_RESULT_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
 
 
-def tokenize_text(text: str) -> list[str]:
-    if not text:
-        return []
-    return TOKEN_RE.findall(text.lower())
+def _clear_search_caches(db_key: str) -> None:
+    with _INDEX_CACHE_LOCK:
+        for k in [k for k in _TENANT_INDEX_CACHE if k[0] == db_key]:
+            _TENANT_INDEX_CACHE.pop(k, None)
+    with _RESULT_CACHE_LOCK:
+        for k in [k for k in _SEARCH_RESULT_CACHE if k[0] == db_key]:
+            _SEARCH_RESULT_CACHE.pop(k, None)
+
+
+register_cache_reset_hook(_clear_search_caches)
+
+
+def sync_single_doc_in_index(
+    db_path: str,
+    tenant_id: str,
+    doc_id: str,
+    new_doc_epoch: int,
+) -> None:
+    """当单篇文档发生 Upsert / Retire / Quarantine 时，在已构建倒排快照上执行 O(L) 增量差量替换。"""
+    db_key = normalize_db_key(db_path)
+    tk = (db_key, tenant_id)
+    with _INDEX_CACHE_LOCK:
+        cur_idx = _TENANT_INDEX_CACHE.get(tk)
+    if cur_idx is None:
+        return
+
+    conn = get_thread_connection(db_path)
+    row = conn.execute(
+        "SELECT doc_id, category, regulation_code, clearance_level, risk_weight, "
+        "custom_tag, title, body, status, quarantined, updated_at "
+        "FROM compliance_docs WHERE tenant_id = ? AND doc_id = ?",
+        (tenant_id, doc_id),
+    ).fetchone()
+
+    new_idoc: IndexedDoc | None = None
+    if row is not None and row["status"] == "ACTIVE" and int(row["quarantined"]) == 0:
+        c_row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM doc_citations WHERE tenant_id = ? AND doc_id = ?",
+            (tenant_id, doc_id),
+        ).fetchone()
+        cite_cnt = int(c_row["cnt"]) if c_row else 0
+        new_idoc = build_indexed_doc(
+            doc_id=str(row["doc_id"]),
+            category=str(row["category"]),
+            regulation_code=str(row["regulation_code"]),
+            clearance_level=int(row["clearance_level"]),
+            risk_weight=int(row["risk_weight"]),
+            custom_tag=str(row["custom_tag"]),
+            title=str(row["title"]),
+            body=str(row["body"]),
+            citation_count=cite_cnt,
+            updated_at=int(row["updated_at"]),
+        )
+
+    with _INDEX_CACHE_LOCK:
+        cur_idx = _TENANT_INDEX_CACHE.get(tk)
+        if cur_idx is None or cur_idx.doc_epoch != new_doc_epoch - 1:
+            # 若期间发生了跳跃版本并发写，安全移除使下次读取按最新纪元对齐重建
+            if cur_idx is not None and cur_idx.doc_epoch < new_doc_epoch:
+                _TENANT_INDEX_CACHE.pop(tk, None)
+            return
+
+        new_docs = dict(cur_idx.docs_by_id)
+        new_postings = dict(cur_idx.postings)
+        old_idoc = new_docs.pop(doc_id, None)
+        if old_idoc is not None:
+            rm_set = frozenset((doc_id,))
+            for term in old_idoc.token_set:
+                prev_p = new_postings.get(term)
+                if prev_p:
+                    rem = prev_p - rm_set
+                    if rem:
+                        new_postings[term] = rem
+                    else:
+                        new_postings.pop(term, None)
+
+        if new_idoc is not None:
+            new_docs[doc_id] = new_idoc
+            add_set = frozenset((doc_id,))
+            for term in new_idoc.token_set:
+                prev_p = new_postings.get(term)
+                new_postings[term] = (prev_p | add_set) if prev_p else add_set
+
+        _TENANT_INDEX_CACHE[tk] = TenantDocIndex(
+            doc_epoch=new_doc_epoch,
+            docs_by_id=new_docs,
+            postings=new_postings,
+        )
 
 
 def _get_or_build_tenant_index(db_path: str, tenant_id: str, doc_epoch: int) -> TenantDocIndex:
     db_key = normalize_db_key(db_path)
-    ck = (db_key, tenant_id, doc_epoch)
+    tk = (db_key, tenant_id)
     with _INDEX_CACHE_LOCK:
-        idx = _TENANT_INDEX_CACHE.get(ck)
-    if idx is not None:
-        return idx
+        idx = _TENANT_INDEX_CACHE.get(tk)
+        if idx is not None and idx.doc_epoch == doc_epoch:
+            return idx
 
     lock = get_striped_lock(db_path, tenant_id, "doc_index")
     with lock:
         with _INDEX_CACHE_LOCK:
-            idx = _TENANT_INDEX_CACHE.get(ck)
-            if idx is not None:
+            idx = _TENANT_INDEX_CACHE.get(tk)
+            if idx is not None and idx.doc_epoch == doc_epoch:
                 return idx
 
         conn = get_thread_connection(db_path)
@@ -99,52 +181,36 @@ def _get_or_build_tenant_index(db_path: str, tenant_id: str, doc_epoch: int) -> 
             "SELECT doc_id, COUNT(*) AS cnt FROM doc_citations WHERE tenant_id = ? GROUP BY doc_id",
             (tenant_id,),
         ).fetchall()
-        cite_map = {r["doc_id"]: int(r["cnt"]) for r in cite_rows}
+        cite_map = {str(r["doc_id"]): int(r["cnt"]) for r in cite_rows}
 
-        docs: list[IndexedDoc] = []
-        postings: dict[str, list[int]] = {}
+        docs_by_id: dict[str, IndexedDoc] = {}
+        postings_tmp: dict[str, set[str]] = {}
 
-        for pos, r in enumerate(doc_rows):
-            title_tokens = tokenize_text(r["title"])
-            body_tokens = tokenize_text(r["body"])
-            t_tf = dict(Counter(title_tokens))
-            b_tf = dict(Counter(body_tokens))
-            tok_set = frozenset(t_tf.keys()) | frozenset(b_tf.keys())
-            c_cnt = cite_map.get(r["doc_id"], 0)
-            r_weight = int(r["risk_weight"])
-            b_score = round(0.25 * c_cnt + 0.1 * r_weight, 4)
-
-            idoc = IndexedDoc(
-                doc_id=r["doc_id"],
-                category=r["category"],
-                regulation_code=r["regulation_code"],
+        for r in doc_rows:
+            did = str(r["doc_id"])
+            idoc = build_indexed_doc(
+                doc_id=did,
+                category=str(r["category"]),
+                regulation_code=str(r["regulation_code"]),
                 clearance_level=int(r["clearance_level"]),
-                risk_weight=r_weight,
-                custom_tag=r["custom_tag"],
-                title=r["title"],
-                snippet=r["body"][:140],
-                citation_count=c_cnt,
-                base_score=b_score,
+                risk_weight=int(r["risk_weight"]),
+                custom_tag=str(r["custom_tag"]),
+                title=str(r["title"]),
+                body=str(r["body"]),
+                citation_count=cite_map.get(did, 0),
                 updated_at=int(r["updated_at"]),
-                title_tf=t_tf,
-                body_tf=b_tf,
-                token_set=tok_set,
-                token_set_len=len(tok_set),
             )
-            docs.append(idoc)
-            for term in tok_set:
-                postings.setdefault(term, []).append(pos)
+            docs_by_id[did] = idoc
+            for term in idoc.token_set:
+                postings_tmp.setdefault(term, set()).add(did)
 
-        built = TenantDocIndex(docs=docs, postings=postings)
+        postings = {term: frozenset(dset) for term, dset in postings_tmp.items()}
+        built = TenantDocIndex(doc_epoch=doc_epoch, docs_by_id=docs_by_id, postings=postings)
+
         with _INDEX_CACHE_LOCK:
-            _, live_doc_ep, _ = get_tenant_epochs(db_path, tenant_id)
-            if live_doc_ep == doc_epoch:
-                stale_keys = [
-                    k for k in _TENANT_INDEX_CACHE if k[0] == db_key and k[1] == tenant_id and k[2] != doc_epoch
-                ]
-                for sk in stale_keys:
-                    _TENANT_INDEX_CACHE.pop(sk, None)
-                _TENANT_INDEX_CACHE[ck] = built
+            live_eps = get_tenant_epochs(db_path, tenant_id)
+            if live_eps.doc == doc_epoch:
+                _TENANT_INDEX_CACHE[tk] = built
         return built
 
 
@@ -163,8 +229,11 @@ def search_documents(
 ) -> dict[str, Any]:
     if not isinstance(query, str) or len(query) > MAX_QUERY_LENGTH:
         raise ValueError(f"Query length exceeds maximum {MAX_QUERY_LENGTH}")
-    if query.count("%") > 4 or query.count("*") > 6:
+    if query.count("%") > 3 or query.count("*") > 4 or query.count("?") > 6:
         raise ValueError("Excessive wildcard characters in query")
+    stripped_q = query.strip()
+    if stripped_q and all(ch in "%*?_." for ch in stripped_q):
+        raise ValueError("Pure wildcard query flood rejected")
 
     norm_sort_by = str(sort_by or "score").strip()
     norm_sort_dir = str(sort_dir or "desc").strip().lower()
@@ -187,16 +256,16 @@ def search_documents(
         raise ValueError(f"Query term count exceeds maximum {MAX_QUERY_TERMS}")
 
     db_key = normalize_db_key(db_path)
-    perm_epoch, doc_epoch, _ = get_tenant_epochs(db_path, caller.tenant_id)
+    eps = get_tenant_epochs(db_path, caller.tenant_id)
     max_cl = caller.max_clearance
     denied_set = caller.denied_doc_ids
 
-    # 缓存键融合租户、文档纪元、权限纪元、最高密级以及 Chinese Wall 被禁文档集合签名！
     res_cache_key = (
         db_key,
         caller.tenant_id,
-        doc_epoch,
-        perm_epoch,
+        eps.doc,
+        eps.perm,
+        eps.acl,
         max_cl,
         denied_set,
         query_terms,
@@ -214,20 +283,22 @@ def search_documents(
             _SEARCH_RESULT_CACHE.move_to_end(res_cache_key)
             return cached_resp
 
-    t_index = _get_or_build_tenant_index(db_path, caller.tenant_id, doc_epoch)
-    all_docs = t_index.docs
+    t_index = _get_or_build_tenant_index(db_path, caller.tenant_id, eps.doc)
+    docs_map = t_index.docs_by_id
 
     if query_terms:
-        candidate_indices: set[int] = set()
+        candidate_ids: set[str] = set()
         for term in query_terms:
-            plist = t_index.postings.get(term)
-            if plist:
-                candidate_indices.update(plist)
-        iter_docs = [all_docs[i] for i in candidate_indices]
+            pset = t_index.postings.get(term)
+            if pset:
+                candidate_ids.update(pset)
+        iter_docs = [docs_map[did] for did in candidate_ids if did in docs_map]
     else:
-        iter_docs = all_docs
+        iter_docs = list(docs_map.values())
 
+    need_prox = len(query_terms) >= 2
     scored_candidates: list[tuple[IndexedDoc, float]] = []
+
     for idoc in iter_docs:
         if idoc.clearance_level > max_cl:
             continue
@@ -249,7 +320,12 @@ def search_documents(
                     term_score += 3.5 * (tc if tc < 5 else 5)
                 if bc:
                     term_score += 1.0 * (bc if bc < 12 else 12)
-            total_score = round(term_score + idoc.base_score, 4)
+            prox_bonus = (
+                compute_phrase_proximity_bonus_indexed(idoc.body_positions, query_terms)
+                if need_prox
+                else 0.0
+            )
+            total_score = round(term_score + prox_bonus + idoc.base_score, 4)
         else:
             total_score = idoc.base_score
 
@@ -259,13 +335,13 @@ def search_documents(
 
     if deduplicate:
         kept_entries: list[dict[str, Any]] = []
-        kept_by_reg: dict[str, list[tuple[frozenset[str], int, dict[str, Any]]]] = {}
+        kept_by_canon_reg: dict[str, list[tuple[frozenset[str], int, dict[str, Any]]]] = {}
 
         for idoc, sc in scored_candidates:
-            reg = idoc.regulation_code
+            creg = idoc.canon_reg
             merged = False
-            if reg:
-                bucket = kept_by_reg.get(reg)
+            if creg:
+                bucket = kept_by_canon_reg.get(creg)
                 if bucket:
                     cand_set = idoc.token_set
                     cand_len = idoc.token_set_len
@@ -289,7 +365,7 @@ def search_documents(
                 entry = {
                     "doc_id": idoc.doc_id,
                     "category": idoc.category,
-                    "regulation_code": reg,
+                    "regulation_code": idoc.regulation_code,
                     "clearance_level": idoc.clearance_level,
                     "risk_weight": idoc.risk_weight,
                     "custom_tag": idoc.custom_tag,
@@ -301,8 +377,8 @@ def search_documents(
                     "cluster_size": 1,
                 }
                 kept_entries.append(entry)
-                if reg:
-                    kept_by_reg.setdefault(reg, []).append((idoc.token_set, idoc.token_set_len, entry))
+                if creg:
+                    kept_by_canon_reg.setdefault(creg, []).append((idoc.token_set, idoc.token_set_len, entry))
 
         final_list = kept_entries
     else:
@@ -342,10 +418,9 @@ def search_documents(
         "items": items_out,
     }
 
-    # 双检纪元锁 + 有界 LRU 淘汰（防并发撤权脏回填 + 防随机查询穿透打爆内存）
     with _RESULT_CACHE_LOCK:
-        live_perm_ep, live_doc_ep, _ = get_tenant_epochs(db_path, caller.tenant_id)
-        if live_perm_ep == perm_epoch and live_doc_ep == doc_epoch:
+        live_eps = get_tenant_epochs(db_path, caller.tenant_id)
+        if live_eps.perm == eps.perm and live_eps.acl == eps.acl and live_eps.doc == eps.doc:
             _SEARCH_RESULT_CACHE[res_cache_key] = response
             _SEARCH_RESULT_CACHE.move_to_end(res_cache_key)
             while len(_SEARCH_RESULT_CACHE) > MAX_SEARCH_CACHE_ENTRIES:
@@ -358,7 +433,7 @@ def batch_get_documents(
     caller: CallerContext,
     doc_ids: list[str],
 ) -> dict[str, Any]:
-    """同时执行横向租户边界、纵向密级上限、隔离下架状态与 Chinese Wall 利益冲突规则四重过滤。"""
+    """同时执行横向租户边界、纵向密级上限、退役/隔离状态与三级利益冲突隔离墙四重过滤。"""
     if not isinstance(doc_ids, list) or not doc_ids:
         raise ValueError("doc_ids must be a non-empty list")
     if len(doc_ids) > MAX_BATCH_DOCS:
@@ -382,7 +457,7 @@ def batch_get_documents(
         (caller.tenant_id, caller.max_clearance, *unique_ids),
     ).fetchall()
 
-    by_id = {r["doc_id"]: r for r in rows}
+    by_id = {str(r["doc_id"]): r for r in rows}
     items = []
     for did in doc_ids:
         if did in caller.denied_doc_ids:
@@ -421,7 +496,7 @@ def set_document_quarantine(
     require_admin(caller)
     if not isinstance(doc_id, str) or not doc_id or len(doc_id) > 128:
         raise ValueError("Invalid doc_id")
-    now_ts = int(time.time())
+    now_ts = int(caller.request_ts or int(time.time()))
     q_val = 1 if quarantined else 0
 
     lock = get_striped_lock(db_path, caller.tenant_id, "doc_write")
@@ -433,10 +508,12 @@ def set_document_quarantine(
             (q_val, now_ts, caller.tenant_id, doc_id),
         )
         if cur.rowcount == 0:
-            conn.rollback()
+            if conn.in_transaction:
+                conn.rollback()
             raise LookupError(f"Document not found in tenant: {doc_id}")
         conn.commit()
-        bump_tenant_epoch(db_path, caller.tenant_id, "doc")
+        new_ep = bump_tenant_epoch(db_path, caller.tenant_id, "doc")
+        sync_single_doc_in_index(db_path, caller.tenant_id, doc_id, new_ep)
 
     return {
         "tenant_id": caller.tenant_id,

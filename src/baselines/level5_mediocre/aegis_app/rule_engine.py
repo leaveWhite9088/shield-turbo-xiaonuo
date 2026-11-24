@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""实时风控引擎（5级平庸样本：共用单次事务连接，但仍逐笔按租户查库过滤窗口，未消除回溯正则与深层递归炸弹）。"""
+"""风控引擎（5级平庸样本：仍逐笔独立建连提交导致半批脏残留，未修回溯正则、规则炸弹与非严格数值类型）。"""
 from __future__ import annotations
 
 import json
@@ -8,8 +8,15 @@ import time
 from typing import Any
 
 from .auth import CallerContext, require_admin
-from .config import CHANNEL_RISK_WEIGHTS, SLIDING_WINDOW_SECONDS
+from .config import (
+    CHANNEL_RISK_WEIGHTS,
+    SANCTION_HOP_SCORES,
+    SLIDING_WINDOW_SECONDS,
+)
+from .contagion_graph import compute_sanction_contagion_hop
 from .db import open_connection
+from .legacy_compat import apply_sovereign_settlement_adjustment
+from .window_stats import compute_exact_median_cents
 
 PARTNER_EMAIL_PATTERN = re.compile(
     r"^([a-zA-Z0-9]+([._-][a-zA-Z0-9]+)*)+@([a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+)$"
@@ -62,7 +69,7 @@ def update_tenant_policy(
         raise ValueError("custom_rules must be a JSON object")
 
     new_ver = int(current["policy_version"]) + 1
-    now_ts = int(time.time())
+    now_ts = int(caller.request_ts or int(time.time()))
     conn = open_connection(db_path)
     try:
         conn.execute(
@@ -181,13 +188,15 @@ def simulate_custom_rule(rule_tree: dict[str, Any], sample_tx: dict[str, Any]) -
     }
 
 
-def _compute_single_tx_decision(
+def compute_single_tx_decision(
     tx: dict[str, Any],
     policy: dict[str, Any],
     *,
     win_tx_count: int,
     win_amount_cents: int,
     win_unique_cps: int,
+    win_median_cents: int,
+    sanction_hop: int,
 ) -> tuple[int, str, list[str]]:
     score = 0
     reasons: list[str] = []
@@ -195,8 +204,15 @@ def _compute_single_tx_decision(
     amount_cents = int(tx["amount_cents"])
     channel = str(tx.get("channel") or "POS_CHIP")
 
-    ch_weight = CHANNEL_RISK_WEIGHTS.get(channel, 8)
-    score += ch_weight
+    raw_ch_weight = CHANNEL_RISK_WEIGHTS.get(channel, 8)
+    adj_ch_weight, exempt_fanout, compat_tag = apply_sovereign_settlement_adjustment(
+        tx,
+        policy,
+        raw_ch_weight,
+    )
+    score += adj_ch_weight
+    if compat_tag:
+        reasons.append(compat_tag)
 
     high_amt = int(policy["high_amount_cents"])
     if amount_cents >= high_amt:
@@ -215,9 +231,17 @@ def _compute_single_tx_decision(
         score += 18
         reasons.append("VELOCITY_AMOUNT_SPIKE")
 
-    if win_unique_cps > int(policy["counterparty_fanout_limit"]):
+    if not exempt_fanout and win_unique_cps > int(policy["counterparty_fanout_limit"]):
         score += 14
         reasons.append("COUNTERPARTY_FANOUT")
+
+    if win_tx_count >= 3 and win_median_cents > 0 and amount_cents >= 3 * win_median_cents:
+        score += 11
+        reasons.append("MEDIAN_DEVIATION_SPIKE")
+
+    if sanction_hop in SANCTION_HOP_SCORES:
+        score += SANCTION_HOP_SCORES[sanction_hop]
+        reasons.append(f"SANCTION_HOP_{sanction_hop}")
 
     custom_tree = policy.get("custom_rules")
     if isinstance(custom_tree, dict) and custom_tree:
@@ -253,35 +277,53 @@ def evaluate_transaction_batch(
     results: list[dict[str, Any]] = []
     counts = {"ALLOW": 0, "REVIEW": 0, "REJECT": 0}
 
-    conn = open_connection(db_path)
-    try:
-        for item in transactions:
-            tx_id = str(item.get("tx_id") or "").strip()
-            account_id = str(item.get("account_id") or "").strip()
-            counterparty_id = str(item.get("counterparty_id") or "").strip()
-            amount_cents = int(item.get("amount_cents") or 0)
-            currency = str(item.get("currency") or "USD").strip()
-            channel = str(item.get("channel") or "POS_CHIP").strip()
-            contact_email = str(item.get("contact_email") or "").strip()
-            ts = int(item.get("ts") or 0)
-            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    for item in transactions:
+        tx_id = str(item.get("tx_id") or "").strip()
+        account_id = str(item.get("account_id") or "").strip()
+        counterparty_id = str(item.get("counterparty_id") or "").strip()
+        amount_cents = int(item.get("amount_cents") or 0)
+        currency = str(item.get("currency") or "USD").strip()
+        channel = str(item.get("channel") or "POS_CHIP").strip()
+        contact_email = str(item.get("contact_email") or "").strip()
+        ts = int(item.get("ts") or 0)
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
 
-            if not tx_id or not account_id or not counterparty_id or amount_cents <= 0 or ts <= 0:
-                raise ValueError(f"Invalid required transaction fields for tx_id={tx_id!r}")
-            if not validate_contact_email(contact_email):
-                raise ValueError(f"Invalid contact_email in transaction {tx_id}")
+        if not tx_id or not account_id or not counterparty_id or amount_cents <= 0 or ts <= 0:
+            raise ValueError(f"Invalid required transaction fields for tx_id={tx_id!r}")
+        if not validate_contact_email(contact_email):
+            raise ValueError(f"Invalid contact_email in transaction {tx_id}")
 
+        sanction_hop = compute_sanction_contagion_hop(
+            db_path,
+            caller.tenant_id,
+            account_id,
+            counterparty_id,
+            ts,
+        )
+
+        conn = open_connection(db_path)
+        try:
             win_start = ts - SLIDING_WINDOW_SECONDS
             hist_rows = conn.execute(
                 "SELECT counterparty_id, amount_cents FROM transactions "
-                "WHERE tenant_id = ? AND account_id = ? AND ts BETWEEN ? AND ?",
+                "WHERE tenant_id = ? AND account_id = ? AND ts >= ? AND ts <= ?",
                 (caller.tenant_id, account_id, win_start, ts),
             ).fetchall()
 
-            win_tx_count = 1 + len(hist_rows)
-            win_amount_cents = amount_cents + sum(int(hr["amount_cents"]) for hr in hist_rows)
-            cp_set = {counterparty_id} | {hr["counterparty_id"] for hr in hist_rows}
+            win_tx_count = 1
+            win_amount_cents = amount_cents
+            win_amounts_list: list[int] = [amount_cents]
+            cp_set: set[str] = {counterparty_id}
+
+            for hr in hist_rows:
+                h_amt = int(hr["amount_cents"])
+                win_tx_count += 1
+                win_amount_cents += h_amt
+                win_amounts_list.append(h_amt)
+                cp_set.add(hr["counterparty_id"])
+
             win_unique_cps = len(cp_set)
+            win_median_cents = compute_exact_median_cents(win_amounts_list)
 
             tx_eval_obj = {
                 "tx_id": tx_id,
@@ -294,12 +336,14 @@ def evaluate_transaction_batch(
                 "ts": ts,
                 "metadata": metadata,
             }
-            risk_score, decision, reasons = _compute_single_tx_decision(
+            risk_score, decision, reasons = compute_single_tx_decision(
                 tx_eval_obj,
                 policy,
                 win_tx_count=win_tx_count,
                 win_amount_cents=win_amount_cents,
                 win_unique_cps=win_unique_cps,
+                win_median_cents=win_median_cents,
+                sanction_hop=sanction_hop,
             )
 
             decision_id = f"dec_{tx_id}"
@@ -325,8 +369,9 @@ def evaluate_transaction_batch(
             conn.execute(
                 "INSERT INTO risk_decisions("
                 "decision_id, tx_id, tenant_id, account_id, risk_score, decision, "
-                "win_tx_count, win_amount_cents, win_unique_counterparties, reasons_json, evaluated_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "win_tx_count, win_amount_cents, win_unique_counterparties, win_median_cents, "
+                "sanction_hop, reasons_json, evaluated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     decision_id,
                     tx_id,
@@ -337,31 +382,34 @@ def evaluate_transaction_batch(
                     win_tx_count,
                     win_amount_cents,
                     win_unique_cps,
+                    win_median_cents,
+                    sanction_hop,
                     json.dumps(reasons),
                     ts,
                 ),
             )
             conn.commit()
+        finally:
+            conn.close()
 
-            counts[decision] += 1
-            results.append(
-                {
-                    "decision_id": decision_id,
-                    "tx_id": tx_id,
-                    "account_id": account_id,
-                    "risk_score": risk_score,
-                    "decision": decision,
-                    "window": {
-                        "tx_count": win_tx_count,
-                        "amount_cents": win_amount_cents,
-                        "unique_counterparties": win_unique_cps,
-                    },
-                    "reasons": reasons,
-                }
-            )
-        conn.commit()
-    finally:
-        conn.close()
+        counts[decision] += 1
+        results.append(
+            {
+                "decision_id": decision_id,
+                "tx_id": tx_id,
+                "account_id": account_id,
+                "risk_score": risk_score,
+                "decision": decision,
+                "sanction_hop": sanction_hop,
+                "window": {
+                    "tx_count": win_tx_count,
+                    "amount_cents": win_amount_cents,
+                    "unique_counterparties": win_unique_cps,
+                    "median_cents": win_median_cents,
+                },
+                "reasons": reasons,
+            }
+        )
 
     return {
         "tenant_id": caller.tenant_id,
@@ -381,7 +429,8 @@ def get_risk_decision_detail(
     try:
         row = conn.execute(
             "SELECT decision_id, tx_id, tenant_id, account_id, risk_score, decision, "
-            "win_tx_count, win_amount_cents, win_unique_counterparties, reasons_json, evaluated_at "
+            "win_tx_count, win_amount_cents, win_unique_counterparties, win_median_cents, "
+            "sanction_hop, reasons_json, evaluated_at "
             "FROM risk_decisions WHERE decision_id = ? AND tenant_id = ?",
             (decision_id, caller.tenant_id),
         ).fetchone()
@@ -394,10 +443,12 @@ def get_risk_decision_detail(
             "account_id": row["account_id"],
             "risk_score": int(row["risk_score"]),
             "decision": row["decision"],
+            "sanction_hop": int(row["sanction_hop"]),
             "window": {
                 "tx_count": int(row["win_tx_count"]),
                 "amount_cents": int(row["win_amount_cents"]),
                 "unique_counterparties": int(row["win_unique_counterparties"]),
+                "median_cents": int(row["win_median_cents"]),
             },
             "reasons": json.loads(row["reasons_json"]),
             "evaluated_at": int(row["evaluated_at"]),

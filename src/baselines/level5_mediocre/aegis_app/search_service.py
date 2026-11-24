@@ -1,32 +1,27 @@
 # -*- coding: utf-8 -*-
-"""合规检索服务（5级平庸样本：保留了 O(N^2) 聚类扫描，缓存未绑定角色密级变化且撤权时未失效，batch_get 漏纵向密级校验）。"""
+"""合规文档检索服务（5级平庸样本：保留 O(N^2) 去重，无界粗糙缓存漏绑权限纪元/委托时效，batch_get 漏纵向与隔离墙校验）。"""
 from __future__ import annotations
 
 from collections import Counter
 import copy
-import re
 import time
 from typing import Any
 
 from .auth import CallerContext, is_doc_blocked_by_acl, require_admin
 from .config import DEDUP_JACCARD_THRESHOLD, DEFAULT_PAGE_LIMIT
 from .db import open_connection
+from .doc_indexer import compute_phrase_proximity_bonus, tokenize_text
+from .legacy_compat import canonicalize_regulation_code
 
-TOKEN_RE = re.compile(r"[a-z0-9_]{2,}")
-
-# 5级平庸缓存：仅按 (db_path, tenant_id, user_id, 查询参数) 缓存，当管理员在 auth.py 撤回该用户授权时不会清理此缓存！
+# 5级平庸缓存：无容量上限，未绑定角色撤回/借调过期/利益冲突墙更新，且任意文档写入即整库清空
 _NAIVE_SEARCH_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 
 
-def tokenize_text(text: str) -> list[str]:
-    if not text:
-        return []
-    return TOKEN_RE.findall(text.lower())
+def clear_naive_search_cache() -> None:
+    _NAIVE_SEARCH_CACHE.clear()
 
 
-def _jaccard_similarity(tokens_a: list[str], tokens_b: list[str]) -> float:
-    set_a = set(tokens_a)
-    set_b = set(tokens_b)
+def _jaccard_sets(set_a: set[str], set_b: set[str]) -> float:
     if not set_a and not set_b:
         return 1.0
     union_len = len(set_a | set_b)
@@ -48,8 +43,6 @@ def search_documents(
     limit: int = DEFAULT_PAGE_LIMIT,
     offset: int = 0,
 ) -> dict[str, Any]:
-    # 简单字符串过滤防注入
-    safe_tag = tag_filter.replace("'", "").replace(";", "").replace("--", "")
     if sort_by not in ("score", "updated_at", "risk_weight"):
         raise ValueError("Unsupported sort_by field")
     if str(sort_dir).lower() not in ("asc", "desc"):
@@ -61,7 +54,7 @@ def search_documents(
         caller.user_id,
         query,
         category,
-        safe_tag,
+        tag_filter,
         deduplicate,
         sort_by,
         str(sort_dir).lower(),
@@ -123,18 +116,21 @@ def search_documents(
                 3.5 * min(title_tf.get(t, 0), 5) + 1.0 * min(body_tf.get(t, 0), 12)
                 for t in query_terms
             )
+            prox_bonus = compute_phrase_proximity_bonus(body_tokens, query_terms)
         else:
             term_score = 0.0
+            prox_bonus = 0.0
 
         cite_cnt = cite_map.get(row["doc_id"], 0)
         risk_w = int(row["risk_weight"])
-        total_score = round(term_score + 0.25 * cite_cnt + 0.1 * risk_w, 4)
+        total_score = round(term_score + prox_bonus + 0.25 * cite_cnt + 0.1 * risk_w, 4)
 
         candidates.append(
             {
                 "doc_id": row["doc_id"],
                 "category": row["category"],
                 "regulation_code": row["regulation_code"],
+                "_canon_reg": canonicalize_regulation_code(row["regulation_code"]),
                 "clearance_level": int(row["clearance_level"]),
                 "risk_weight": risk_w,
                 "custom_tag": row["custom_tag"],
@@ -143,13 +139,12 @@ def search_documents(
                 "citation_count": cite_cnt,
                 "score": total_score,
                 "updated_at": int(row["updated_at"]),
-                "_all_tokens": title_tokens + body_tokens,
+                "_tok_set": set(title_tokens + body_tokens),
             }
         )
 
     candidates.sort(key=lambda d: (-d["score"], -d["updated_at"], d["doc_id"]))
 
-    # 仍保留 O(N^2) 嵌套遍历去重
     if deduplicate:
         kept: list[dict[str, Any]] = []
         consumed = [False] * len(candidates)
@@ -161,10 +156,10 @@ def search_documents(
             for j in range(i + 1, len(candidates)):
                 if consumed[j]:
                     continue
-                same_reg = bool(rep["regulation_code"]) and (
-                    rep["regulation_code"] == candidates[j]["regulation_code"]
+                same_reg = bool(rep["_canon_reg"]) and (
+                    rep["_canon_reg"] == candidates[j]["_canon_reg"]
                 )
-                sim = _jaccard_similarity(rep["_all_tokens"], candidates[j]["_all_tokens"])
+                sim = _jaccard_sets(rep["_tok_set"], candidates[j]["_tok_set"])
                 if same_reg and sim >= DEDUP_JACCARD_THRESHOLD:
                     consumed[j] = True
                     cluster_size += 1
@@ -206,7 +201,7 @@ def batch_get_documents(
     caller: CallerContext,
     doc_ids: list[str],
 ) -> dict[str, Any]:
-    """仅补了 tenant_id 过滤，但遗漏了 clearance_level 与 quarantined 纵向密级拦截。"""
+    """仅补了 tenant_id 过滤，遗漏了纵向 clearance_level、quarantined 与利益冲突隔离墙拦截。"""
     if not isinstance(doc_ids, list) or not doc_ids:
         raise ValueError("doc_ids must be a non-empty list")
 
@@ -257,7 +252,7 @@ def set_document_quarantine(
     quarantined: bool,
 ) -> dict[str, Any]:
     require_admin(caller)
-    now_ts = int(time.time())
+    now_ts = int(caller.request_ts or int(time.time()))
     q_val = 1 if quarantined else 0
     conn = open_connection(db_path)
     try:
@@ -272,7 +267,7 @@ def set_document_quarantine(
     finally:
         conn.close()
 
-    _NAIVE_SEARCH_CACHE.clear()
+    clear_naive_search_cache()
     return {
         "tenant_id": caller.tenant_id,
         "doc_id": doc_id,

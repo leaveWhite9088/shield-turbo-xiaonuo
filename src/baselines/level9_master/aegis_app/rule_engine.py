@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""高性能风控引擎：零回溯邮箱校验、多变体正则/规则预算熔断、严格整数/有限浮点校验与批次强原子事务。"""
+"""高性能风控引擎：零回溯邮箱校验、全变体正则/规则预算熔断、O(log W) 滑窗中位数、3跳传染与单事务强原子提交。"""
 from __future__ import annotations
 
+import functools
 import json
 import math
 import re
@@ -15,30 +16,46 @@ from .config import (
     CHANNEL_RISK_WEIGHTS,
     MAX_BATCH_TXS,
     MAX_REGEX_PATTERN_LEN,
+    MAX_REGEX_QUANTIFIER,
     MAX_RULE_DEPTH,
     MAX_RULE_NODES,
+    SANCTION_HOP_SCORES,
     SLIDING_WINDOW_SECONDS,
 )
+from .contagion_graph import eval_3hop_from_window_adj, get_active_sanctioned_entities
 from .db import (
     bump_tenant_epoch,
     get_striped_lock,
     get_tenant_epochs,
     get_thread_connection,
     normalize_db_key,
+    register_cache_reset_hook,
     require_strict_int,
 )
+from .legacy_compat import apply_sovereign_settlement_adjustment
+from .window_stats import SlidingAccountWindow
 
-# 拦截嵌套重复量词、重叠分支重复 (a|aa)+、回溯先行断言及连续多项 .* / .+ 通配链
-_UNSAFE_NESTED_QUANT = re.compile(r"(\+|\*|\{[0-9,]+\})\s*\)\s*(\+|\*|\?|\{[0-9,]+\})|\(\?[<=!P]")
+# 拦截嵌套重复量词、重叠分支重复、反向引用、前瞻/后顾断言、多段通配符链与超大花括号重复上界
+_UNSAFE_NESTED_QUANT = re.compile(r"(\+|\*|\{[0-9,]+\})\s*\)\s*(\+|\*|\?|\{[0-9,]+\})|\(\?[<=!P]|\\[1-9]")
 _UNSAFE_ALT_REPEAT = re.compile(r"\([^)]*\|[^)]*\)\s*(\+|\*|\{[0-9,]+\})")
-_WILDCARD_CHAIN = re.compile(r"\.[\*\+]")
+_WILDCARD_CHAIN = re.compile(r"(?:\.|\[[^\]]+\]|\(\\w\)|\\w|\\S)[\*\+]")
+_BRACE_QUANT_RE = re.compile(r"\{(\d+)(?:,(\d*))?\}")
 
 _POLICY_CACHE_LOCK = threading.Lock()
-_POLICY_CACHE: dict[tuple[str, str, int], dict[str, Any]] = {}
+_POLICY_CACHE: dict[tuple[str, str], tuple[int, dict[str, Any]]] = {}
+
+
+def _clear_policy_cache(db_key: str) -> None:
+    with _POLICY_CACHE_LOCK:
+        for k in [k for k in _POLICY_CACHE if k[0] == db_key]:
+            _POLICY_CACHE.pop(k, None)
+
+
+register_cache_reset_hook(_clear_policy_cache)
 
 
 class BatchConflictError(ValueError):
-    """批次内或与历史交易发生主键冲突。"""
+    """交易批次内部或与已落盘记录发生主键冲突。"""
 
 
 def _is_alnum_ascii(ch: str) -> bool:
@@ -75,17 +92,26 @@ def validate_contact_email(email: str) -> bool:
     return True
 
 
-def _validate_safe_regex_pattern(pattern: str) -> None:
+@functools.lru_cache(maxsize=256)
+def _compile_safe_regex(pattern: str) -> re.Pattern[str]:
     if len(pattern) > MAX_REGEX_PATTERN_LEN:
         raise ValueError(f"Regex pattern exceeds maximum length {MAX_REGEX_PATTERN_LEN}")
     if _UNSAFE_NESTED_QUANT.search(pattern) or _UNSAFE_ALT_REPEAT.search(pattern):
         raise ValueError("Unsafe backtracking regex construct rejected")
     if len(_WILDCARD_CHAIN.findall(pattern)) > 1:
         raise ValueError("Multiple unbounded wildcard chains rejected")
+    for m in _BRACE_QUANT_RE.finditer(pattern):
+        low_b = int(m.group(1))
+        high_s = m.group(2)
+        if high_s == "":
+            raise ValueError("Unbounded brace quantifier rejected")
+        high_b = int(high_s) if high_s is not None else low_b
+        if low_b > MAX_REGEX_QUANTIFIER or high_b > MAX_REGEX_QUANTIFIER or high_b < low_b:
+            raise ValueError(f"Brace quantifier exceeds safe limit {MAX_REGEX_QUANTIFIER}")
     if pattern.count("(") > 3 or (pattern.count("+") + pattern.count("*") + pattern.count("{")) > 3:
         raise ValueError("Regex complexity budget exceeded")
     try:
-        re.compile(pattern)
+        return re.compile(pattern)
     except re.error as exc:
         raise ValueError(f"Invalid regex syntax: {exc}") from exc
 
@@ -137,7 +163,7 @@ def validate_rule_tree_budget(root: dict[str, Any]) -> None:
             pat = curr.get("value")
             if not isinstance(pat, str):
                 raise ValueError("REGEX operator value must be a string")
-            _validate_safe_regex_pattern(pat)
+            _compile_safe_regex(pat)
         elif op in ("GT", "GTE", "LT", "LTE"):
             _to_finite_number(curr.get("value"), "rule threshold value")
         elif op in ("EQ", "NEQ", "IN", "CONTAINS"):
@@ -155,12 +181,12 @@ def validate_rule_tree_budget(root: dict[str, Any]) -> None:
 
 def load_tenant_policy(db_path: str, tenant_id: str) -> dict[str, Any]:
     db_key = normalize_db_key(db_path)
-    _, _, policy_epoch = get_tenant_epochs(db_path, tenant_id)
-    ck = (db_key, tenant_id, policy_epoch)
+    eps = get_tenant_epochs(db_path, tenant_id)
+    tk = (db_key, tenant_id)
     with _POLICY_CACHE_LOCK:
-        cached = _POLICY_CACHE.get(ck)
-    if cached is not None:
-        return cached
+        cached = _POLICY_CACHE.get(tk)
+        if cached is not None and cached[0] == eps.policy:
+            return cached[1]
 
     conn = get_thread_connection(db_path)
     row = conn.execute(
@@ -175,11 +201,9 @@ def load_tenant_policy(db_path: str, tenant_id: str) -> dict[str, Any]:
     policy = dict(row)
     policy["custom_rules"] = json.loads(policy["custom_rules_json"])
     with _POLICY_CACHE_LOCK:
-        _, _, live_pol_ep = get_tenant_epochs(db_path, tenant_id)
-        if live_pol_ep == policy_epoch:
-            if len(_POLICY_CACHE) > 512:
-                _POLICY_CACHE.clear()
-            _POLICY_CACHE[ck] = policy
+        live_eps = get_tenant_epochs(db_path, tenant_id)
+        if live_eps.policy == eps.policy:
+            _POLICY_CACHE[tk] = (eps.policy, policy)
     return policy
 
 
@@ -203,6 +227,7 @@ def update_tenant_policy(
     if custom_rules:
         validate_rule_tree_budget(custom_rules)
 
+    now_ts = int(caller.request_ts or int(time.time()))
     lock = get_striped_lock(db_path, caller.tenant_id, "policy")
     with lock:
         conn = get_thread_connection(db_path)
@@ -211,7 +236,6 @@ def update_tenant_policy(
             (caller.tenant_id,),
         ).fetchone()
         new_ver = int(ver_row["policy_version"]) + 1 if ver_row else int(current["policy_version"]) + 1
-        now_ts = int(time.time())
         conn.execute(
             "UPDATE tenant_policies SET policy_version = ?, high_amount_cents = ?, "
             "velocity_tx_limit = ?, velocity_amount_cents = ?, counterparty_fanout_limit = ?, "
@@ -290,7 +314,18 @@ def eval_rule_node(node: dict[str, Any], tx: dict[str, Any], _depth: int = 1) ->
 
     matched = False
     if op == "EQ":
-        matched = (type(actual) is type(target) or isinstance(actual, (int, float)) and isinstance(target, (int, float)) and not isinstance(actual, bool) and not isinstance(target, bool)) and (actual == target)
+        matched = (
+            (
+                type(actual) is type(target)
+                or (
+                    isinstance(actual, (int, float))
+                    and isinstance(target, (int, float))
+                    and not isinstance(actual, bool)
+                    and not isinstance(target, bool)
+                )
+            )
+            and (actual == target)
+        )
     elif op == "NEQ":
         matched = actual != target
     elif op in ("GT", "GTE", "LT", "LTE"):
@@ -312,11 +347,11 @@ def eval_rule_node(node: dict[str, Any], tx: dict[str, Any], _depth: int = 1) ->
     elif op == "REGEX":
         if not isinstance(target, str):
             raise ValueError("REGEX target must be a string")
-        _validate_safe_regex_pattern(target)
+        compiled = _compile_safe_regex(target)
         if isinstance(actual, str):
             if len(actual) > 256:
                 raise ValueError("REGEX input text exceeds maximum safe length")
-            matched = re.search(target, actual) is not None
+            matched = compiled.search(actual) is not None
     else:
         raise ValueError(f"Unsupported rule operator: {op}")
 
@@ -340,13 +375,15 @@ def simulate_custom_rule(rule_tree: dict[str, Any], sample_tx: dict[str, Any]) -
     }
 
 
-def _compute_single_tx_decision(
+def compute_single_tx_decision(
     tx: dict[str, Any],
     policy: dict[str, Any],
     *,
     win_tx_count: int,
     win_amount_cents: int,
     win_unique_cps: int,
+    win_median_cents: int,
+    sanction_hop: int,
 ) -> tuple[int, str, list[str]]:
     score = 0
     reasons: list[str] = []
@@ -354,8 +391,15 @@ def _compute_single_tx_decision(
     amount_cents = int(tx["amount_cents"])
     channel = str(tx.get("channel") or "POS_CHIP")
 
-    ch_weight = CHANNEL_RISK_WEIGHTS.get(channel, 8)
-    score += ch_weight
+    raw_ch_weight = CHANNEL_RISK_WEIGHTS.get(channel, 8)
+    adj_ch_weight, exempt_fanout, compat_tag = apply_sovereign_settlement_adjustment(
+        tx,
+        policy,
+        raw_ch_weight,
+    )
+    score += adj_ch_weight
+    if compat_tag:
+        reasons.append(compat_tag)
 
     high_amt = int(policy["high_amount_cents"])
     if amount_cents >= high_amt:
@@ -374,9 +418,17 @@ def _compute_single_tx_decision(
         score += 18
         reasons.append("VELOCITY_AMOUNT_SPIKE")
 
-    if win_unique_cps > int(policy["counterparty_fanout_limit"]):
+    if not exempt_fanout and win_unique_cps > int(policy["counterparty_fanout_limit"]):
         score += 14
         reasons.append("COUNTERPARTY_FANOUT")
+
+    if win_tx_count >= 3 and win_median_cents > 0 and amount_cents >= 3 * win_median_cents:
+        score += 11
+        reasons.append("MEDIAN_DEVIATION_SPIKE")
+
+    if sanction_hop in SANCTION_HOP_SCORES:
+        score += SANCTION_HOP_SCORES[sanction_hop]
+        reasons.append(f"SANCTION_HOP_{sanction_hop}")
 
     custom_tree = policy.get("custom_rules")
     if isinstance(custom_tree, dict) and custom_tree:
@@ -405,7 +457,6 @@ def evaluate_transaction_batch(
     batch_id: str,
     transactions: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """全批次严格前置校验 + 批次内与数据库主键冲突预检 + 单事务原子提交（零半截落盘、零内存幽灵污染）。"""
     if not isinstance(batch_id, str) or not batch_id.strip() or len(batch_id) > 128:
         raise ValueError("Valid batch_id is required")
     if not isinstance(transactions, list) or len(transactions) == 0:
@@ -425,10 +476,8 @@ def evaluate_transaction_batch(
         tx_id = str(item.get("tx_id") or "").strip()
         account_id = str(item.get("account_id") or "").strip()
         counterparty_id = str(item.get("counterparty_id") or "").strip()
-        raw_amt = item.get("amount_cents")
-        raw_ts = item.get("ts")
-        amount_cents = require_strict_int(raw_amt, "amount_cents", min_val=1)
-        ts = require_strict_int(raw_ts, "ts", min_val=1, max_val=9_999_999_999)
+        amount_cents = require_strict_int(item.get("amount_cents"), "amount_cents", min_val=1)
+        ts = require_strict_int(item.get("ts"), "ts", min_val=1, max_val=9_999_999_999)
 
         currency = str(item.get("currency") or "USD").strip()
         channel = str(item.get("channel") or "POS_CHIP").strip()
@@ -473,6 +522,7 @@ def evaluate_transaction_batch(
         )
 
     policy = load_tenant_policy(db_path, caller.tenant_id)
+    sanctioned_set = get_active_sanctioned_entities(db_path, caller.tenant_id)
     earliest_win = int(min_ts) - SLIDING_WINDOW_SECONDS
     latest_ts = int(max_ts)
     acct_list = sorted(account_set)
@@ -483,7 +533,6 @@ def evaluate_transaction_batch(
         conn = get_thread_connection(db_path)
         conn.execute("BEGIN IMMEDIATE")
         try:
-            # 预检数据库内是否已存在冲突 tx_id，保证整批无副作用快速拒绝
             for i0 in range(0, len(tx_id_list), 400):
                 sub_ids = tx_id_list[i0: i0 + 400]
                 ph = ",".join("?" for _ in sub_ids)
@@ -495,19 +544,37 @@ def evaluate_transaction_batch(
                     conn.rollback()
                     raise BatchConflictError(f"Transaction already exists: {dup_row['tx_id']}")
 
-            acct_history: dict[str, list[tuple[int, int, str]]] = {a: [] for a in acct_list}
+            acct_init_rows: dict[str, list[tuple[int, int, str]]] = {a: [] for a in acct_list}
             for start_i in range(0, len(acct_list), 400):
                 sub_accts = acct_list[start_i: start_i + 400]
                 placeholders = ",".join("?" for _ in sub_accts)
-                sql = (
+                rows = conn.execute(
                     f"SELECT account_id, ts, amount_cents, counterparty_id FROM transactions "
-                    f"WHERE tenant_id = ? AND account_id IN ({placeholders}) AND ts >= ? AND ts <= ?"
-                )
-                rows = conn.execute(sql, (caller.tenant_id, *sub_accts, earliest_win, latest_ts)).fetchall()
+                    f"WHERE tenant_id = ? AND account_id IN ({placeholders}) AND ts >= ? AND ts <= ?",
+                    (caller.tenant_id, *sub_accts, earliest_win, latest_ts),
+                ).fetchall()
                 for r in rows:
-                    acct_history[r["account_id"]].append(
-                        (int(r["ts"]), int(r["amount_cents"]), str(r["counterparty_id"]))
-                    )
+                    acct_init_rows[str(r[0])].append((int(r[1]), int(r[2]), str(r[3])))
+
+            acct_windows = {
+                acct: SlidingAccountWindow(init_list)
+                for acct, init_list in acct_init_rows.items()
+            }
+
+            # 若存在活跃受制裁实体，仅一次索引扫描构建活跃窗口边邻接表供整批交易增量复用
+            adj_by_node: dict[str, list[tuple[int, str]]] = {}
+            if sanctioned_set:
+                edge_rows = conn.execute(
+                    "SELECT ts, account_id, counterparty_id FROM transactions "
+                    "WHERE tenant_id = ? AND ts >= ? AND ts <= ?",
+                    (caller.tenant_id, earliest_win, latest_ts),
+                ).fetchall()
+                for er in edge_rows:
+                    e_ts = int(er[0])
+                    u = str(er[1])
+                    v = str(er[2])
+                    adj_by_node.setdefault(u, []).append((e_ts, v))
+                    adj_by_node.setdefault(v, []).append((e_ts, u))
 
             results: list[dict[str, Any]] = []
             counts = {"ALLOW": 0, "REVIEW": 0, "REJECT": 0}
@@ -522,26 +589,38 @@ def evaluate_transaction_batch(
                 ts = tx_obj["ts"]
                 win_start = ts - SLIDING_WINDOW_SECONDS
 
-                win_tx_count = 1
-                win_amount_cents = amt
-                cp_set: set[str] = {cp_id}
+                if sanctioned_set:
+                    sanction_hop = eval_3hop_from_window_adj(
+                        sanctioned_set,
+                        adj_by_node,
+                        acct_id,
+                        cp_id,
+                        win_start,
+                        ts,
+                    )
+                    adj_by_node.setdefault(acct_id, []).append((ts, cp_id))
+                    adj_by_node.setdefault(cp_id, []).append((ts, acct_id))
+                else:
+                    sanction_hop = 0
 
-                for h_ts, h_amt, h_cp in acct_history[acct_id]:
-                    if win_start <= h_ts <= ts:
-                        win_tx_count += 1
-                        win_amount_cents += h_amt
-                        cp_set.add(h_cp)
+                win_tx_count, win_amount_cents, win_unique_cps, win_median_cents = (
+                    acct_windows[acct_id].eval_and_record(
+                        ts=ts,
+                        amount_cents=amt,
+                        counterparty_id=cp_id,
+                        window_seconds=SLIDING_WINDOW_SECONDS,
+                    )
+                )
 
-                win_unique_cps = len(cp_set)
-                risk_score, decision, reasons = _compute_single_tx_decision(
+                risk_score, decision, reasons = compute_single_tx_decision(
                     tx_obj,
                     policy,
                     win_tx_count=win_tx_count,
                     win_amount_cents=win_amount_cents,
                     win_unique_cps=win_unique_cps,
+                    win_median_cents=win_median_cents,
+                    sanction_hop=sanction_hop,
                 )
-
-                acct_history[acct_id].append((ts, amt, cp_id))
 
                 decision_id = f"dec_{tx_id}"
                 tx_insert_rows.append(
@@ -570,6 +649,8 @@ def evaluate_transaction_batch(
                         win_tx_count,
                         win_amount_cents,
                         win_unique_cps,
+                        win_median_cents,
+                        sanction_hop,
                         json.dumps(reasons),
                         ts,
                     )
@@ -583,10 +664,12 @@ def evaluate_transaction_batch(
                         "account_id": acct_id,
                         "risk_score": risk_score,
                         "decision": decision,
+                        "sanction_hop": sanction_hop,
                         "window": {
                             "tx_count": win_tx_count,
                             "amount_cents": win_amount_cents,
                             "unique_counterparties": win_unique_cps,
+                            "median_cents": win_median_cents,
                         },
                         "reasons": reasons,
                     }
@@ -602,8 +685,9 @@ def evaluate_transaction_batch(
             conn.executemany(
                 "INSERT INTO risk_decisions("
                 "decision_id, tx_id, tenant_id, account_id, risk_score, decision, "
-                "win_tx_count, win_amount_cents, win_unique_counterparties, reasons_json, evaluated_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "win_tx_count, win_amount_cents, win_unique_counterparties, win_median_cents, "
+                "sanction_hop, reasons_json, evaluated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 dec_insert_rows,
             )
             conn.commit()
@@ -635,7 +719,8 @@ def get_risk_decision_detail(
     conn = get_thread_connection(db_path)
     row = conn.execute(
         "SELECT decision_id, tx_id, tenant_id, account_id, risk_score, decision, "
-        "win_tx_count, win_amount_cents, win_unique_counterparties, reasons_json, evaluated_at "
+        "win_tx_count, win_amount_cents, win_unique_counterparties, win_median_cents, "
+        "sanction_hop, reasons_json, evaluated_at "
         "FROM risk_decisions WHERE decision_id = ? AND tenant_id = ?",
         (decision_id, caller.tenant_id),
     ).fetchone()
@@ -648,10 +733,12 @@ def get_risk_decision_detail(
         "account_id": row["account_id"],
         "risk_score": int(row["risk_score"]),
         "decision": row["decision"],
+        "sanction_hop": int(row["sanction_hop"]),
         "window": {
             "tx_count": int(row["win_tx_count"]),
             "amount_cents": int(row["win_amount_cents"]),
             "unique_counterparties": int(row["win_unique_counterparties"]),
+            "median_cents": int(row["win_median_cents"]),
         },
         "reasons": json.loads(row["reasons_json"]),
         "evaluated_at": int(row["evaluated_at"]),

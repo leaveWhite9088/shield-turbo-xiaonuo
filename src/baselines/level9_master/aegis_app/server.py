@@ -1,27 +1,38 @@
 # -*- coding: utf-8 -*-
-"""AegisGate 高并发安全路由网关：JSON 嵌套深度预检、非有限浮点拦截、诊断封闭与统一脱敏异常拦截。"""
+"""AegisGate 高并发纵深安全路由网关（9级疾风铁盾大师基线）。"""
 from __future__ import annotations
 
 import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import pathlib
-import urllib.parse
 from typing import Any
 
 from . import __version__
-from .audit_export import export_audit_digest, read_compliance_snapshot
+from .audit_export import (
+    export_audit_digest,
+    read_compliance_snapshot,
+    render_saved_report,
+    save_report_template,
+)
 from .auth import (
     AuthError,
     authenticate_caller,
     configure_doc_acl_rule,
-    consume_tenant_quota,
+    manage_role_delegation,
     process_settlement_webhook,
-    redeem_override_token,
     revoke_or_grant_role,
 )
 from .config import DEFAULT_PAGE_LIMIT, MAX_BODY_BYTES
-from .db import init_schema, reset_db_caches
+from .contagion_graph import manage_sanctioned_entity
+from .db import init_schema, require_strict_int, reset_db_caches
+from .doc_writer import retire_compliance_document, upsert_compliance_document
+from .ledger_ops import (
+    consume_tenant_quota,
+    redeem_override_token,
+    transfer_tenant_quota,
+)
+from .middleware import parse_json_payload, parse_url_and_query
 from .rule_engine import (
     BatchConflictError,
     evaluate_transaction_batch,
@@ -35,35 +46,12 @@ from .search_service import (
     set_document_quarantine,
 )
 
-MAX_JSON_NESTING_DEPTH = 32
 
-
-def _reject_non_finite_constant(token: str) -> Any:
-    raise ValueError(f"Non-finite JSON number constant rejected: {token}")
-
-
-def _check_json_nesting_depth(raw_text: str, max_depth: int = MAX_JSON_NESTING_DEPTH) -> None:
-    """在调用 json.loads 之前执行 O(N) 词法扫描，毫秒级拦截千层嵌套 JSON 栈溢出炸弹。"""
-    depth = 0
-    in_str = False
-    esc = False
-    for ch in raw_text:
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch in ("{", "["):
-            depth += 1
-            if depth > max_depth:
-                raise ValueError(f"JSON nesting depth exceeds maximum {max_depth}")
-        elif ch in ("}", "]"):
-            depth = max(0, depth - 1)
+def _parse_query_int(raw_val: str | None, field_name: str) -> int:
+    if raw_val is None or raw_val == "":
+        raise ValueError(f"Missing integer parameter {field_name}")
+    val = int(raw_val)
+    return require_strict_int(val, field_name)
 
 
 class AegisGateway:
@@ -72,31 +60,6 @@ class AegisGateway:
         self.storage_dir = str(pathlib.Path(storage_dir).resolve())
         init_schema(self.db_path)
         reset_db_caches(self.db_path)
-
-    def _parse_json_body(self, body: bytes | str | dict[str, Any] | None) -> tuple[dict[str, Any], str]:
-        if body is None:
-            return {}, ""
-        if isinstance(body, dict):
-            raw = json.dumps(body, separators=(",", ":"), allow_nan=False)
-            if len(raw) > MAX_BODY_BYTES:
-                raise ValueError("Payload size exceeds gateway limit")
-            _check_json_nesting_depth(raw)
-            return body, raw
-        if isinstance(body, bytes):
-            if len(body) > MAX_BODY_BYTES:
-                raise ValueError("Payload size exceeds gateway limit")
-            raw = body.decode("utf-8")
-        else:
-            raw = str(body)
-            if len(raw.encode("utf-8")) > MAX_BODY_BYTES:
-                raise ValueError("Payload size exceeds gateway limit")
-        if not raw.strip():
-            return {}, raw
-        _check_json_nesting_depth(raw)
-        data = json.loads(raw, parse_constant=_reject_non_finite_constant)
-        if not isinstance(data, dict):
-            raise ValueError("Request JSON payload must be an object")
-        return data, raw
 
     def request(
         self,
@@ -107,23 +70,15 @@ class AegisGateway:
         body: bytes | str | dict[str, Any] | None = None,
     ) -> tuple[int, dict[str, str], dict[str, Any]]:
         req_method = method.upper().strip()
+        resp_headers = {"Content-Type": "application/json; charset=utf-8"}
         if len(path) > 4096:
-            return 400, {"Content-Type": "application/json; charset=utf-8"}, {
+            return 400, resp_headers, {
                 "error": "BAD_REQUEST",
                 "message": "URI too long",
             }
 
-        parsed_url = urllib.parse.urlsplit(path)
-        route = parsed_url.path.rstrip("/") or "/"
-        raw_query_map: dict[str, str] = {}
-        if parsed_url.query:
-            for seg in parsed_url.query.split("&"):
-                if "=" in seg:
-                    rk, rv = seg.split("=", 1)
-                    raw_query_map[urllib.parse.unquote_plus(rk)] = rv
-        query_params = dict(urllib.parse.parse_qsl(parsed_url.query, keep_blank_values=True))
+        route, query_params, raw_query_map = parse_url_and_query(path)
         req_headers = dict(headers or {})
-        resp_headers = {"Content-Type": "application/json; charset=utf-8"}
 
         try:
             if req_method == "GET" and route == "/api/v1/health":
@@ -139,10 +94,11 @@ class AegisGateway:
                     "message": "Internal diagnostics endpoint is disabled in production",
                 }
 
+            now_ov_str = query_params.get("_now_ts")
+            now_ov = _parse_query_int(now_ov_str, "_now_ts") if now_ov_str else None
+
             if req_method == "POST" and route == "/api/v1/webhooks/settlement-callback":
-                _, raw_body = self._parse_json_body(body)
-                now_ov_str = query_params.get("_now_ts")
-                now_ov = int(now_ov_str) if now_ov_str else None
+                _, raw_body = parse_json_payload(body)
                 res = process_settlement_webhook(
                     self.db_path,
                     req_headers,
@@ -151,7 +107,7 @@ class AegisGateway:
                 )
                 return 200, resp_headers, res
 
-            caller = authenticate_caller(self.db_path, req_headers)
+            caller = authenticate_caller(self.db_path, req_headers, now_override=now_ov)
 
             if req_method == "GET" and route == "/api/v1/docs/search":
                 q = query_params.get("q", "")
@@ -160,8 +116,8 @@ class AegisGateway:
                 dedup_flag = query_params.get("deduplicate", "1") != "0"
                 sort_by = query_params.get("sort_by", "score")
                 sort_dir = query_params.get("sort_dir", "desc")
-                limit = int(query_params.get("limit", str(DEFAULT_PAGE_LIMIT)))
-                offset = int(query_params.get("offset", "0"))
+                limit = _parse_query_int(query_params.get("limit", str(DEFAULT_PAGE_LIMIT)), "limit")
+                offset = _parse_query_int(query_params.get("offset", "0"), "offset")
                 res = search_documents(
                     self.db_path,
                     caller,
@@ -176,13 +132,23 @@ class AegisGateway:
                 )
                 return 200, resp_headers, res
 
+            if req_method == "POST" and route == "/api/v1/docs/upsert":
+                data, _ = parse_json_payload(body)
+                res = upsert_compliance_document(self.db_path, caller, data)
+                return 200, resp_headers, res
+
+            if req_method == "POST" and route == "/api/v1/docs/retire":
+                data, _ = parse_json_payload(body)
+                res = retire_compliance_document(self.db_path, caller, str(data.get("doc_id") or ""))
+                return 200, resp_headers, res
+
             if req_method == "POST" and route == "/api/v1/docs/batch-get":
-                data, _ = self._parse_json_body(body)
+                data, _ = parse_json_payload(body)
                 res = batch_get_documents(self.db_path, caller, data.get("doc_ids") or [])
                 return 200, resp_headers, res
 
             if req_method == "POST" and route == "/api/v1/docs/quarantine":
-                data, _ = self._parse_json_body(body)
+                data, _ = parse_json_payload(body)
                 res = set_document_quarantine(
                     self.db_path,
                     caller,
@@ -192,7 +158,7 @@ class AegisGateway:
                 return 200, resp_headers, res
 
             if req_method == "POST" and route == "/api/v1/admin/grants/revoke":
-                data, _ = self._parse_json_body(body)
+                data, _ = parse_json_payload(body)
                 res = revoke_or_grant_role(
                     self.db_path,
                     caller,
@@ -202,25 +168,51 @@ class AegisGateway:
                 )
                 return 200, resp_headers, res
 
+            if req_method == "POST" and route == "/api/v1/admin/delegations":
+                data, _ = parse_json_payload(body)
+                res = manage_role_delegation(
+                    self.db_path,
+                    caller,
+                    grantor_user_id=str(data.get("grantor_user_id") or caller.user_id),
+                    grantee_user_id=str(data.get("grantee_user_id") or ""),
+                    delegated_role=str(data.get("delegated_role") or ""),
+                    starts_at=data.get("starts_at", 0),
+                    expires_at=data.get("expires_at", 0),
+                    action=str(data.get("action") or "create"),
+                )
+                return 200, resp_headers, res
+
             if req_method == "POST" and route == "/api/v1/admin/doc-acl":
-                data, _ = self._parse_json_body(body)
+                data, _ = parse_json_payload(body)
                 res = configure_doc_acl_rule(
                     self.db_path,
                     caller,
                     doc_id=str(data.get("doc_id") or ""),
                     subject_type=str(data.get("subject_type") or ""),
                     subject_id=str(data.get("subject_id") or ""),
+                    effect=str(data.get("effect") or "DENY"),
+                    active=bool(data.get("active", True)),
+                )
+                return 200, resp_headers, res
+
+            if req_method == "POST" and route == "/api/v1/admin/sanctions":
+                data, _ = parse_json_payload(body)
+                res = manage_sanctioned_entity(
+                    self.db_path,
+                    caller,
+                    entity_id=str(data.get("entity_id") or ""),
+                    list_source=str(data.get("list_source") or "OFAC_SDN"),
                     active=bool(data.get("active", True)),
                 )
                 return 200, resp_headers, res
 
             if req_method == "PUT" and route == "/api/v1/policies":
-                data, _ = self._parse_json_body(body)
+                data, _ = parse_json_payload(body)
                 res = update_tenant_policy(self.db_path, caller, data)
                 return 200, resp_headers, res
 
             if req_method == "POST" and route == "/api/v1/risk/evaluate-batch":
-                data, _ = self._parse_json_body(body)
+                data, _ = parse_json_payload(body)
                 res = evaluate_transaction_batch(
                     self.db_path,
                     caller,
@@ -230,7 +222,7 @@ class AegisGateway:
                 return 200, resp_headers, res
 
             if req_method == "POST" and route == "/api/v1/risk/simulate-rule":
-                data, _ = self._parse_json_body(body)
+                data, _ = parse_json_payload(body)
                 res = simulate_custom_rule(
                     data.get("rule_tree") or {},
                     data.get("sample_tx") or {},
@@ -243,7 +235,7 @@ class AegisGateway:
                 return 200, resp_headers, res
 
             if req_method == "POST" and route == "/api/v1/quotas/consume":
-                data, _ = self._parse_json_body(body)
+                data, _ = parse_json_payload(body)
                 res = consume_tenant_quota(
                     self.db_path,
                     caller,
@@ -253,8 +245,20 @@ class AegisGateway:
                 status_code = 200 if res.get("accepted") else 409
                 return status_code, resp_headers, res
 
+            if req_method == "POST" and route == "/api/v1/quotas/transfer":
+                data, _ = parse_json_payload(body)
+                res = transfer_tenant_quota(
+                    self.db_path,
+                    caller,
+                    from_quota=str(data.get("from_quota") or ""),
+                    to_quota=str(data.get("to_quota") or ""),
+                    amount=data.get("amount", 0),
+                )
+                status_code = 200 if res.get("transferred") else 409
+                return status_code, resp_headers, res
+
             if req_method == "POST" and route == "/api/v1/risk/override-token/redeem":
-                data, _ = self._parse_json_body(body)
+                data, _ = parse_json_payload(body)
                 res = redeem_override_token(
                     self.db_path,
                     caller,
@@ -265,10 +269,10 @@ class AegisGateway:
                 return status_code, resp_headers, res
 
             if req_method == "GET" and route == "/api/v1/audit/export-digest":
-                s_ts = int(query_params["start_ts"]) if query_params.get("start_ts") else None
-                e_ts = int(query_params["end_ts"]) if query_params.get("end_ts") else None
+                s_ts = _parse_query_int(query_params["start_ts"], "start_ts") if query_params.get("start_ts") else None
+                e_ts = _parse_query_int(query_params["end_ts"], "end_ts") if query_params.get("end_ts") else None
                 sev = query_params.get("severity", "")
-                slim = int(query_params.get("sample_limit", "10"))
+                slim = _parse_query_int(query_params.get("sample_limit", "10"), "sample_limit")
                 res = export_audit_digest(
                     self.db_path,
                     caller,
@@ -276,6 +280,31 @@ class AegisGateway:
                     end_ts=e_ts,
                     severity=sev,
                     sample_limit=slim,
+                )
+                return 200, resp_headers, res
+
+            if req_method == "PUT" and route == "/api/v1/audit/report-template":
+                data, _ = parse_json_payload(body)
+                res = save_report_template(
+                    self.db_path,
+                    caller,
+                    template_id=str(data.get("template_id") or ""),
+                    title_format=str(data.get("title_format") or ""),
+                    extra_event_filter=str(data.get("extra_event_filter") or ""),
+                    sample_limit=data.get("sample_limit", 10),
+                )
+                return 200, resp_headers, res
+
+            if req_method == "GET" and route == "/api/v1/audit/render-report":
+                tpl_id = query_params.get("template_id", "")
+                s_ts = _parse_query_int(query_params["start_ts"], "start_ts") if query_params.get("start_ts") else None
+                e_ts = _parse_query_int(query_params["end_ts"], "end_ts") if query_params.get("end_ts") else None
+                res = render_saved_report(
+                    self.db_path,
+                    caller,
+                    template_id=tpl_id,
+                    start_ts=s_ts,
+                    end_ts=e_ts,
                 )
                 return 200, resp_headers, res
 
@@ -291,6 +320,8 @@ class AegisGateway:
 
         except AuthError as exc:
             return exc.status_code, resp_headers, {"error": "AUTH_ERROR", "message": str(exc)}
+        except PermissionError as exc:
+            return 403, resp_headers, {"error": "FORBIDDEN", "message": str(exc)}
         except BatchConflictError as exc:
             return 409, resp_headers, {"error": "CONFLICT", "message": str(exc)}
         except LookupError as exc:
@@ -353,3 +384,26 @@ def build_http_server(
             return
 
     return ThreadingHTTPServer((host, port), GatewayHTTPHandler)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="启动 AegisGate 多租户风控与合规检索网关")
+    ap.add_argument("--db", required=True)
+    ap.add_argument("--storage", required=True)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8080)
+    args = ap.parse_args()
+
+    gw = create_gateway(args.db, args.storage)
+    srv = build_http_server(gw, host=args.host, port=args.port)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,50 +1,75 @@
 # -*- coding: utf-8 -*-
-"""高性能安全审计导出服务：游标分块流式迭代（极低恒定内存峰值）与规范化路径边界锚定防穿越。"""
+"""高性能安全审计导出与报表渲染：游标分块流式扫描、二阶参数化防注入、安全字面量替换防反射与物理路径锚定。"""
 from __future__ import annotations
 
 import hashlib
 import json
 import pathlib
 import re
+import time
 import urllib.parse
 from typing import Any
 
-from .auth import CallerContext
-from .db import get_thread_connection
+from .auth import CallerContext, require_admin
+from .db import get_striped_lock, get_thread_connection, require_strict_int
 
 SAFE_SNAPSHOT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}\.json$")
+SAFE_TEMPLATE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+SAFE_EVENT_TYPE_RE = re.compile(r"^[A-Z0-9_]{2,32}$")
 ALLOWED_SEVERITIES = {"INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"}
+ALLOWED_TEMPLATE_VARS = {"tenant_id", "total_records", "total_amount_cents"}
+_BRACE_TOKEN_RE = re.compile(r"\{([^{}]*)\}")
 
 
-def export_audit_digest(
+def _validate_and_render_title(title_format: str, values: dict[str, str] | None = None) -> str:
+    """严格白名单占位符校验与单遍字面量替换，彻底阻断 Python .format() 属性/字典反射泄露。"""
+    if not isinstance(title_format, str) or not title_format.strip() or len(title_format) > 200:
+        raise ValueError("title_format must be a non-empty string up to 200 chars")
+
+    # 检查是否存在未闭合或嵌套花括号
+    stripped_tokens = _BRACE_TOKEN_RE.sub("", title_format)
+    if "{" in stripped_tokens or "}" in stripped_tokens:
+        raise ValueError("Malformed or nested braces in title_format")
+
+    for match in _BRACE_TOKEN_RE.finditer(title_format):
+        var_name = match.group(1)
+        if var_name not in ALLOWED_TEMPLATE_VARS:
+            raise ValueError(f"Disallowed template placeholder: {var_name!r}")
+
+    if values is None:
+        return title_format
+
+    return _BRACE_TOKEN_RE.sub(lambda m: values[m.group(1)], title_format)
+
+
+def _stream_audit_digest(
     db_path: str,
-    caller: CallerContext,
+    tenant_id: str,
     *,
     start_ts: int | None = None,
     end_ts: int | None = None,
     severity: str = "",
+    event_type: str = "",
     sample_limit: int = 10,
 ) -> dict[str, Any]:
-    """仅投影计算所需轻量列，使用游标 fetchmany 流式迭代计算统计与滚动哈希，避免加载大体积 payload_json。"""
-    if severity and severity not in ALLOWED_SEVERITIES:
-        raise ValueError(f"Invalid severity filter: {severity}")
-    if not isinstance(sample_limit, int) or sample_limit < 0 or sample_limit > 50:
-        if isinstance(sample_limit, int) and sample_limit > 50:
-            sample_limit = 50
-        elif isinstance(sample_limit, int) and sample_limit < 0:
-            raise ValueError("sample_limit must be non-negative")
-
     clauses = ["tenant_id = ?"]
-    params: list[Any] = [caller.tenant_id]
+    params: list[Any] = [tenant_id]
     if start_ts is not None:
         clauses.append("ts >= ?")
-        params.append(int(start_ts))
+        params.append(require_strict_int(start_ts, "start_ts", min_val=0))
     if end_ts is not None:
         clauses.append("ts <= ?")
-        params.append(int(end_ts))
+        params.append(require_strict_int(end_ts, "end_ts", min_val=0))
     if severity:
+        if severity not in ALLOWED_SEVERITIES:
+            raise ValueError(f"Invalid severity filter: {severity}")
         clauses.append("severity = ?")
         params.append(severity)
+    if event_type:
+        if not SAFE_EVENT_TYPE_RE.match(event_type):
+            raise ValueError("Invalid event_type filter")
+        clauses.append("event_type = ?")
+        params.append(event_type)
 
     sql = (
         "SELECT log_id, event_type, severity, amount_cents, masked_account, ts "
@@ -96,7 +121,7 @@ def export_audit_digest(
         cur.close()
 
     return {
-        "tenant_id": caller.tenant_id,
+        "tenant_id": tenant_id,
         "total_records": total_records,
         "total_amount_cents": total_amount_cents,
         "severity_breakdown": dict(sorted(severity_counts.items())),
@@ -106,16 +131,125 @@ def export_audit_digest(
     }
 
 
+def export_audit_digest(
+    db_path: str,
+    caller: CallerContext,
+    *,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+    severity: str = "",
+    sample_limit: Any = 10,
+) -> dict[str, Any]:
+    checked_slim = require_strict_int(sample_limit, "sample_limit", min_val=0, max_val=1000)
+    return _stream_audit_digest(
+        db_path,
+        caller.tenant_id,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        severity=severity,
+        sample_limit=min(checked_slim, 50),
+    )
+
+
+def save_report_template(
+    db_path: str,
+    caller: CallerContext,
+    *,
+    template_id: str,
+    title_format: str,
+    extra_event_filter: str = "",
+    sample_limit: Any = 10,
+) -> dict[str, Any]:
+    if "SENIOR_AUDITOR" not in caller.effective_roles and "COMPLIANCE_ADMIN" not in caller.effective_roles:
+        require_admin(caller)
+
+    tpl_id = str(template_id or "").strip()
+    t_fmt = str(title_format or "").strip()
+    evt_flt = str(extra_event_filter or "").strip()
+    checked_slim = require_strict_int(sample_limit, "sample_limit", min_val=0, max_val=1000)
+    s_lim = min(checked_slim, 50)
+
+    if not tpl_id or not SAFE_TEMPLATE_ID_RE.match(tpl_id):
+        raise ValueError("Invalid template_id format")
+    _validate_and_render_title(t_fmt, None)
+    if evt_flt and not SAFE_EVENT_TYPE_RE.match(evt_flt):
+        raise ValueError("Invalid extra_event_filter value")
+
+    now_ts = int(caller.request_ts or int(time.time()))
+    lock = get_striped_lock(db_path, caller.tenant_id, "report_tpl")
+    with lock:
+        conn = get_thread_connection(db_path)
+        conn.execute(
+            "INSERT OR REPLACE INTO report_templates("
+            "tenant_id, template_id, title_format, extra_event_filter, sample_limit, created_by, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (caller.tenant_id, tpl_id, t_fmt, evt_flt, s_lim, caller.user_id, now_ts),
+        )
+        conn.commit()
+
+    return {
+        "tenant_id": caller.tenant_id,
+        "template_id": tpl_id,
+        "title_format": t_fmt,
+        "extra_event_filter": evt_flt,
+        "sample_limit": s_lim,
+    }
+
+
+def render_saved_report(
+    db_path: str,
+    caller: CallerContext,
+    *,
+    template_id: str,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+) -> dict[str, Any]:
+    tpl_id = str(template_id or "").strip()
+    if not tpl_id or not SAFE_TEMPLATE_ID_RE.match(tpl_id):
+        raise ValueError("Invalid template_id")
+
+    conn = get_thread_connection(db_path)
+    tpl = conn.execute(
+        "SELECT template_id, title_format, extra_event_filter, sample_limit "
+        "FROM report_templates WHERE tenant_id = ? AND template_id = ?",
+        (caller.tenant_id, tpl_id),
+    ).fetchone()
+    if not tpl:
+        raise LookupError(f"Report template not found: {tpl_id}")
+
+    stored_filter = str(tpl["extra_event_filter"] or "").strip()
+    digest = _stream_audit_digest(
+        db_path,
+        caller.tenant_id,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        event_type=stored_filter,
+        sample_limit=int(tpl["sample_limit"]),
+    )
+
+    rendered_title = _validate_and_render_title(
+        str(tpl["title_format"]),
+        {
+            "tenant_id": caller.tenant_id,
+            "total_records": str(digest["total_records"]),
+            "total_amount_cents": str(digest["total_amount_cents"]),
+        },
+    )
+    return {
+        "template_id": str(tpl["template_id"]),
+        "rendered_title": rendered_title,
+        "digest": digest,
+    }
+
+
 def read_compliance_snapshot(
     storage_dir: str,
     caller: CallerContext,
     snapshot_name: str,
 ) -> dict[str, Any]:
-    """双重防线防路径穿越：严格文件名白名单 + resolve().is_relative_to() 物理边界锚定。"""
     if not isinstance(snapshot_name, str) or not snapshot_name:
         raise ValueError("snapshot_name is required")
 
-    # 拒绝任何编码残留、路径分隔符、控制字符或相对跳转符号
     unquoted_once = urllib.parse.unquote(snapshot_name)
     unquoted_twice = urllib.parse.unquote(unquoted_once)
     if (

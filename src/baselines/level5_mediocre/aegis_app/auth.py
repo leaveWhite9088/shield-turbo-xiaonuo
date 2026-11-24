@@ -1,16 +1,22 @@
 # -*- coding: utf-8 -*-
-"""租户身份认证模块（5级平庸样本：仅补了 Webhook 时间窗检查，漏掉 Nonce 去重与权限变更缓存失效通知）。"""
+"""认证与权限管理（5级平庸样本：补了常量时间比较与回调时间窗，但漏了 nonce 唯一防重放，且撤权未失效缓存）。"""
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import hmac
 import json
 import time
-from dataclasses import dataclass
 from typing import Any
 
+from .acl_wall import is_doc_blocked_by_wall, upsert_doc_acl_rule
 from .config import ROLE_DEFAULT_CLEARANCE, WEBHOOK_TOLERANCE_SECONDS
 from .db import hash_api_token, open_connection
+from .delegation import (
+    create_or_revoke_delegation,
+    resolve_active_delegated_roles,
+    resolve_base_and_explicit_roles,
+)
 
 
 class AuthError(Exception):
@@ -27,101 +33,33 @@ class CallerContext:
     org_node_id: str
     effective_roles: set[str]
     max_clearance: int
+    request_ts: int
 
 
-def resolve_org_ancestors(db_path: str, tenant_id: str, start_node_id: str) -> list[str]:
-    ancestors: list[str] = []
-    curr = start_node_id
-    visited: set[str] = set()
-    conn = open_connection(db_path)
-    try:
-        while curr and curr not in visited:
-            visited.add(curr)
-            ancestors.append(curr)
-            row = conn.execute(
-                "SELECT parent_node_id FROM org_nodes WHERE tenant_id = ? AND node_id = ?",
-                (tenant_id, curr),
-            ).fetchone()
-            curr = row["parent_node_id"] if row else None
-    finally:
-        conn.close()
-    return ancestors
-
-
-def is_doc_blocked_by_acl(db_path: str, tenant_id: str, user_id: str, doc_id: str) -> bool:
-    conn = open_connection(db_path)
-    try:
-        u_row = conn.execute(
-            "SELECT org_node_id FROM users WHERE tenant_id = ? AND user_id = ?",
-            (tenant_id, user_id),
-        ).fetchone()
-        if not u_row:
-            return True
-        org_chain = resolve_org_ancestors(db_path, tenant_id, u_row["org_node_id"])
-        acl_rows = conn.execute(
-            "SELECT subject_type, subject_id, effect FROM doc_acl_rules "
-            "WHERE tenant_id = ? AND doc_id = ? AND active = 1",
-            (tenant_id, doc_id),
-        ).fetchall()
-        for r in acl_rows:
-            if r["effect"] != "DENY":
-                continue
-            if r["subject_type"] == "USER" and r["subject_id"] == user_id:
-                return True
-            if r["subject_type"] == "ORG_NODE" and r["subject_id"] in org_chain:
-                return True
-        return False
-    finally:
-        conn.close()
-
-
-def configure_doc_acl_rule(
+def resolve_effective_permissions(
     db_path: str,
-    caller: CallerContext,
+    tenant_id: str,
+    user_id: str,
     *,
-    doc_id: str,
-    subject_type: str,
-    subject_id: str,
-    active: bool = True,
-) -> dict[str, Any]:
-    require_admin(caller)
-    if subject_type not in ("USER", "ORG_NODE"):
-        raise ValueError("subject_type must be USER or ORG_NODE")
-    now_ts = int(time.time())
-    conn = open_connection(db_path)
-    try:
-        doc_row = conn.execute(
-            "SELECT doc_id FROM compliance_docs WHERE tenant_id = ? AND doc_id = ?",
-            (caller.tenant_id, doc_id),
-        ).fetchone()
-        if not doc_row:
-            raise LookupError(f"Document not found in tenant: {doc_id}")
-        if active:
-            conn.execute(
-                "INSERT INTO doc_acl_rules(tenant_id, doc_id, subject_type, subject_id, effect, active, updated_at) "
-                "VALUES (?, ?, ?, ?, 'DENY', 1, ?)",
-                (caller.tenant_id, doc_id, subject_type, subject_id, now_ts),
-            )
-        else:
-            conn.execute(
-                "UPDATE doc_acl_rules SET active = 0, updated_at = ? "
-                "WHERE tenant_id = ? AND doc_id = ? AND subject_type = ? AND subject_id = ?",
-                (now_ts, caller.tenant_id, doc_id, subject_type, subject_id),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-    return {
-        "tenant_id": caller.tenant_id,
-        "doc_id": doc_id,
-        "subject_type": subject_type,
-        "subject_id": subject_id,
-        "effect": "DENY",
-        "active": bool(active),
-    }
+    at_ts: int | None = None,
+) -> tuple[set[str], int]:
+    eval_ts = int(at_ts if at_ts is not None else time.time())
+    roles = resolve_base_and_explicit_roles(db_path, tenant_id, user_id)
+    if not roles:
+        return set(), 0
+
+    delegated = resolve_active_delegated_roles(db_path, tenant_id, user_id, eval_ts)
+    all_roles = roles | delegated
+    max_clearance = max((ROLE_DEFAULT_CLEARANCE.get(r, 1) for r in all_roles), default=1)
+    return all_roles, max_clearance
 
 
-def authenticate_caller(db_path: str, headers: dict[str, str]) -> CallerContext:
+def authenticate_caller(
+    db_path: str,
+    headers: dict[str, str],
+    *,
+    now_override: int | None = None,
+) -> CallerContext:
     norm_headers = {k.lower(): v for k, v in (headers or {}).items()}
     tenant_id = (norm_headers.get("x-aegis-tenant") or "").strip()
     user_id = (norm_headers.get("x-aegis-user") or "").strip()
@@ -130,6 +68,7 @@ def authenticate_caller(db_path: str, headers: dict[str, str]) -> CallerContext:
     if not tenant_id or not user_id or not raw_token:
         raise AuthError("Missing authentication headers", 401)
 
+    req_ts = int(now_override if now_override is not None else time.time())
     conn = open_connection(db_path)
     try:
         t_row = conn.execute(
@@ -147,10 +86,15 @@ def authenticate_caller(db_path: str, headers: dict[str, str]) -> CallerContext:
         if not u_row or not u_row["active"]:
             raise AuthError("Invalid operator identity", 401)
 
-        if u_row["api_token_hash"] != hash_api_token(raw_token):
+        if not hmac.compare_digest(u_row["api_token_hash"], hash_api_token(raw_token)):
             raise AuthError("Invalid access token", 401)
 
-        roles, max_cl = resolve_effective_permissions(db_path, tenant_id, user_id)
+        roles, max_cl = resolve_effective_permissions(
+            db_path,
+            tenant_id,
+            user_id,
+            at_ts=req_ts,
+        )
         return CallerContext(
             tenant_id=tenant_id,
             user_id=user_id,
@@ -158,45 +102,8 @@ def authenticate_caller(db_path: str, headers: dict[str, str]) -> CallerContext:
             org_node_id=u_row["org_node_id"],
             effective_roles=roles,
             max_clearance=max_cl,
+            request_ts=req_ts,
         )
-    finally:
-        conn.close()
-
-
-def resolve_effective_permissions(db_path: str, tenant_id: str, user_id: str) -> tuple[set[str], int]:
-    conn = open_connection(db_path)
-    try:
-        u_row = conn.execute(
-            "SELECT org_node_id, base_role FROM users WHERE tenant_id = ? AND user_id = ? AND active = 1",
-            (tenant_id, user_id),
-        ).fetchone()
-        if not u_row:
-            return set(), 0
-
-        roles: set[str] = {u_row["base_role"]}
-        curr_node = u_row["org_node_id"]
-        visited: set[str] = set()
-        while curr_node and curr_node not in visited:
-            visited.add(curr_node)
-            n_row = conn.execute(
-                "SELECT parent_node_id, inherited_role FROM org_nodes WHERE tenant_id = ? AND node_id = ?",
-                (tenant_id, curr_node),
-            ).fetchone()
-            if not n_row:
-                break
-            if n_row["inherited_role"]:
-                roles.add(n_row["inherited_role"])
-            curr_node = n_row["parent_node_id"]
-
-        g_rows = conn.execute(
-            "SELECT granted_role FROM role_grants WHERE tenant_id = ? AND user_id = ? AND active = 1",
-            (tenant_id, user_id),
-        ).fetchall()
-        for gr in g_rows:
-            roles.add(gr["granted_role"])
-
-        max_clearance = max((ROLE_DEFAULT_CLEARANCE.get(r, 1) for r in roles), default=1)
-        return roles, max_clearance
     finally:
         conn.close()
 
@@ -204,6 +111,60 @@ def resolve_effective_permissions(db_path: str, tenant_id: str, user_id: str) ->
 def require_admin(caller: CallerContext) -> None:
     if "COMPLIANCE_ADMIN" not in caller.effective_roles:
         raise AuthError("COMPLIANCE_ADMIN role required", 403)
+
+
+def is_doc_blocked_by_acl(db_path: str, tenant_id: str, user_id: str, doc_id: str) -> bool:
+    return is_doc_blocked_by_wall(db_path, tenant_id, user_id, doc_id)
+
+
+def configure_doc_acl_rule(
+    db_path: str,
+    caller: CallerContext,
+    *,
+    doc_id: str,
+    subject_type: str,
+    subject_id: str,
+    effect: str = "DENY",
+    active: bool = True,
+) -> dict[str, Any]:
+    require_admin(caller)
+    return upsert_doc_acl_rule(
+        db_path,
+        caller.tenant_id,
+        doc_id=doc_id,
+        subject_type=subject_type,
+        subject_id=subject_id,
+        effect=effect,
+        active=active,
+    )
+
+
+def manage_role_delegation(
+    db_path: str,
+    caller: CallerContext,
+    *,
+    grantor_user_id: str,
+    grantee_user_id: str,
+    delegated_role: str,
+    starts_at: int,
+    expires_at: int,
+    action: str = "create",
+) -> dict[str, Any]:
+    try:
+        return create_or_revoke_delegation(
+            db_path,
+            caller.tenant_id,
+            caller.user_id,
+            caller.effective_roles,
+            grantor_user_id=grantor_user_id,
+            grantee_user_id=grantee_user_id,
+            delegated_role=delegated_role,
+            starts_at=starts_at,
+            expires_at=expires_at,
+            action=action,
+        )
+    except PermissionError as exc:
+        raise AuthError(str(exc), 403) from exc
 
 
 def revoke_or_grant_role(
@@ -217,7 +178,7 @@ def revoke_or_grant_role(
     require_admin(caller)
     if role_name not in ROLE_DEFAULT_CLEARANCE:
         raise ValueError(f"Unsupported role: {role_name}")
-    now_ts = int(time.time())
+    now_ts = int(caller.request_ts)
     conn = open_connection(db_path)
     try:
         target = conn.execute(
@@ -246,7 +207,12 @@ def revoke_or_grant_role(
     finally:
         conn.close()
 
-    eff_roles, eff_cl = resolve_effective_permissions(db_path, caller.tenant_id, target_user_id)
+    eff_roles, eff_cl = resolve_effective_permissions(
+        db_path,
+        caller.tenant_id,
+        target_user_id,
+        at_ts=now_ts,
+    )
     return {
         "tenant_id": caller.tenant_id,
         "user_id": target_user_id,
@@ -256,109 +222,6 @@ def revoke_or_grant_role(
         "effective_clearance": eff_cl,
         "effective_roles": sorted(eff_roles),
     }
-
-
-def consume_tenant_quota(
-    db_path: str,
-    caller: CallerContext,
-    *,
-    quota_type: str,
-    amount: int = 1,
-) -> dict[str, Any]:
-    if amount <= 0:
-        raise ValueError("Quota consumption amount must be positive")
-    now_ts = int(time.time())
-    conn = open_connection(db_path)
-    try:
-        row = conn.execute(
-            "SELECT remaining_quota FROM tenant_quotas WHERE tenant_id = ? AND quota_type = ?",
-            (caller.tenant_id, quota_type),
-        ).fetchone()
-        if not row:
-            raise LookupError(f"Quota bucket not found: {quota_type}")
-
-        current_rem = int(row["remaining_quota"])
-        if current_rem < amount:
-            return {
-                "accepted": False,
-                "quota_type": quota_type,
-                "remaining_quota": current_rem,
-                "reason": "QUOTA_EXHAUSTED",
-            }
-
-        new_rem = current_rem - amount
-        conn.execute(
-            "INSERT INTO audit_logs(tenant_id, actor_id, event_type, severity, amount_cents, masked_account, ts, payload_json) "
-            "VALUES (?, ?, 'QUOTA_CONSUME', 'MEDIUM', ?, '****0000', ?, ?)",
-            (
-                caller.tenant_id,
-                caller.user_id,
-                amount,
-                now_ts,
-                json.dumps({"quota_type": quota_type, "consumed": amount, "remaining": new_rem}),
-            ),
-        )
-        conn.execute(
-            "UPDATE tenant_quotas SET remaining_quota = ?, updated_at = ? WHERE tenant_id = ? AND quota_type = ?",
-            (new_rem, now_ts, caller.tenant_id, quota_type),
-        )
-        conn.commit()
-        return {
-            "accepted": True,
-            "quota_type": quota_type,
-            "consumed": amount,
-            "remaining_quota": new_rem,
-        }
-    finally:
-        conn.close()
-
-
-def redeem_override_token(
-    db_path: str,
-    caller: CallerContext,
-    *,
-    token_id: str,
-    tx_ref: str,
-) -> dict[str, Any]:
-    now_ts = int(time.time())
-    conn = open_connection(db_path)
-    try:
-        row = conn.execute(
-            "SELECT token_id, tenant_id, purpose, used FROM override_tokens WHERE token_id = ? AND tenant_id = ?",
-            (token_id, caller.tenant_id),
-        ).fetchone()
-        if not row:
-            raise LookupError("Override token not found")
-        if int(row["used"]) != 0:
-            return {
-                "redeemed": False,
-                "token_id": token_id,
-                "reason": "TOKEN_ALREADY_USED",
-            }
-
-        conn.execute(
-            "INSERT INTO audit_logs(tenant_id, actor_id, event_type, severity, amount_cents, masked_account, ts, payload_json) "
-            "VALUES (?, ?, 'OVERRIDE_REDEEM', 'HIGH', 0, '****0000', ?, ?)",
-            (
-                caller.tenant_id,
-                caller.user_id,
-                now_ts,
-                json.dumps({"token_id": token_id, "tx_ref": tx_ref, "purpose": row["purpose"]}),
-            ),
-        )
-        conn.execute(
-            "UPDATE override_tokens SET used = 1, used_by = ?, used_at = ? WHERE token_id = ? AND tenant_id = ?",
-            (caller.user_id, now_ts, token_id, caller.tenant_id),
-        )
-        conn.commit()
-        return {
-            "redeemed": True,
-            "token_id": token_id,
-            "purpose": row["purpose"],
-            "tx_ref": tx_ref,
-        }
-    finally:
-        conn.close()
 
 
 def process_settlement_webhook(
@@ -403,7 +266,7 @@ def process_settlement_webhook(
         ).hexdigest()
 
         provided_sig = sig_header.removeprefix("sha256=").strip()
-        if provided_sig != expected_sig:
+        if not hmac.compare_digest(provided_sig, expected_sig):
             raise AuthError("Webhook signature verification failed", 401)
 
         payload = json.loads(raw_body)
@@ -412,6 +275,7 @@ def process_settlement_webhook(
         if not settlement_ref or amount_cents < 0:
             raise ValueError("Invalid settlement payload fields")
 
+        # 遗漏了 nonce 唯一性校验，时间窗内重放仍可重复入账
         conn.execute(
             "INSERT INTO webhook_events(tenant_id, nonce, callback_ts, settlement_ref, amount_cents, raw_payload, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
