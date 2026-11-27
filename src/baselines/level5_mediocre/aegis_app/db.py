@@ -372,6 +372,18 @@ def seed_dataset(
                     base_ts - 3600,
                 ),
             )
+            conn.execute(
+                "INSERT INTO delegation_grants(tenant_id, grantor_user_id, grantee_user_id, delegated_role, starts_at, expires_at, active, created_at) "
+                "VALUES (?, ?, ?, 'SENIOR_AUDITOR', ?, ?, 1, ?)",
+                (
+                    tenant_id,
+                    user_tokens["researcher"]["user_id"],
+                    user_tokens["specialist"]["user_id"],
+                    base_ts + 200,
+                    base_ts + 9000,
+                    base_ts - 1800,
+                ),
+            )
 
             custom_rules = {
                 "op": "OR",
@@ -452,21 +464,33 @@ def seed_dataset(
                     _EXTRA_VOCAB[(d_idx + k * 3 + t_idx) % len(_EXTRA_VOCAB)]
                     for k in range(6)
                 ]
+                appendix_clause = (
+                    f" Regulatory archival schedule for {tenant_id} section {d_idx + 1}: "
+                    + " ".join(picked_vocab)
+                    + " "
+                    + ("supervisory compliance record retention governance attestation " * 6).strip()
+                    + "."
+                )
                 if cluster_variant in (0, 1) and d_idx >= len(_REGULATION_TOPICS):
                     shared_anchor = [
                         _EXTRA_VOCAB[((d_idx % len(_REGULATION_TOPICS)) + k * 3 + t_idx) % len(_EXTRA_VOCAB)]
                         for k in range(8)
                     ]
+                    shared_tail = (
+                        " ".join(shared_anchor)
+                        + " "
+                        + ("supervisory compliance record retention governance attestation " * 6).strip()
+                    )
                     body_text = (
                         f"{extra_words}. Tenant {t_slug} policy directive for {reg_code}. "
                         f"Core mandate: {core_phrase}. "
-                        f"Operational scope: {' '.join(shared_anchor)} {' '.join(picked_vocab[:2])}."
+                        f"Operational scope: {shared_tail} {' '.join(picked_vocab[:2])}."
                     )
                 else:
                     body_text = (
                         f"{extra_words}. Tenant {t_slug} reference manual {d_idx + 1} under {reg_code}. "
                         f"Mandate: {core_phrase}. "
-                        f"Specific controls: {' '.join(picked_vocab)}."
+                        f"Specific controls: {' '.join(picked_vocab)}.{appendix_clause}"
                     )
 
                 title_text = f"[{reg_code}] {cat} Control Standard Rev-{d_idx + 1}"
@@ -492,6 +516,15 @@ def seed_dataset(
                 num_cites = (d_idx + t_idx) % 5
                 for c_i in range(num_cites):
                     citation_rows.append((tenant_id, doc_id, f"ref_{t_slug}_{d_idx}_{c_i}", upd_ts + c_i * 10))
+                if d_idx >= 3 and (d_idx % 3 == 0):
+                    peer_idx = ((d_idx - 2) % docs_per_tenant) + 1
+                    peer_doc_id = f"doc_{t_slug}_{peer_idx:04d}"
+                    if peer_doc_id != doc_id:
+                        citation_rows.append((tenant_id, doc_id, peer_doc_id, upd_ts + 55))
+
+            if docs_per_tenant >= 6:
+                citation_rows.append((tenant_id, f"doc_{t_slug}_0006", f"doc_{t_slug}_0002", base_ts - 120))
+                citation_rows.append((tenant_id, f"doc_{t_slug}_0002", f"doc_{t_slug}_0005", base_ts - 110))
 
             conn.executemany(
                 "INSERT OR REPLACE INTO compliance_docs("

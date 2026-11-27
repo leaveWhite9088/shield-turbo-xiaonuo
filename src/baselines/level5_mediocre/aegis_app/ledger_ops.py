@@ -7,7 +7,32 @@ import time
 from typing import Any
 
 from .auth import CallerContext, require_admin
+from .config import ALERT_QUOTA_BUCKET
 from .db import open_connection
+
+
+def try_consume_realtime_alert_quota(
+    db_path: str,
+    tenant_id: str,
+    now_ts: int,
+) -> bool:
+    conn = open_connection(db_path)
+    try:
+        row = conn.execute(
+            "SELECT remaining_quota FROM tenant_quotas WHERE tenant_id = ? AND quota_type = ?",
+            (tenant_id, ALERT_QUOTA_BUCKET),
+        ).fetchone()
+        if not row or int(row["remaining_quota"]) < 1:
+            return False
+        new_rem = int(row["remaining_quota"]) - 1
+        conn.execute(
+            "UPDATE tenant_quotas SET remaining_quota = ?, updated_at = ? WHERE tenant_id = ? AND quota_type = ?",
+            (new_rem, int(now_ts), tenant_id, ALERT_QUOTA_BUCKET),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
 
 
 def consume_tenant_quota(

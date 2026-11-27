@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 from typing import Sequence
 
@@ -88,6 +88,17 @@ def build_indexed_doc(
         body_positions=b_pos,
         token_set=tok_set,
         token_set_len=len(tok_set),
+    )
+
+
+def with_updated_citation_count(idoc: IndexedDoc, new_citation_count: int) -> IndexedDoc:
+    """当内部引用源状态翻转时，O(1) 复用全部预分词结构仅刷新有效引用数与基础分。"""
+    if idoc.citation_count == new_citation_count:
+        return idoc
+    return replace(
+        idoc,
+        citation_count=new_citation_count,
+        base_score=round(0.25 * new_citation_count + 0.1 * idoc.risk_weight, 4),
     )
 
 

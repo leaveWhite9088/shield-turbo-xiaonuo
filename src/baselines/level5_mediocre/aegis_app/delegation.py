@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""跨部门角色借调委托管理（5级平庸样本：每次鉴权递归新建连接查询，变更未联动检索缓存失效）。"""
+"""跨部门角色借调委托管理（5级平庸样本：每次鉴权递归新建连接，未防委托有向环路，变更未联动检索缓存失效）。"""
 from __future__ import annotations
 
 import time
 from typing import Any
 
-from .config import ROLE_DEFAULT_CLEARANCE
+from .config import MAX_DELEGATION_HOPS, ROLE_DEFAULT_CLEARANCE
 from .db import open_connection
 
 
@@ -45,6 +45,45 @@ def resolve_base_and_explicit_roles(db_path: str, tenant_id: str, user_id: str) 
         conn.close()
 
 
+def _collect_upstream_grantors(
+    db_path: str,
+    tenant_id: str,
+    grantee_user_id: str,
+    role_name: str,
+    at_ts: int,
+    depth: int = 0,
+) -> list[tuple[str, int]]:
+    conn = open_connection(db_path)
+    try:
+        d_rows = conn.execute(
+            "SELECT grantor_user_id, starts_at, expires_at "
+            "FROM delegation_grants "
+            "WHERE tenant_id = ? AND grantee_user_id = ? AND delegated_role = ? AND active = 1",
+            (tenant_id, grantee_user_id, role_name),
+        ).fetchall()
+        active_grantors: list[str] = []
+        for dr in d_rows:
+            if int(dr["starts_at"]) <= at_ts < int(dr["expires_at"]):
+                gid = str(dr["grantor_user_id"])
+                u_row = conn.execute(
+                    "SELECT active FROM users WHERE tenant_id = ? AND user_id = ?",
+                    (tenant_id, gid),
+                ).fetchone()
+                if u_row and int(u_row["active"]) == 1:
+                    active_grantors.append(gid)
+    finally:
+        conn.close()
+
+    discovered: list[tuple[str, int]] = []
+    for gid in active_grantors:
+        next_hop = depth + 1
+        discovered.append((gid, next_hop))
+        discovered.extend(
+            _collect_upstream_grantors(db_path, tenant_id, gid, role_name, at_ts, next_hop)
+        )
+    return discovered
+
+
 def resolve_active_delegated_roles(
     db_path: str,
     tenant_id: str,
@@ -54,7 +93,7 @@ def resolve_active_delegated_roles(
     conn = open_connection(db_path)
     try:
         d_rows = conn.execute(
-            "SELECT grantor_user_id, delegated_role, starts_at, expires_at "
+            "SELECT DISTINCT delegated_role, starts_at, expires_at "
             "FROM delegation_grants "
             "WHERE tenant_id = ? AND grantee_user_id = ? AND active = 1",
             (tenant_id, grantee_user_id),
@@ -62,17 +101,19 @@ def resolve_active_delegated_roles(
     finally:
         conn.close()
 
+    candidate_roles = {
+        str(dr["delegated_role"])
+        for dr in d_rows
+        if int(dr["starts_at"]) <= at_ts < int(dr["expires_at"])
+    }
+
     effective_delegated: set[str] = set()
-    for dr in d_rows:
-        s_ts = int(dr["starts_at"])
-        e_ts = int(dr["expires_at"])
-        if not (s_ts <= at_ts < e_ts):
-            continue
-        grantor_id = dr["grantor_user_id"]
-        role_name = dr["delegated_role"]
-        grantor_native_roles = resolve_base_and_explicit_roles(db_path, tenant_id, grantor_id)
-        if role_name in grantor_native_roles:
-            effective_delegated.add(role_name)
+    for role_name in candidate_roles:
+        for src_uid, hop_dist in _collect_upstream_grantors(db_path, tenant_id, grantee_user_id, role_name, at_ts):
+            if 1 <= hop_dist <= MAX_DELEGATION_HOPS:
+                if role_name in resolve_base_and_explicit_roles(db_path, tenant_id, src_uid):
+                    effective_delegated.add(role_name)
+                    break
     return effective_delegated
 
 
@@ -88,6 +129,7 @@ def create_or_revoke_delegation(
     starts_at: int,
     expires_at: int,
     action: str = "create",
+    now_ts: int | None = None,
 ) -> dict[str, Any]:
     if delegated_role not in ROLE_DEFAULT_CLEARANCE:
         raise ValueError(f"Unsupported delegated_role: {delegated_role}")
@@ -96,7 +138,7 @@ def create_or_revoke_delegation(
     if grantor_user_id == grantee_user_id:
         raise ValueError("Cannot delegate role to self")
 
-    now_ts = int(time.time())
+    eval_ts = int(now_ts if now_ts is not None else time.time())
     conn = open_connection(db_path)
     try:
         u_check = conn.execute(
@@ -109,14 +151,21 @@ def create_or_revoke_delegation(
         if action == "create":
             if expires_at <= starts_at:
                 raise ValueError("expires_at must be greater than starts_at")
-            grantor_roles = resolve_base_and_explicit_roles(db_path, tenant_id, grantor_user_id)
-            if delegated_role not in grantor_roles:
-                raise PermissionError("Grantor does not possess the role being delegated")
+            grantor_native = resolve_base_and_explicit_roles(db_path, tenant_id, grantor_user_id)
+            can_delegate = delegated_role in grantor_native
+            if not can_delegate and MAX_DELEGATION_HOPS >= 2:
+                upstream = _collect_upstream_grantors(db_path, tenant_id, grantor_user_id, delegated_role, eval_ts)
+                can_delegate = any(
+                    hop == 1 and delegated_role in resolve_base_and_explicit_roles(db_path, tenant_id, src_uid)
+                    for src_uid, hop in upstream
+                )
+            if not can_delegate:
+                raise PermissionError("Grantor does not possess delegatable role within hop limit")
             conn.execute(
                 "INSERT INTO delegation_grants("
                 "tenant_id, grantor_user_id, grantee_user_id, delegated_role, starts_at, expires_at, active, created_at"
                 ") VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
-                (tenant_id, grantor_user_id, grantee_user_id, delegated_role, int(starts_at), int(expires_at), now_ts),
+                (tenant_id, grantor_user_id, grantee_user_id, delegated_role, int(starts_at), int(expires_at), eval_ts),
             )
             affected = 1
         elif action == "revoke":

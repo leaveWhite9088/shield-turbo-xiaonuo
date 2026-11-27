@@ -87,10 +87,26 @@ def search_documents(
     try:
         raw_rows = conn.execute(sql, tuple(params)).fetchall()
         cite_rows = conn.execute(
-            "SELECT doc_id, COUNT(*) AS cnt FROM doc_citations WHERE tenant_id = ? GROUP BY doc_id",
+            "SELECT doc_id, cited_by_ref FROM doc_citations WHERE tenant_id = ?",
             (caller.tenant_id,),
         ).fetchall()
-        cite_map = {r["doc_id"]: int(r["cnt"]) for r in cite_rows}
+        # 5级平庸样本：虽合并拉取了引用，但未校验被引用内部 doc_ 的租户归属（遗留跨租户引用存在性侧信道）
+        active_global_docs = {
+            r["doc_id"]
+            for r in conn.execute(
+                "SELECT doc_id FROM compliance_docs WHERE status = 'ACTIVE' AND quarantined = 0"
+            ).fetchall()
+        }
+        refs_by_doc: dict[str, set[str]] = {}
+        for cr in cite_rows:
+            did = str(cr["doc_id"])
+            ref = str(cr["cited_by_ref"] or "").strip()
+            if ref and ref != did:
+                refs_by_doc.setdefault(did, set()).add(ref)
+        cite_map = {
+            did: sum(1 for ref in rset if (not ref.startswith("doc_")) or (ref in active_global_docs))
+            for did, rset in refs_by_doc.items()
+        }
     finally:
         conn.close()
 

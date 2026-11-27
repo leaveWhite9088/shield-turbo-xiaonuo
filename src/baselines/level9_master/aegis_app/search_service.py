@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""高性能合规文档检索引擎：单篇 O(L) 写时复制增量倒排表 + 双指针词距加成 + 五维纪元有界 LRU。"""
+"""高性能合规文档检索引擎：单篇 O(L + deg) 双向引用联动增量倒排表 + 双指针词距 + 五维纪元有界 LRU。"""
 from __future__ import annotations
 
 from collections import OrderedDict
 import re
 import threading
 import time
-from typing import Any
+from typing import Any, Mapping
 
 from .auth import CallerContext, require_admin
 from .config import (
@@ -32,6 +32,7 @@ from .doc_indexer import (
     build_indexed_doc,
     compute_phrase_proximity_bonus_indexed,
     tokenize_text,
+    with_updated_citation_count,
 )
 
 ALLOWED_SORT_FIELDS = {"score", "updated_at", "risk_weight"}
@@ -40,10 +41,24 @@ SAFE_TAG_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 MAX_SEARCH_CACHE_ENTRIES = 256
 
 
-class TenantDocIndex:
-    """不可变快照式租户文档倒排结构，支持无锁并发读取与单篇写时复制增量演进。"""
+def _count_effective_citations(
+    raw_refs: frozenset[str],
+    active_tenant_docs: Mapping[str, Any] | set[str],
+) -> int:
+    """严格限定内部 doc_ 引用仅在本租户活跃且未隔离文档集合内计分，天然阻断二阶注入与跨租户侧信道。"""
+    if not raw_refs:
+        return 0
+    return sum(
+        1
+        for ref in raw_refs
+        if (not ref.startswith("doc_")) or (ref in active_tenant_docs)
+    )
 
-    __slots__ = ("doc_epoch", "docs_by_id", "postings")
+
+class TenantDocIndex:
+    """不可变快照式租户文档倒排与双向引用图结构，支持无锁并发读与单篇写时复制增量演进。"""
+
+    __slots__ = ("doc_epoch", "docs_by_id", "postings", "raw_refs_by_doc", "reverse_dependents")
 
     def __init__(
         self,
@@ -51,14 +66,17 @@ class TenantDocIndex:
         doc_epoch: int,
         docs_by_id: dict[str, IndexedDoc],
         postings: dict[str, frozenset[str]],
+        raw_refs_by_doc: dict[str, frozenset[str]],
+        reverse_dependents: dict[str, frozenset[str]],
     ) -> None:
         self.doc_epoch = doc_epoch
         self.docs_by_id = docs_by_id
         self.postings = postings
+        self.raw_refs_by_doc = raw_refs_by_doc
+        self.reverse_dependents = reverse_dependents
 
 
 _INDEX_CACHE_LOCK = threading.Lock()
-# 仅保留每个 (db_key, tenant_id) 最新一代索引快照，杜绝多代历史拷贝驻留堆内存
 _TENANT_INDEX_CACHE: dict[tuple[str, str], TenantDocIndex] = {}
 
 _RESULT_CACHE_LOCK = threading.Lock()
@@ -83,7 +101,7 @@ def sync_single_doc_in_index(
     doc_id: str,
     new_doc_epoch: int,
 ) -> None:
-    """当单篇文档发生 Upsert / Retire / Quarantine 时，在已构建倒排快照上执行 O(L) 增量差量替换。"""
+    """当单篇文档 Upsert / Retire / Quarantine 时，执行 O(L + deg) 增量倒排替换与反向引用分值传播。"""
     db_key = normalize_db_key(db_path)
     tk = (db_key, tenant_id)
     with _INDEX_CACHE_LOCK:
@@ -98,37 +116,51 @@ def sync_single_doc_in_index(
         "FROM compliance_docs WHERE tenant_id = ? AND doc_id = ?",
         (tenant_id, doc_id),
     ).fetchone()
-
-    new_idoc: IndexedDoc | None = None
-    if row is not None and row["status"] == "ACTIVE" and int(row["quarantined"]) == 0:
-        c_row = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM doc_citations WHERE tenant_id = ? AND doc_id = ?",
-            (tenant_id, doc_id),
-        ).fetchone()
-        cite_cnt = int(c_row["cnt"]) if c_row else 0
-        new_idoc = build_indexed_doc(
-            doc_id=str(row["doc_id"]),
-            category=str(row["category"]),
-            regulation_code=str(row["regulation_code"]),
-            clearance_level=int(row["clearance_level"]),
-            risk_weight=int(row["risk_weight"]),
-            custom_tag=str(row["custom_tag"]),
-            title=str(row["title"]),
-            body=str(row["body"]),
-            citation_count=cite_cnt,
-            updated_at=int(row["updated_at"]),
-        )
+    c_rows = conn.execute(
+        "SELECT cited_by_ref FROM doc_citations WHERE tenant_id = ? AND doc_id = ?",
+        (tenant_id, doc_id),
+    ).fetchall()
+    new_d_refs = frozenset(
+        ref
+        for cr in c_rows
+        if (ref := str(cr[0] or "").strip()) and ref != doc_id
+    )
 
     with _INDEX_CACHE_LOCK:
         cur_idx = _TENANT_INDEX_CACHE.get(tk)
         if cur_idx is None or cur_idx.doc_epoch != new_doc_epoch - 1:
-            # 若期间发生了跳跃版本并发写，安全移除使下次读取按最新纪元对齐重建
             if cur_idx is not None and cur_idx.doc_epoch < new_doc_epoch:
                 _TENANT_INDEX_CACHE.pop(tk, None)
             return
 
         new_docs = dict(cur_idx.docs_by_id)
         new_postings = dict(cur_idx.postings)
+        new_raw_refs = dict(cur_idx.raw_refs_by_doc)
+        new_rev = dict(cur_idx.reverse_dependents)
+
+        was_active = doc_id in new_docs
+        old_d_refs = new_raw_refs.get(doc_id, frozenset())
+
+        if new_d_refs != old_d_refs:
+            doc_singleton = frozenset((doc_id,))
+            for r_rem in old_d_refs - new_d_refs:
+                if r_rem.startswith("doc_"):
+                    prev_dep = new_rev.get(r_rem)
+                    if prev_dep:
+                        rem_dep = prev_dep - doc_singleton
+                        if rem_dep:
+                            new_rev[r_rem] = rem_dep
+                        else:
+                            new_rev.pop(r_rem, None)
+            for r_add in new_d_refs - old_d_refs:
+                if r_add.startswith("doc_"):
+                    prev_dep = new_rev.get(r_add)
+                    new_rev[r_add] = (prev_dep | doc_singleton) if prev_dep else doc_singleton
+            if new_d_refs:
+                new_raw_refs[doc_id] = new_d_refs
+            else:
+                new_raw_refs.pop(doc_id, None)
+
         old_idoc = new_docs.pop(doc_id, None)
         if old_idoc is not None:
             rm_set = frozenset((doc_id,))
@@ -141,17 +173,46 @@ def sync_single_doc_in_index(
                     else:
                         new_postings.pop(term, None)
 
-        if new_idoc is not None:
+        is_now_active = (
+            row is not None
+            and row["status"] == "ACTIVE"
+            and int(row["quarantined"]) == 0
+        )
+        if is_now_active and row is not None:
+            cite_cnt = _count_effective_citations(new_d_refs, new_docs)
+            new_idoc = build_indexed_doc(
+                doc_id=str(row["doc_id"]),
+                category=str(row["category"]),
+                regulation_code=str(row["regulation_code"]),
+                clearance_level=int(row["clearance_level"]),
+                risk_weight=int(row["risk_weight"]),
+                custom_tag=str(row["custom_tag"]),
+                title=str(row["title"]),
+                body=str(row["body"]),
+                citation_count=cite_cnt,
+                updated_at=int(row["updated_at"]),
+            )
             new_docs[doc_id] = new_idoc
             add_set = frozenset((doc_id,))
             for term in new_idoc.token_set:
                 prev_p = new_postings.get(term)
                 new_postings[term] = (prev_p | add_set) if prev_p else add_set
 
+        # 若本文档在线活跃状态发生翻转，O(deg) 局部刷新所有引用本文档的同租户目标文档计分
+        if was_active != is_now_active:
+            for target_did in new_rev.get(doc_id, ()):
+                t_idoc = new_docs.get(target_did)
+                if t_idoc is not None:
+                    t_refs = new_raw_refs.get(target_did, frozenset())
+                    t_cnt = _count_effective_citations(t_refs, new_docs)
+                    new_docs[target_did] = with_updated_citation_count(t_idoc, t_cnt)
+
         _TENANT_INDEX_CACHE[tk] = TenantDocIndex(
             doc_epoch=new_doc_epoch,
             docs_by_id=new_docs,
             postings=new_postings,
+            raw_refs_by_doc=new_raw_refs,
+            reverse_dependents=new_rev,
         )
 
 
@@ -178,16 +239,33 @@ def _get_or_build_tenant_index(db_path: str, tenant_id: str, doc_epoch: int) -> 
             (tenant_id,),
         ).fetchall()
         cite_rows = conn.execute(
-            "SELECT doc_id, COUNT(*) AS cnt FROM doc_citations WHERE tenant_id = ? GROUP BY doc_id",
+            "SELECT doc_id, cited_by_ref FROM doc_citations WHERE tenant_id = ?",
             (tenant_id,),
         ).fetchall()
-        cite_map = {str(r["doc_id"]): int(r["cnt"]) for r in cite_rows}
+
+        raw_tmp: dict[str, set[str]] = {}
+        rev_tmp: dict[str, set[str]] = {}
+        for cr in cite_rows:
+            did = str(cr[0])
+            ref = str(cr[1] or "").strip()
+            if ref and ref != did:
+                raw_tmp.setdefault(did, set()).add(ref)
+                if ref.startswith("doc_"):
+                    rev_tmp.setdefault(ref, set()).add(did)
+
+        raw_refs_by_doc = {d: frozenset(rset) for d, rset in raw_tmp.items()}
+        reverse_dependents = {r: frozenset(dset) for r, dset in rev_tmp.items()}
+        active_doc_ids = {str(r["doc_id"]) for r in doc_rows}
 
         docs_by_id: dict[str, IndexedDoc] = {}
         postings_tmp: dict[str, set[str]] = {}
 
         for r in doc_rows:
             did = str(r["doc_id"])
+            eff_cites = _count_effective_citations(
+                raw_refs_by_doc.get(did, frozenset()),
+                active_doc_ids,
+            )
             idoc = build_indexed_doc(
                 doc_id=did,
                 category=str(r["category"]),
@@ -197,7 +275,7 @@ def _get_or_build_tenant_index(db_path: str, tenant_id: str, doc_epoch: int) -> 
                 custom_tag=str(r["custom_tag"]),
                 title=str(r["title"]),
                 body=str(r["body"]),
-                citation_count=cite_map.get(did, 0),
+                citation_count=eff_cites,
                 updated_at=int(r["updated_at"]),
             )
             docs_by_id[did] = idoc
@@ -205,7 +283,13 @@ def _get_or_build_tenant_index(db_path: str, tenant_id: str, doc_epoch: int) -> 
                 postings_tmp.setdefault(term, set()).add(did)
 
         postings = {term: frozenset(dset) for term, dset in postings_tmp.items()}
-        built = TenantDocIndex(doc_epoch=doc_epoch, docs_by_id=docs_by_id, postings=postings)
+        built = TenantDocIndex(
+            doc_epoch=doc_epoch,
+            docs_by_id=docs_by_id,
+            postings=postings,
+            raw_refs_by_doc=raw_refs_by_doc,
+            reverse_dependents=reverse_dependents,
+        )
 
         with _INDEX_CACHE_LOCK:
             live_eps = get_tenant_epochs(db_path, tenant_id)

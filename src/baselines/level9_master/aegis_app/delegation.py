@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""高性能角色借调委托引擎：租户权限内存快照 + 精确秒级时效窗口 + O(1) 委托人实时资格级联核验。"""
+"""高性能二级受控借调委托引擎：租户权限内存快照 + 精确秒级双窗口交集 + O(1) 无环级联核验。"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,7 +7,7 @@ import threading
 import time
 from typing import Any
 
-from .config import ROLE_DEFAULT_CLEARANCE
+from .config import MAX_DELEGATION_HOPS, ROLE_DEFAULT_CLEARANCE
 from .db import (
     bump_tenant_epoch,
     get_striped_lock,
@@ -19,7 +19,7 @@ from .db import (
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class UserAuthProfile:
     user_id: str
     username: str
@@ -30,7 +30,7 @@ class UserAuthProfile:
     native_roles: frozenset[str]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TenantAuthSnapshot:
     perm_epoch: int
     tenant_status: str
@@ -54,7 +54,7 @@ register_cache_reset_hook(_clear_auth_snaps)
 
 
 def get_tenant_auth_snapshot(db_path: str, tenant_id: str, perm_epoch: int) -> TenantAuthSnapshot | None:
-    """获取或构建本租户在当前 perm_epoch 下的不可变身份与委托关系快照。"""
+    """获取或构建本租户在当前 perm_epoch 下的不可变身份与借调拓扑快照。"""
     db_key = normalize_db_key(db_path)
     tk = (db_key, tenant_id)
     with _SNAP_LOCK:
@@ -159,23 +159,52 @@ def get_tenant_auth_snapshot(db_path: str, tenant_id: str, perm_epoch: int) -> T
     return built
 
 
+def _compute_role_hops_from_snapshot(
+    snap: TenantAuthSnapshot,
+    user_id: str,
+    at_ts: int,
+) -> dict[str, int]:
+    """两层定界无环求值：返回 user_id 在 at_ts 时刻有效持有的 role -> 最短跳数 (0=原生, 1=一级借调, 2=二级转借调)。"""
+    u_prof = snap.users.get(user_id)
+    if u_prof is None or not u_prof.active:
+        return {}
+
+    role_hops: dict[str, int] = {r: 0 for r in u_prof.native_roles}
+
+    for g1_id, del_role, s1, e1 in snap.delegations_by_grantee.get(user_id, ()):
+        if g1_id == user_id or not (s1 <= at_ts < e1):
+            continue
+        cur_best = role_hops.get(del_role, 99)
+        if cur_best <= 1:
+            continue
+        g1_prof = snap.users.get(g1_id)
+        if g1_prof is None or not g1_prof.active:
+            continue
+        if del_role in g1_prof.native_roles:
+            role_hops[del_role] = 1
+            continue
+        if MAX_DELEGATION_HOPS >= 2 and cur_best > 2:
+            for g0_id, r0, s0, e0 in snap.delegations_by_grantee.get(g1_id, ()):
+                if r0 != del_role or g0_id == user_id or g0_id == g1_id or not (s0 <= at_ts < e0):
+                    continue
+                g0_prof = snap.users.get(g0_id)
+                if g0_prof is not None and g0_prof.active and del_role in g0_prof.native_roles:
+                    role_hops[del_role] = 2
+                    break
+
+    return role_hops
+
+
 def compute_effective_roles_from_snapshot(
     snap: TenantAuthSnapshot,
     user_id: str,
     at_ts: int,
 ) -> tuple[set[str], int]:
-    """在内存快照上精确核验借调时间窗 [starts_at, expires_at) 与委托人当前原生角色持有状态。"""
-    u_prof = snap.users.get(user_id)
-    if u_prof is None or not u_prof.active:
+    """在内存快照上精确核验 0..2 跳借调时间窗交集与源头/中间节点实时活跃资格。"""
+    role_hops = _compute_role_hops_from_snapshot(snap, user_id, at_ts)
+    if not role_hops:
         return set(), 0
-
-    roles = set(u_prof.native_roles)
-    for grantor_id, del_role, s_ts, e_ts in snap.delegations_by_grantee.get(user_id, ()):
-        if s_ts <= at_ts < e_ts:
-            grantor_prof = snap.users.get(grantor_id)
-            if grantor_prof is not None and grantor_prof.active and del_role in grantor_prof.native_roles:
-                roles.add(del_role)
-
+    roles = set(role_hops.keys())
     max_cl = max((ROLE_DEFAULT_CLEARANCE.get(r, 1) for r in roles), default=1)
     return roles, max_cl
 
@@ -201,13 +230,8 @@ def resolve_active_delegated_roles(
     snap = get_tenant_auth_snapshot(db_path, tenant_id, eps.perm)
     if snap is None:
         return set()
-    delegated: set[str] = set()
-    for grantor_id, del_role, s_ts, e_ts in snap.delegations_by_grantee.get(grantee_user_id, ()):
-        if s_ts <= at_ts < e_ts:
-            grantor_prof = snap.users.get(grantor_id)
-            if grantor_prof is not None and grantor_prof.active and del_role in grantor_prof.native_roles:
-                delegated.add(del_role)
-    return delegated
+    role_hops = _compute_role_hops_from_snapshot(snap, grantee_user_id, at_ts)
+    return {r for r, h in role_hops.items() if 1 <= h <= MAX_DELEGATION_HOPS}
 
 
 def create_or_revoke_delegation(
@@ -254,9 +278,12 @@ def create_or_revoke_delegation(
                 raise ValueError("expires_at must be greater than starts_at")
             eps = get_tenant_epochs(db_path, tenant_id)
             snap = get_tenant_auth_snapshot(db_path, tenant_id, eps.perm)
-            grantor_prof = snap.users.get(grantor_user_id) if snap else None
-            if grantor_prof is None or delegated_role not in grantor_prof.native_roles:
-                raise PermissionError("Grantor does not possess the role being delegated")
+            if snap is None:
+                raise LookupError("Tenant snapshot unavailable")
+            grantor_hops = _compute_role_hops_from_snapshot(snap, grantor_user_id, ts_val)
+            # 仅原生持有者(0跳)或有效一级受托人(1跳)可继续发起借调；二级受托人(2跳)不得发起第3跳
+            if grantor_hops.get(delegated_role, 99) >= MAX_DELEGATION_HOPS:
+                raise PermissionError("Grantor does not possess delegatable role within hop limit")
             conn.execute(
                 "INSERT INTO delegation_grants("
                 "tenant_id, grantor_user_id, grantee_user_id, delegated_role, starts_at, expires_at, active, created_at"

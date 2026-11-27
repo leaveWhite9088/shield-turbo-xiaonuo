@@ -15,6 +15,7 @@ from .config import (
 )
 from .contagion_graph import compute_sanction_contagion_hop
 from .db import open_connection
+from .ledger_ops import try_consume_realtime_alert_quota
 from .legacy_compat import apply_sovereign_settlement_adjustment
 from .window_stats import compute_exact_median_cents
 
@@ -309,44 +310,57 @@ def evaluate_transaction_batch(
                 "WHERE tenant_id = ? AND account_id = ? AND ts >= ? AND ts <= ?",
                 (caller.tenant_id, account_id, win_start, ts),
             ).fetchall()
+        finally:
+            conn.close()
 
-            win_tx_count = 1
-            win_amount_cents = amount_cents
-            win_amounts_list: list[int] = [amount_cents]
-            cp_set: set[str] = {counterparty_id}
+        win_tx_count = 1
+        win_amount_cents = amount_cents
+        win_amounts_list: list[int] = [amount_cents]
+        cp_set: set[str] = {counterparty_id}
 
-            for hr in hist_rows:
-                h_amt = int(hr["amount_cents"])
-                win_tx_count += 1
-                win_amount_cents += h_amt
-                win_amounts_list.append(h_amt)
-                cp_set.add(hr["counterparty_id"])
+        for hr in hist_rows:
+            h_amt = int(hr["amount_cents"])
+            win_tx_count += 1
+            win_amount_cents += h_amt
+            win_amounts_list.append(h_amt)
+            cp_set.add(hr["counterparty_id"])
 
-            win_unique_cps = len(cp_set)
-            win_median_cents = compute_exact_median_cents(win_amounts_list)
+        win_unique_cps = len(cp_set)
+        win_median_cents = compute_exact_median_cents(win_amounts_list)
 
-            tx_eval_obj = {
-                "tx_id": tx_id,
-                "account_id": account_id,
-                "counterparty_id": counterparty_id,
-                "amount_cents": amount_cents,
-                "currency": currency,
-                "channel": channel,
-                "contact_email": contact_email,
-                "ts": ts,
-                "metadata": metadata,
-            }
-            risk_score, decision, reasons = compute_single_tx_decision(
-                tx_eval_obj,
-                policy,
-                win_tx_count=win_tx_count,
-                win_amount_cents=win_amount_cents,
-                win_unique_cps=win_unique_cps,
-                win_median_cents=win_median_cents,
-                sanction_hop=sanction_hop,
-            )
+        tx_eval_obj = {
+            "tx_id": tx_id,
+            "account_id": account_id,
+            "counterparty_id": counterparty_id,
+            "amount_cents": amount_cents,
+            "currency": currency,
+            "channel": channel,
+            "contact_email": contact_email,
+            "ts": ts,
+            "metadata": metadata,
+        }
+        risk_score, decision, reasons = compute_single_tx_decision(
+            tx_eval_obj,
+            policy,
+            win_tx_count=win_tx_count,
+            win_amount_cents=win_amount_cents,
+            win_unique_cps=win_unique_cps,
+            win_median_cents=win_median_cents,
+            sanction_hop=sanction_hop,
+        )
 
-            decision_id = f"dec_{tx_id}"
+        # 5级平庸样本：逐笔独立扣减告警配额并立即提交，末尾交易异常会导致已扣配额泄漏不回滚
+        alert_dispatched = False
+        if decision == "REJECT":
+            if try_consume_realtime_alert_quota(db_path, caller.tenant_id, ts):
+                alert_dispatched = True
+                reasons.append("ALERT_QUOTA_CONSUMED")
+            else:
+                reasons.append("ALERT_POOL_DEPLETED")
+
+        decision_id = f"dec_{tx_id}"
+        conn = open_connection(db_path)
+        try:
             conn.execute(
                 "INSERT INTO transactions("
                 "tx_id, tenant_id, batch_id, account_id, counterparty_id, amount_cents, "
@@ -401,6 +415,7 @@ def evaluate_transaction_batch(
                 "risk_score": risk_score,
                 "decision": decision,
                 "sanction_hop": sanction_hop,
+                "alert_dispatched": alert_dispatched,
                 "window": {
                     "tx_count": win_tx_count,
                     "amount_cents": win_amount_cents,
@@ -436,6 +451,7 @@ def get_risk_decision_detail(
         ).fetchone()
         if not row:
             raise LookupError(f"Decision record not found: {decision_id}")
+        reasons_list = json.loads(row["reasons_json"])
         return {
             "decision_id": row["decision_id"],
             "tx_id": row["tx_id"],
@@ -444,13 +460,14 @@ def get_risk_decision_detail(
             "risk_score": int(row["risk_score"]),
             "decision": row["decision"],
             "sanction_hop": int(row["sanction_hop"]),
+            "alert_dispatched": "ALERT_QUOTA_CONSUMED" in reasons_list,
             "window": {
                 "tx_count": int(row["win_tx_count"]),
                 "amount_cents": int(row["win_amount_cents"]),
                 "unique_counterparties": int(row["win_unique_counterparties"]),
                 "median_cents": int(row["win_median_cents"]),
             },
-            "reasons": json.loads(row["reasons_json"]),
+            "reasons": reasons_list,
             "evaluated_at": int(row["evaluated_at"]),
         }
     finally:

@@ -13,6 +13,7 @@ from typing import Any
 
 from .auth import CallerContext, require_admin
 from .config import (
+    ALERT_QUOTA_BUCKET,
     CHANNEL_RISK_WEIGHTS,
     MAX_BATCH_TXS,
     MAX_REGEX_PATTERN_LEN,
@@ -24,6 +25,7 @@ from .config import (
 )
 from .contagion_graph import eval_3hop_from_window_adj, get_active_sanctioned_entities
 from .db import (
+    acquire_ordered_striped_locks,
     bump_tenant_epoch,
     get_striped_lock,
     get_tenant_epochs,
@@ -528,8 +530,8 @@ def evaluate_transaction_batch(
     acct_list = sorted(account_set)
     tx_id_list = [t["tx_id"] for t in parsed_items]
 
-    lock = get_striped_lock(db_path, caller.tenant_id, "risk_eval")
-    with lock:
+    # 全局统一偏序加锁（按分片号升序一次性锁住 risk_eval 与 REALTIME_ALERT_POOL，再进 BEGIN IMMEDIATE），根除与跨池调拨交叉竞争死锁
+    with acquire_ordered_striped_locks(db_path, caller.tenant_id, "risk_eval", f"quota:{ALERT_QUOTA_BUCKET}"):
         conn = get_thread_connection(db_path)
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -543,6 +545,14 @@ def evaluate_transaction_batch(
                 if dup_row:
                     conn.rollback()
                     raise BatchConflictError(f"Transaction already exists: {dup_row['tx_id']}")
+
+            q_row = conn.execute(
+                "SELECT remaining_quota FROM tenant_quotas WHERE tenant_id = ? AND quota_type = ?",
+                (caller.tenant_id, ALERT_QUOTA_BUCKET),
+            ).fetchone()
+            initial_alert_quota = int(q_row["remaining_quota"]) if q_row else 0
+            avail_alert_quota = initial_alert_quota
+            last_alert_ts = latest_ts
 
             acct_init_rows: dict[str, list[tuple[int, int, str]]] = {a: [] for a in acct_list}
             for start_i in range(0, len(acct_list), 400):
@@ -561,7 +571,6 @@ def evaluate_transaction_batch(
                 for acct, init_list in acct_init_rows.items()
             }
 
-            # 若存在活跃受制裁实体，仅一次索引扫描构建活跃窗口边邻接表供整批交易增量复用
             adj_by_node: dict[str, list[tuple[int, str]]] = {}
             if sanctioned_set:
                 edge_rows = conn.execute(
@@ -622,6 +631,16 @@ def evaluate_transaction_batch(
                     sanction_hop=sanction_hop,
                 )
 
+                alert_dispatched = False
+                if decision == "REJECT":
+                    if avail_alert_quota >= 1:
+                        avail_alert_quota -= 1
+                        alert_dispatched = True
+                        last_alert_ts = ts
+                        reasons.append("ALERT_QUOTA_CONSUMED")
+                    else:
+                        reasons.append("ALERT_POOL_DEPLETED")
+
                 decision_id = f"dec_{tx_id}"
                 tx_insert_rows.append(
                     (
@@ -665,6 +684,7 @@ def evaluate_transaction_batch(
                         "risk_score": risk_score,
                         "decision": decision,
                         "sanction_hop": sanction_hop,
+                        "alert_dispatched": alert_dispatched,
                         "window": {
                             "tx_count": win_tx_count,
                             "amount_cents": win_amount_cents,
@@ -673,6 +693,13 @@ def evaluate_transaction_batch(
                         },
                         "reasons": reasons,
                     }
+                )
+
+            if avail_alert_quota != initial_alert_quota and q_row is not None:
+                conn.execute(
+                    "UPDATE tenant_quotas SET remaining_quota = ?, updated_at = ? "
+                    "WHERE tenant_id = ? AND quota_type = ?",
+                    (avail_alert_quota, last_alert_ts, caller.tenant_id, ALERT_QUOTA_BUCKET),
                 )
 
             conn.executemany(
@@ -726,6 +753,7 @@ def get_risk_decision_detail(
     ).fetchone()
     if not row:
         raise LookupError(f"Decision record not found: {decision_id}")
+    reasons_list = json.loads(row["reasons_json"])
     return {
         "decision_id": row["decision_id"],
         "tx_id": row["tx_id"],
@@ -734,12 +762,13 @@ def get_risk_decision_detail(
         "risk_score": int(row["risk_score"]),
         "decision": row["decision"],
         "sanction_hop": int(row["sanction_hop"]),
+        "alert_dispatched": "ALERT_QUOTA_CONSUMED" in reasons_list,
         "window": {
             "tx_count": int(row["win_tx_count"]),
             "amount_cents": int(row["win_amount_cents"]),
             "unique_counterparties": int(row["win_unique_counterparties"]),
             "median_cents": int(row["win_median_cents"]),
         },
-        "reasons": json.loads(row["reasons_json"]),
+        "reasons": reasons_list,
         "evaluated_at": int(row["evaluated_at"]),
     }

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""高性能合规文档流式写入服务：原子事务校验 + 联动内存倒排表执行 O(L) 单篇增量差量同步。"""
+"""高性能合规文档流式写入服务：引用白名单防二阶注入 + 联动内存倒排与反向引用图 O(L + deg) 增量更新。"""
 from __future__ import annotations
 
 import re
@@ -7,7 +7,7 @@ import time
 from typing import Any
 
 from .auth import CallerContext
-from .config import CLEARANCE_LEVELS, MAX_DOC_BODY_CHARS
+from .config import CLEARANCE_LEVELS, MAX_CITATIONS_PER_UPSERT, MAX_DOC_BODY_CHARS
 from .db import (
     bump_tenant_epoch,
     get_striped_lock,
@@ -18,6 +18,7 @@ from .search_service import sync_single_doc_in_index
 
 SAFE_DOC_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 SAFE_TAG_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+SAFE_CITATION_REF_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
 def _require_editor_clearance(caller: CallerContext, doc_clearance: int) -> None:
@@ -54,8 +55,17 @@ def upsert_compliance_document(
         updated_at = int(caller.request_ts or int(time.time()))
 
     citations = payload.get("citations") if payload.get("citations") is not None else []
-    if not isinstance(citations, list) or len(citations) > 50:
-        raise ValueError("citations must be a list of at most 50 items")
+    if not isinstance(citations, list) or len(citations) > MAX_CITATIONS_PER_UPSERT:
+        raise ValueError(f"citations must be a list of at most {MAX_CITATIONS_PER_UPSERT} items")
+
+    validated_citations: list[str] = []
+    for c_ref in citations:
+        if not isinstance(c_ref, str):
+            raise ValueError("Each citation reference must be a string")
+        c_str = c_ref.strip()
+        if not c_str or not SAFE_CITATION_REF_RE.match(c_str):
+            raise ValueError("Invalid citation reference format")
+        validated_citations.append(c_str)
 
     if not doc_id or not SAFE_DOC_ID_RE.match(doc_id):
         raise ValueError("Invalid doc_id format")
@@ -125,13 +135,8 @@ def upsert_compliance_document(
                 )
                 mode = "created"
 
-            if citations:
-                cite_rows = []
-                for c_ref in citations:
-                    c_str = str(c_ref).strip()
-                    if len(c_str) > 128:
-                        raise ValueError("Citation reference too long")
-                    cite_rows.append((caller.tenant_id, doc_id, c_str, updated_at))
+            if validated_citations:
+                cite_rows = [(caller.tenant_id, doc_id, c_str, updated_at) for c_str in validated_citations]
                 conn.executemany(
                     "INSERT INTO doc_citations(tenant_id, doc_id, cited_by_ref, cited_at) VALUES (?, ?, ?, ?)",
                     cite_rows,
