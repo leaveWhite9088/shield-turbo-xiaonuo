@@ -1,0 +1,18 @@
+{
+  "model": "glm-5.3-flash",
+  "model_id": "glm-5.3-flash",
+  "pack_id": "5422dc3bbedc",
+  "created_at": "2026-11-26T23:35:38+08:00",
+  "cases": {
+    "case-01": {
+      "run": "glm-5.3-flash",
+      "code_sha256": "de68131a43f2f424c721921fb88191866accc816f3310a803e2d9c518c715f52",
+      "end_iso": "2026-11-26T23:35:36+08:00",
+      "diff_stats": {
+        "changed_files": 16,
+        "added_lines": 2213,
+        "deleted_lines": 811
+      }
+    }
+  }
+}

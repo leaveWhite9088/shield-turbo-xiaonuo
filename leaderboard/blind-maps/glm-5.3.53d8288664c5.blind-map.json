@@ -1,0 +1,18 @@
+{
+  "model": "glm-5.3",
+  "model_id": "glm-5.3",
+  "pack_id": "53d8288664c5",
+  "created_at": "2026-11-27T08:54:21+08:00",
+  "cases": {
+    "case-01": {
+      "run": "glm-5.3",
+      "code_sha256": "8340e356039292acd2ad68c3363190c84b711a6b29f3202600620b1c560e0843",
+      "end_iso": "2026-11-27T08:54:18+08:00",
+      "diff_stats": {
+        "changed_files": 15,
+        "added_lines": 2078,
+        "deleted_lines": 664
+      }
+    }
+  }
+}

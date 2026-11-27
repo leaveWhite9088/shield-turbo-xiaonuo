@@ -1,0 +1,66 @@
+{
+  "model": "deepseek-v4.1-flash",
+  "model_inputs": [
+    "deepseek-v4.1-flash"
+  ],
+  "finalized_at": "2026-11-27T15:35:14+08:00",
+  "scoring_hash": "a5bc652a364f96bc6ac445838be6804a25179500a8560473abbb35a98f6ee2fd",
+  "blind_pack_ids": [
+    "586f3f675095"
+  ],
+  "d_aggregate": "mean",
+  "summary": {
+    "runs_total": 1,
+    "runs_scored": 1,
+    "judge_reviews": 1,
+    "objective_cache_hits": 1,
+    "objective_recomputed": 0
+  },
+  "runs": [
+    {
+      "run": "deepseek-v4.1-flash",
+      "pack_id": "586f3f675095",
+      "case_id": "case-01",
+      "judge_count": 1,
+      "code_sha256": "520c6ff2c648",
+      "objective_cached": true,
+      "b2_reliable": true,
+      "speedup": 0.43,
+      "b1AccuracyPct": 48.48,
+      "endToEndMin": 127.83,
+      "A": 0.13,
+      "B": 0.13,
+      "C": 2.64,
+      "D": 15.0,
+      "total": 17.9,
+      "A1": 0.0,
+      "A2": 0.0,
+      "A3": 0.13,
+      "B1": 0.13,
+      "B2": 0.0,
+      "C1": 2.06,
+      "C2": 0.58,
+      "C3": 0.0,
+      "D1": 6.6,
+      "D2": 5.6,
+      "D3": 2.8
+    }
+  ],
+  "mean": {
+    "speedup": 0.43,
+    "endToEndMin": 127.83,
+    "A": 0.13,
+    "B": 0.13,
+    "C": 2.64,
+    "D": 15.0,
+    "total": 17.9,
+    "B1": 0.13,
+    "B2": 0.0,
+    "C1": 2.06,
+    "C2": 0.58,
+    "C3": 0.0,
+    "D1": 6.6,
+    "D2": 5.6,
+    "D3": 2.8
+  }
+}

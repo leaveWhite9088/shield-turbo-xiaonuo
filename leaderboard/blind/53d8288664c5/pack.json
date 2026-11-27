@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "pack_id": "53d8288664c5",
+  "blind": true,
+  "rubric": "RUBRIC.md",
+  "official_level5_reference": "OFFICIAL_LEVEL5_BASELINE.md",
+  "cases": [
+    {
+      "case_id": "case-01",
+      "overview": "case-01/OVERVIEW.md",
+      "diff": "case-01/code_changes.diff",
+      "explanation": "case-01/EXPLANATION.md",
+      "code_dir": "case-01/code"
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "model": "minimax-m3.1-flash",
+  "model_id": "minimax-m3.1-flash",
+  "pack_id": "7ec86796cc43",
+  "created_at": "2026-11-26T23:28:54+08:00",
+  "cases": {
+    "case-01": {
+      "run": "minimax-m3.1-flash",
+      "code_sha256": "93a17740ef909b7fd47188a4908b1b9c86e00e5872482907eb2a700022ade4d4",
+      "end_iso": "2026-11-26T23:28:54+08:00",
+      "diff_stats": {
+        "changed_files": 18,
+        "added_lines": 2998,
+        "deleted_lines": 1027
+      }
+    }
+  }
+}

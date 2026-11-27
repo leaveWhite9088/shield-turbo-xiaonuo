@@ -1,0 +1,66 @@
+{
+  "model": "glm-5.3",
+  "model_inputs": [
+    "glm-5.3"
+  ],
+  "finalized_at": "2026-11-27T15:35:15+08:00",
+  "scoring_hash": "a5bc652a364f96bc6ac445838be6804a25179500a8560473abbb35a98f6ee2fd",
+  "blind_pack_ids": [
+    "53d8288664c5"
+  ],
+  "d_aggregate": "mean",
+  "summary": {
+    "runs_total": 1,
+    "runs_scored": 1,
+    "judge_reviews": 1,
+    "objective_cache_hits": 1,
+    "objective_recomputed": 0
+  },
+  "runs": [
+    {
+      "run": "glm-5.3",
+      "pack_id": "53d8288664c5",
+      "case_id": "case-01",
+      "judge_count": 1,
+      "code_sha256": "8340e3560392",
+      "objective_cached": true,
+      "b2_reliable": true,
+      "speedup": 3.5,
+      "b1AccuracyPct": 100.0,
+      "endToEndMin": 552.72,
+      "A": 15.38,
+      "B": 5.0,
+      "C": 16.8,
+      "D": 22.0,
+      "total": 59.18,
+      "A1": 2.27,
+      "A2": 6.46,
+      "A3": 6.65,
+      "B1": 5.0,
+      "B2": 0.0,
+      "C1": 7.8,
+      "C2": 9.0,
+      "C3": 0.0,
+      "D1": 8.0,
+      "D2": 7.7,
+      "D3": 6.3
+    }
+  ],
+  "mean": {
+    "speedup": 3.5,
+    "endToEndMin": 552.72,
+    "A": 15.38,
+    "B": 5.0,
+    "C": 16.8,
+    "D": 22.0,
+    "total": 59.18,
+    "B1": 5.0,
+    "B2": 0.0,
+    "C1": 7.8,
+    "C2": 9.0,
+    "C3": 0.0,
+    "D1": 8.0,
+    "D2": 7.7,
+    "D3": 6.3
+  }
+}

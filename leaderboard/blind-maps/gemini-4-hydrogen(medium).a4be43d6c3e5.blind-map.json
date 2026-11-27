@@ -1,0 +1,18 @@
+{
+  "model": "gemini-4-hydrogen(medium)",
+  "model_id": "gemini-4-hydrogen(medium)",
+  "pack_id": "a4be43d6c3e5",
+  "created_at": "2026-11-27T14:53:35+08:00",
+  "cases": {
+    "case-01": {
+      "run": "gemini-4-hydrogen(medium)",
+      "code_sha256": "a1fea350434d4dd49b7a75dbdf086cad2c813fdabe96bf7284c8f79f59a9e1ff",
+      "end_iso": "2026-11-27T14:53:35+08:00",
+      "diff_stats": {
+        "changed_files": 17,
+        "added_lines": 2606,
+        "deleted_lines": 1165
+      }
+    }
+  }
+}

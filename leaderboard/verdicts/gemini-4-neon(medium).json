@@ -1,0 +1,66 @@
+{
+  "model": "gemini-4-neon(medium)",
+  "model_inputs": [
+    "gemini-4-neon(medium)"
+  ],
+  "finalized_at": "2026-11-27T15:35:15+08:00",
+  "scoring_hash": "a5bc652a364f96bc6ac445838be6804a25179500a8560473abbb35a98f6ee2fd",
+  "blind_pack_ids": [
+    "2b190fb3d2f7"
+  ],
+  "d_aggregate": "mean",
+  "summary": {
+    "runs_total": 1,
+    "runs_scored": 1,
+    "judge_reviews": 1,
+    "objective_cache_hits": 1,
+    "objective_recomputed": 0
+  },
+  "runs": [
+    {
+      "run": "gemini-4-neon(medium)",
+      "pack_id": "2b190fb3d2f7",
+      "case_id": "case-01",
+      "judge_count": 1,
+      "code_sha256": "26f8bc249e6b",
+      "objective_cached": true,
+      "b2_reliable": true,
+      "speedup": 58.67,
+      "b1AccuracyPct": 100.0,
+      "endToEndMin": 15.05,
+      "A": 21.39,
+      "B": 7.5,
+      "C": 23.03,
+      "D": 28.8,
+      "total": 80.72,
+      "A1": 7.59,
+      "A2": 6.03,
+      "A3": 7.77,
+      "B1": 5.0,
+      "B2": 2.5,
+      "C1": 10.0,
+      "C2": 9.0,
+      "C3": 4.03,
+      "D1": 10.6,
+      "D2": 9.7,
+      "D3": 8.5
+    }
+  ],
+  "mean": {
+    "speedup": 58.67,
+    "endToEndMin": 15.05,
+    "A": 21.39,
+    "B": 7.5,
+    "C": 23.03,
+    "D": 28.8,
+    "total": 80.72,
+    "B1": 5.0,
+    "B2": 2.5,
+    "C1": 10.0,
+    "C2": 9.0,
+    "C3": 4.03,
+    "D1": 10.6,
+    "D2": 9.7,
+    "D3": 8.5
+  }
+}

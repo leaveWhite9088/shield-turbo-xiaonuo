@@ -1,0 +1,66 @@
+{
+  "model": "kimi-k3.1-pro",
+  "model_inputs": [
+    "kimi-k3.1-pro"
+  ],
+  "finalized_at": "2026-11-27T15:35:15+08:00",
+  "scoring_hash": "a5bc652a364f96bc6ac445838be6804a25179500a8560473abbb35a98f6ee2fd",
+  "blind_pack_ids": [
+    "58223ecf8e6a"
+  ],
+  "d_aggregate": "mean",
+  "summary": {
+    "runs_total": 1,
+    "runs_scored": 1,
+    "judge_reviews": 1,
+    "objective_cache_hits": 1,
+    "objective_recomputed": 0
+  },
+  "runs": [
+    {
+      "run": "kimi-k3.1-pro",
+      "pack_id": "58223ecf8e6a",
+      "case_id": "case-01",
+      "judge_count": 1,
+      "code_sha256": "827d709388ea",
+      "objective_cached": true,
+      "b2_reliable": true,
+      "speedup": 119.18,
+      "b1AccuracyPct": 100.0,
+      "endToEndMin": 523.68,
+      "A": 22.02,
+      "B": 5.0,
+      "C": 20.83,
+      "D": 22.5,
+      "total": 70.35,
+      "A1": 9.51,
+      "A2": 4.51,
+      "A3": 8.0,
+      "B1": 5.0,
+      "B2": 0.0,
+      "C1": 7.8,
+      "C2": 9.0,
+      "C3": 4.03,
+      "D1": 8.3,
+      "D2": 7.9,
+      "D3": 6.3
+    }
+  ],
+  "mean": {
+    "speedup": 119.18,
+    "endToEndMin": 523.68,
+    "A": 22.02,
+    "B": 5.0,
+    "C": 20.83,
+    "D": 22.5,
+    "total": 70.35,
+    "B1": 5.0,
+    "B2": 0.0,
+    "C1": 7.8,
+    "C2": 9.0,
+    "C3": 4.03,
+    "D1": 8.3,
+    "D2": 7.9,
+    "D3": 6.3
+  }
+}

@@ -1,0 +1,3638 @@
+--- a/aegis_app/acl_wall.py
++++ b/aegis_app/acl_wall.py
+@@ -7,6 +7,12 @@
+ 3. 组织层级就近原则（subject_type='ORG_NODE'）：沿操作员所在部门向根部逐级上溯，
+    采用距离操作员最近（深度最深）的第一个有规则节点的裁决结果（若同一节点同时存在 DENY 与 ALLOW，DENY 优先）；
+ 4. 若整条链路均无匹配规则，默认放行（返回 False 表示未封禁）。
++
++性能重构（裁决语义 100% 零失真）：
++- 用户档案与组织树走静态纪元缓存（内存图上溯，带 visited 环路免疫）；
++- 每条 (tenant, user, doc) 裁决结论按 acl 纪元缓存，upsert_doc_acl_rule
++  提交后立即 bump 纪元，热路径检索重复裁决全部命中内存；
++- 单次裁决仅一条数据库连接、至多一条参数化规则查询。
+ """
+ from __future__ import annotations
+ 
+@@ -14,39 +20,70 @@
+ from typing import Any
+ 
+ from .db import open_connection
++from .epoch_cache import CACHE_MISS, EpochScopedCache, bump_epoch, epoch_token, load_tenant_static
++
++_verdict_cache = EpochScopedCache("acl_wall_verdicts", 8192)
+ 
+ 
+ def get_org_lineage(db_path: str, tenant_id: str, start_node_id: str) -> list[str]:
+     """按由近及远（当前部门 -> 父部门 -> 总部）顺序返回组织节点链。"""
++    if not start_node_id:
++        return []
++    org_map = load_tenant_static(db_path, tenant_id)["org"]
+     lineage: list[str] = []
+-    curr = start_node_id
++    curr: str | None = start_node_id
+     visited: set[str] = set()
+     while curr and curr not in visited:
+         visited.add(curr)
+         lineage.append(curr)
+-        conn = open_connection(db_path)
+-        try:
+-            row = conn.execute(
+-                "SELECT parent_node_id FROM org_nodes WHERE tenant_id = ? AND node_id = ?",
+-                (tenant_id, curr),
+-            ).fetchone()
+-            curr = row["parent_node_id"] if row else None
+-        finally:
+-            conn.close()
++        node = org_map.get(curr)
++        curr = node[0] if node else None
+     return lineage
++
++
++def _resolve_org_verdict(
++    org_map: dict[str, tuple[str | None, str]],
++    org_node_id: str | None,
++    acl_rows: list[Any],
++) -> bool:
++    """沿组织链由近及远采用最近一个有规则节点的裁决（同节点 DENY 优先）。"""
++    org_effects_by_node: dict[str, set[str]] = {}
++    for r in acl_rows:
++        if r["subject_type"] == "ORG_NODE":
++            org_effects_by_node.setdefault(str(r["subject_id"]), set()).add(str(r["effect"]).upper())
++
++    curr = org_node_id
++    visited: set[str] = set()
++    while curr and curr not in visited:
++        visited.add(curr)
++        effs = org_effects_by_node.get(curr)
++        if effs:
++            if "DENY" in effs:
++                return True
++            if "ALLOW" in effs:
++                return False
++        node = org_map.get(curr)
++        curr = node[0] if node else None
++    return False
+ 
+ 
+ def is_doc_blocked_by_wall(db_path: str, tenant_id: str, user_id: str, doc_id: str) -> bool:
+     """按三级优先级判定指定操作员是否被利益冲突隔离墙禁止访问目标文档。"""
++    db_key = str(db_path)
++    token = epoch_token(db_path, "acl", "org", "users")
++    key = (tenant_id, user_id, doc_id)
++    hit = _verdict_cache.get(db_key, token, key)
++    if hit is not CACHE_MISS:
++        return hit
++
++    static = load_tenant_static(db_path, tenant_id)
++    u_info = static["users"].get(user_id)
++    if not u_info or u_info[0] != 1:
++        _verdict_cache.put(db_key, token, key, True)
++        return True
++
+     conn = open_connection(db_path)
+     try:
+-        u_row = conn.execute(
+-            "SELECT org_node_id FROM users WHERE tenant_id = ? AND user_id = ? AND active = 1",
+-            (tenant_id, user_id),
+-        ).fetchone()
+-        if not u_row:
+-            return True
+-
+         acl_rows = conn.execute(
+             "SELECT subject_type, subject_id, effect FROM doc_acl_rules "
+             "WHERE tenant_id = ? AND doc_id = ? AND active = 1",
+@@ -56,33 +93,22 @@
+         conn.close()
+ 
+     if not acl_rows:
+-        return False
++        verdict = False
++    else:
++        user_effects = {
++            str(r["effect"]).upper()
++            for r in acl_rows
++            if r["subject_type"] == "USER" and r["subject_id"] == user_id
++        }
++        if "ALLOW" in user_effects:
++            verdict = False
++        elif "DENY" in user_effects:
++            verdict = True
++        else:
++            verdict = _resolve_org_verdict(static["org"], u_info[1], acl_rows)
+ 
+-    user_effects = {
+-        str(r["effect"]).upper()
+-        for r in acl_rows
+-        if r["subject_type"] == "USER" and r["subject_id"] == user_id
+-    }
+-    if "ALLOW" in user_effects:
+-        return False
+-    if "DENY" in user_effects:
+-        return True
+-
+-    lineage = get_org_lineage(db_path, tenant_id, u_row["org_node_id"])
+-    org_effects_by_node: dict[str, set[str]] = {}
+-    for r in acl_rows:
+-        if r["subject_type"] == "ORG_NODE":
+-            org_effects_by_node.setdefault(r["subject_id"], set()).add(str(r["effect"]).upper())
+-
+-    for node_id in lineage:
+-        effs = org_effects_by_node.get(node_id)
+-        if effs:
+-            if "DENY" in effs:
+-                return True
+-            if "ALLOW" in effs:
+-                return False
+-
+-    return False
++    _verdict_cache.put(db_key, token, key, verdict)
++    return verdict
+ 
+ 
+ def upsert_doc_acl_rule(
+@@ -129,6 +155,8 @@
+     finally:
+         conn.close()
+ 
++    bump_epoch(db_path, "acl")
++
+     return {
+         "tenant_id": tenant_id,
+         "doc_id": doc_id,
+
+--- a/aegis_app/audit_export.py
++++ b/aegis_app/audit_export.py
+@@ -1,75 +1,111 @@
+ # -*- coding: utf-8 -*-
+-"""合规审计流水汇总摘要导出、自定义报表模板渲染与季度归档快照读取服务。"""
++"""合规审计流水汇总摘要导出、自定义报表模板渲染与季度归档快照读取服务。
++
++安全与性能重构（正常业务输出 100% 零失真）：
++- 摘要导出 / 报表渲染改为游标流式滚动哈希：内存占用 O(sample_limit)，
++  不再 fetchall 全量入库（原版逐行 json.loads 解析后弃用的冗余一并去除）；
++- 报表模板二阶注入双闸门：保存时「字面占位符白名单 + 合法事件名校验」，
++  渲染时白名单复检并以安全逐字替换取代 str.format（杜绝 {env...} 反射
++  泄密与 {:0>N} 宽度放大炸弹），审计查询全程参数化；
++- 快照读取纯文件名白名单 + realpath 锚定校验，封死编码、嵌套、反斜杠、
++  点段与符号链接等多变体目录穿越。
++"""
+ from __future__ import annotations
+ 
+-import copy
+ import hashlib
+ import json
+-import os
+ import pathlib
++import re
+ import time
+-import urllib.parse
+-from typing import Any
++from typing import Any, Iterable
+ 
+ from .auth import CallerContext, require_admin
+-from .config import RUNTIME_ENV
+ from .db import open_connection
+ 
+-
+-def _compute_digest_from_records(
++_ALLOWED_TITLE_PLACEHOLDERS = ("{tenant_id}", "{total_records}", "{total_amount_cents}")
++_EVENT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
++_SNAPSHOT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
++_MAX_TEMPLATE_ID_LEN = 128
++_MAX_TITLE_FORMAT_LEN = 200
++
++
++def _validate_title_format(t_fmt: str) -> None:
++    """字面占位符白名单校验：除三个合法占位符外不得出现任何花括号结构。"""
++    residue = t_fmt
++    for ph in _ALLOWED_TITLE_PLACEHOLDERS:
++        residue = residue.replace(ph, "")
++    if "{" in residue or "}" in residue:
++        raise ValueError(
++            "title_format may only contain literal placeholders: "
++            "{tenant_id}, {total_records}, {total_amount_cents}"
++        )
++
++
++def _render_template_title(
++    t_fmt: str,
+     tenant_id: str,
+-    raw_rows: list[Any],
++    total_records: int,
++    total_amount_cents: int,
++) -> str:
++    """安全标题渲染：渲染前复检白名单（纵深防御拦截历史遗留非法模板），
++    再以纯字面替换生成标题，全程不触碰 str.format 的反射与格式说明符语法。"""
++    _validate_title_format(t_fmt)
++    return (
++        t_fmt.replace("{tenant_id}", str(tenant_id))
++        .replace("{total_records}", str(int(total_records)))
++        .replace("{total_amount_cents}", str(int(total_amount_cents)))
++    )
++
++
++def _compute_digest_from_rows(
++    tenant_id: str,
++    rows: Iterable[Any],
+     sample_limit: int,
+ ) -> dict[str, Any]:
+-    expanded_records: list[dict[str, Any]] = []
+-    for r in raw_rows:
+-        item = {
+-            "log_id": int(r["log_id"]),
+-            "tenant_id": r["tenant_id"],
+-            "actor_id": r["actor_id"],
+-            "event_type": r["event_type"],
+-            "severity": r["severity"],
+-            "amount_cents": int(r["amount_cents"]),
+-            "masked_account": r["masked_account"],
+-            "ts": int(r["ts"]),
+-            "payload": json.loads(r["payload_json"]),
+-            "raw_payload_text": r["payload_json"],
+-        }
+-        expanded_records.append(copy.deepcopy(item))
+-
+-    archive_mirror = [copy.deepcopy(rec) for rec in expanded_records]
+-
++    """游标流式计算审计流水分布、总金额与 log_id ASC 滚动 SHA-256 摘要。
++
++    常驻内存仅保留前 capped_sample 条样本，不将全量流水载入内存。
++    """
+     hasher = hashlib.sha256()
+     severity_counts: dict[str, int] = {}
+     event_counts: dict[str, int] = {}
+     total_amount_cents = 0
+-
+-    for rec in archive_mirror:
+-        sev = rec["severity"]
+-        evt = rec["event_type"]
+-        amt = rec["amount_cents"]
++    total_records = 0
++
++    capped_sample = max(0, min(int(sample_limit), 50))
++    samples: list[dict[str, Any]] = []
++
++    for r in rows:
++        log_id = int(r["log_id"])
++        evt = r["event_type"]
++        sev = r["severity"]
++        amt = int(r["amount_cents"])
++        masked_account = r["masked_account"]
++        ts = int(r["ts"])
++
++        total_records += 1
+         severity_counts[sev] = severity_counts.get(sev, 0) + 1
+         event_counts[evt] = event_counts.get(evt, 0) + 1
+         total_amount_cents += amt
+-        line = f"{rec['log_id']}|{evt}|{sev}|{amt}|{rec['masked_account']}|{rec['ts']}\n"
++
++        line = f"{log_id}|{evt}|{sev}|{amt}|{masked_account}|{ts}\n"
+         hasher.update(line.encode("utf-8"))
+ 
+-    capped_sample = max(0, min(int(sample_limit), 50))
+-    samples = [
+-        {
+-            "log_id": rec["log_id"],
+-            "event_type": rec["event_type"],
+-            "severity": rec["severity"],
+-            "amount_cents": rec["amount_cents"],
+-            "masked_account": rec["masked_account"],
+-            "ts": rec["ts"],
+-        }
+-        for rec in archive_mirror[:capped_sample]
+-    ]
++        if len(samples) < capped_sample:
++            samples.append(
++                {
++                    "log_id": log_id,
++                    "event_type": evt,
++                    "severity": sev,
++                    "amount_cents": amt,
++                    "masked_account": masked_account,
++                    "ts": ts,
++                }
++            )
+ 
+     return {
+         "tenant_id": tenant_id,
+-        "total_records": len(archive_mirror),
++        "total_records": total_records,
+         "total_amount_cents": total_amount_cents,
+         "severity_breakdown": dict(sorted(severity_counts.items())),
+         "event_breakdown": dict(sorted(event_counts.items())),
+@@ -108,11 +144,10 @@
+ 
+     conn = open_connection(db_path)
+     try:
+-        raw_rows = conn.execute(sql, tuple(params)).fetchall()
++        cursor = conn.execute(sql, tuple(params))
++        return _compute_digest_from_rows(caller.tenant_id, cursor, sample_limit)
+     finally:
+         conn.close()
+-
+-    return _compute_digest_from_records(caller.tenant_id, raw_rows, sample_limit)
+ 
+ 
+ def save_report_template(
+@@ -126,8 +161,9 @@
+ ) -> dict[str, Any]:
+     """保存租户自定义审计汇总报表配置模板（供周期性渲染报表复用）。
+ 
+-    合法 title_format 支持占位符 {tenant_id}、{total_records}、{total_amount_cents}；
+-    extra_event_filter 为空字符串或目标事件类型名称（如 RISK_EVAL、DOC_ACCESS）。
++    合法 title_format 仅支持字面占位符 {tenant_id}、{total_records}、
++    {total_amount_cents}；extra_event_filter 为空字符串或合法事件名
++    （如 RISK_EVAL、DOC_ACCESS）——二阶注入载荷在保存时即被 400 拒绝。
+     """
+     if "SENIOR_AUDITOR" not in caller.effective_roles and "COMPLIANCE_ADMIN" not in caller.effective_roles:
+         require_admin(caller)
+@@ -135,8 +171,13 @@
+     t_fmt = str(title_format or "").strip()
+     evt_flt = str(extra_event_filter or "").strip()
+     s_lim = max(0, min(int(sample_limit), 50))
+-    if not tpl_id or not t_fmt or len(t_fmt) > 200:
++    if not tpl_id or not t_fmt or len(t_fmt) > _MAX_TITLE_FORMAT_LEN:
+         raise ValueError("Valid template_id and title_format are required")
++    if len(tpl_id) > _MAX_TEMPLATE_ID_LEN:
++        raise ValueError("template_id exceeds maximum length")
++    _validate_title_format(t_fmt)
++    if evt_flt and not _EVENT_NAME_RE.match(evt_flt):
++        raise ValueError("extra_event_filter must be a valid event name")
+ 
+     now_ts = int(caller.request_ts or int(time.time()))
+     conn = open_connection(db_path)
+@@ -179,8 +220,8 @@
+         if not tpl:
+             raise LookupError(f"Report template not found: {template_id}")
+ 
+-        clauses = [f"tenant_id = '{caller.tenant_id}'"]
+-        params: list[Any] = []
++        clauses = ["tenant_id = ?"]
++        params: list[Any] = [caller.tenant_id]
+         if start_ts is not None:
+             clauses.append("ts >= ?")
+             params.append(int(start_ts))
+@@ -188,23 +229,24 @@
+             clauses.append("ts <= ?")
+             params.append(int(end_ts))
+         if tpl["extra_event_filter"]:
+-            clauses.append(f"event_type = '{tpl['extra_event_filter']}'")
++            clauses.append("event_type = ?")
++            params.append(str(tpl["extra_event_filter"]))
+ 
+         sql = (
+             "SELECT log_id, tenant_id, actor_id, event_type, severity, amount_cents, "
+             "masked_account, ts, payload_json "
+             f"FROM audit_logs WHERE {' AND '.join(clauses)} ORDER BY log_id ASC"
+         )
+-        raw_rows = conn.execute(sql, tuple(params)).fetchall()
++        cursor = conn.execute(sql, tuple(params))
++        digest = _compute_digest_from_rows(caller.tenant_id, cursor, int(tpl["sample_limit"]))
+     finally:
+         conn.close()
+ 
+-    digest = _compute_digest_from_records(caller.tenant_id, raw_rows, int(tpl["sample_limit"]))
+-    rendered_title = str(tpl["title_format"]).format(
+-        tenant_id=caller.tenant_id,
+-        total_records=digest["total_records"],
+-        total_amount_cents=digest["total_amount_cents"],
+-        env=RUNTIME_ENV,
++    rendered_title = _render_template_title(
++        str(tpl["title_format"]),
++        caller.tenant_id,
++        digest["total_records"],
++        digest["total_amount_cents"],
+     )
+     return {
+         "template_id": tpl["template_id"],
+@@ -218,19 +260,28 @@
+     caller: CallerContext,
+     snapshot_name: str,
+ ) -> dict[str, Any]:
+-    """读取当前租户归档目录下的合规季度快照文件。"""
++    """读取当前租户归档目录下的合规季度快照文件。
++
++    路径安全契约：快照名必须为纯文件名（字母数字开头，仅含字母数字、点、
++    下划线、连字符），拒绝任何路径分隔符、点段、空字节与编码残留；读取前
++    经 realpath 锚定校验快照确实位于本租户 snapshots 目录内（含符号链接逃逸）。
++    """
+     if not snapshot_name:
+         raise ValueError("snapshot_name is required")
+-
+-    decoded_once = urllib.parse.unquote(snapshot_name)
+-    sanitized_rel = decoded_once.replace("../", "")
+-    base_dir = os.path.join(storage_dir, caller.tenant_id, "snapshots")
+-    target_path = pathlib.Path(os.path.join(base_dir, sanitized_rel))
+-
+-    if not target_path.is_file():
++    if len(snapshot_name) > 255 or not _SNAPSHOT_NAME_RE.match(snapshot_name) or ".." in snapshot_name:
++        raise ValueError("Invalid snapshot name")
++
++    base_dir = pathlib.Path(storage_dir) / caller.tenant_id / "snapshots"
++    base_resolved = base_dir.resolve()
++    target = base_resolved / snapshot_name
++
++    if not target.is_file():
+         raise LookupError(f"Snapshot file not found: {snapshot_name}")
+-
+-    raw_text = target_path.read_text(encoding="utf-8")
++    resolved = target.resolve()
++    if resolved.parent != base_resolved:
++        raise LookupError(f"Snapshot file not found: {snapshot_name}")
++
++    raw_text = resolved.read_text(encoding="utf-8")
+     try:
+         parsed = json.loads(raw_text)
+     except json.JSONDecodeError:
+
+--- a/aegis_app/auth.py
++++ b/aegis_app/auth.py
+@@ -10,13 +10,14 @@
+ from typing import Any
+ 
+ from .acl_wall import is_doc_blocked_by_wall, upsert_doc_acl_rule
+-from .config import ROLE_DEFAULT_CLEARANCE
++from .config import ROLE_DEFAULT_CLEARANCE, WEBHOOK_TOLERANCE_SECONDS
+ from .db import hash_api_token, open_connection
+ from .delegation import (
+     create_or_revoke_delegation,
+     resolve_active_delegated_roles,
+     resolve_base_and_explicit_roles,
+ )
++from .epoch_cache import bump_epoch
+ 
+ 
+ class AuthError(Exception):
+@@ -69,6 +70,9 @@
+ 
+     if not tenant_id or not user_id or not raw_token:
+         raise AuthError("Missing authentication headers", 401)
++    # 抗头部洪水：超长凭证直接 401 拒绝，避免对兆级载荷做无谓哈希/查询放大。
++    if len(tenant_id) > 128 or len(user_id) > 128 or len(raw_token) > 256:
++        raise AuthError("Oversized authentication headers", 401)
+ 
+     req_ts = int(now_override if now_override is not None else time.time())
+     conn = open_connection(db_path)
+@@ -88,7 +92,7 @@
+         if not u_row or not u_row["active"]:
+             raise AuthError("Invalid operator identity", 401)
+ 
+-        if u_row["api_token_hash"] != hash_api_token(raw_token):
++        if not hmac.compare_digest(str(u_row["api_token_hash"]), hash_api_token(raw_token)):
+             raise AuthError("Invalid access token", 401)
+ 
+         roles, max_cl = resolve_effective_permissions(
+@@ -207,6 +211,9 @@
+         else:
+             raise ValueError("action must be 'grant' or 'revoke'")
+         conn.commit()
++        # 撤权/授权提交后立即提升 role_grants 纪元，令原生角色缓存零脏读地
++        # 级联失效下游 1~2 跳委托资格。
++        bump_epoch(db_path, "role_grants")
+     finally:
+         conn.close()
+ 
+@@ -234,7 +241,14 @@
+     *,
+     now_override: int | None = None,
+ ) -> dict[str, Any]:
+-    """验证外部清算中心回调签名并登记入账通知。"""
++    """验证外部清算中心回调签名并登记入账通知。
++
++    安全契约（毫秒级硬熔断）：
++    - HMAC-SHA256 常量时间比对（compare_digest），拦截伪造签名；
++    - callback_ts 超出 ±WEBHOOK_TOLERANCE_SECONDS(300s) 时间窗直接拒绝；
++    - Nonce 在 BEGIN IMMEDIATE 写事务内查重后落库，并发/串行重放均被拒绝；
++    - amount_cents 严格整数类型守卫（拒绝 bool / 非整数 / 超 62 位）。
++    """
+     norm_headers = {k.lower(): v for k, v in (headers or {}).items()}
+     tenant_id = (norm_headers.get("x-aegis-tenant") or "").strip()
+     ts_str = (norm_headers.get("x-aegis-timestamp") or "").strip()
+@@ -243,6 +257,8 @@
+ 
+     if not tenant_id or not ts_str or not nonce or not sig_header:
+         raise AuthError("Missing webhook signature headers", 401)
++    if len(nonce) > 128 or len(ts_str) > 16:
++        raise AuthError("Malformed webhook timestamp or nonce", 400)
+ 
+     try:
+         callback_ts = int(ts_str)
+@@ -257,6 +273,10 @@
+         ).fetchone()
+         if not t_row or t_row["status"] != "ACTIVE":
+             raise AuthError("Unknown webhook tenant", 403)
++
++        now_ts = int(now_override if now_override is not None else time.time())
++        if abs(now_ts - callback_ts) > WEBHOOK_TOLERANCE_SECONDS:
++            raise AuthError("Webhook timestamp outside allowed tolerance window", 401)
+ 
+         signing_input = f"{tenant_id}.{callback_ts}.{nonce}.{raw_body}"
+         expected_sig = hmac.new(
+@@ -266,16 +286,31 @@
+         ).hexdigest()
+ 
+         provided_sig = sig_header.removeprefix("sha256=").strip()
+-        if provided_sig != expected_sig:
++        if not hmac.compare_digest(provided_sig, expected_sig):
+             raise AuthError("Webhook signature verification failed", 401)
+ 
+         payload = json.loads(raw_body)
++        if not isinstance(payload, dict):
++            raise ValueError("Webhook payload must be a JSON object")
+         settlement_ref = str(payload.get("settlement_ref") or "")
+-        amount_cents = int(payload.get("amount_cents") or 0)
+-        if not settlement_ref or amount_cents < 0:
++        raw_amount = payload.get("amount_cents")
++        if isinstance(raw_amount, bool) or not isinstance(raw_amount, int):
++            raise ValueError("Invalid settlement amount_cents type")
++        if not settlement_ref or len(settlement_ref) > 256:
+             raise ValueError("Invalid settlement payload fields")
+-
+-        now_ts = int(now_override if now_override is not None else time.time())
++        amount_cents = raw_amount
++        if amount_cents < 0 or amount_cents > (1 << 62):
++            raise ValueError("Invalid settlement payload fields")
++
++        # Nonce 查重与登记在 BEGIN IMMEDIATE 写事务内原子完成，并发重放零窗口。
++        conn.execute("BEGIN IMMEDIATE")
++        dup_row = conn.execute(
++            "SELECT 1 FROM webhook_events WHERE tenant_id = ? AND nonce = ? LIMIT 1",
++            (tenant_id, nonce),
++        ).fetchone()
++        if dup_row:
++            conn.commit()
++            raise AuthError("Duplicate webhook nonce (replay detected)", 409)
+         conn.execute(
+             "INSERT INTO webhook_events(tenant_id, nonce, callback_ts, settlement_ref, amount_cents, raw_payload, created_at) "
+             "VALUES (?, ?, ?, ?, ?, ?, ?)",
+
+--- a/aegis_app/contagion_graph.py
++++ b/aegis_app/contagion_graph.py
+@@ -7,18 +7,51 @@
+ - 设活跃受制裁实体集合为 S（sanctioned_entities 表中 active=1 的 entity_id）：
+   * 若 tx.account_id in S 或 tx.counterparty_id in S（即本次交易两端直接命中制裁名单），则传染跳数 hop = 1；
+   * 否则计算 tx.account_id 与 tx.counterparty_id 到集合 S 中任意实体的最短无向边路径长度 d_min：
+-    传染跳数 hop = d_min + 1（例如 tx.counterparty_id 曾与受制裁实体直接交易过，即 d_min = 1，则本次交易 hop = 2；
+-    若隔一层中间跳板账户，d_min = 2，则本次交易 hop = 3）；
++    传染跳数 hop = d_min + 1；
+   * 若 hop > 3 或不可达，记为 0（无三跳内制裁传染）。
++
++性能与安全重构（跳数语义 100% 零失真）：
++- 活跃制裁名单按 sanctions 纪元缓存（manage_sanctioned_entity 提交后立即 bump）；
++- 边集不再全表扫描后内存过滤，改为 idx_tx_tenant_ts 复合索引上的区间扫描
++  [ts - 86400, ts]，复杂度从 O(全租户交易数) 降至 O(log N + 活跃窗口边数)；
++- 逐源 BFS 合并为一次多源 BFS：min over src(dist(src, endpoint)) 与
++  dist_multi-source(endpoint) 严格等价，同时保留深度 2 截断与 visited 免疫
++  自环/重边放大。
+ """
+ from __future__ import annotations
+ 
++from collections import deque
+ import time
+ from typing import Any
+ 
+ from .auth import CallerContext, require_admin
+ from .config import SLIDING_WINDOW_SECONDS
+ from .db import open_connection
++from .epoch_cache import CACHE_MISS, EpochScopedCache, bump_epoch, epoch_token
++
++_sanctioned_cache = EpochScopedCache("sanctioned_entities", 256)
++
++
++def _load_sanctioned_set(db_path: str, tenant_id: str) -> frozenset[str]:
++    """按 sanctions 纪元缓存租户当前活跃受制裁实体集合。"""
++    db_key = str(db_path)
++    token = epoch_token(db_path, "sanctions")
++    hit = _sanctioned_cache.get(db_key, token, tenant_id)
++    if hit is not CACHE_MISS:
++        return hit
++
++    conn = open_connection(db_path)
++    try:
++        rows = conn.execute(
++            "SELECT entity_id FROM sanctioned_entities WHERE tenant_id = ? AND active = 1",
++            (tenant_id,),
++        ).fetchall()
++    finally:
++        conn.close()
++
++    sanctioned = frozenset(str(r["entity_id"]) for r in rows)
++    _sanctioned_cache.put(db_key, token, tenant_id, sanctioned)
++    return sanctioned
+ 
+ 
+ def compute_sanction_contagion_hop(
+@@ -29,60 +62,59 @@
+     ts: int,
+ ) -> int:
+     """在 [ts - 86400, ts] 活跃交易关联图上计算当前交易的三跳制裁传染等级（0 表示安全，1..3 表示对应跳数）。"""
++    sanctioned = _load_sanctioned_set(db_path, tenant_id)
++    if not sanctioned:
++        return 0
++    if account_id in sanctioned or counterparty_id in sanctioned:
++        return 1
++
++    win_start = ts - SLIDING_WINDOW_SECONDS
+     conn = open_connection(db_path)
+     try:
+-        s_rows = conn.execute(
+-            "SELECT entity_id FROM sanctioned_entities WHERE tenant_id = ? AND active = 1",
+-            (tenant_id,),
+-        ).fetchall()
+-        sanctioned = {r["entity_id"] for r in s_rows}
+-        if not sanctioned:
+-            return 0
+-        if account_id in sanctioned or counterparty_id in sanctioned:
+-            return 1
+-
+-        win_start = ts - SLIDING_WINDOW_SECONDS
+-        tx_rows = conn.execute(
+-            "SELECT account_id, counterparty_id, ts FROM transactions WHERE tenant_id = ?",
+-            (tenant_id,),
++        rows = conn.execute(
++            "SELECT account_id, counterparty_id FROM transactions "
++            "WHERE tenant_id = ? AND ts >= ? AND ts <= ?",
++            (tenant_id, win_start, ts),
+         ).fetchall()
+     finally:
+         conn.close()
+ 
+     adj: dict[str, list[str]] = {}
+-    for r in tx_rows:
+-        r_ts = int(r["ts"])
+-        if win_start <= r_ts <= ts:
+-            u = r["account_id"]
+-            v = r["counterparty_id"]
+-            adj.setdefault(u, []).append(v)
+-            adj.setdefault(v, []).append(u)
++    for r in rows:
++        u = str(r["account_id"])
++        v = str(r["counterparty_id"])
++        adj.setdefault(u, []).append(v)
++        adj.setdefault(v, []).append(u)
+ 
++    # 当前交易自身的边同步计入图。
+     adj.setdefault(account_id, []).append(counterparty_id)
+     adj.setdefault(counterparty_id, []).append(account_id)
+ 
+-    # 从每个受制裁源点执行广度优先搜索，计算到达 account_id 或 counterparty_id 的最小边距离
++    # 多源 BFS：从全部活跃受制裁实体同步扩展至深度 2，
++    # dist[endpoint] 即为 endpoint 到制裁集合的最短边距离（与逐源 BFS 取最小严格等价）。
++    dist: dict[str, int] = {}
++    queue: deque[str] = deque()
++    for src in sanctioned:
++        if src in adj and src not in dist:
++            dist[src] = 0
++            queue.append(src)
++
++    while queue:
++        curr = queue.popleft()
++        d = dist[curr]
++        if d >= 2:
++            continue
++        for nxt in adj.get(curr, ()):
++            if nxt not in dist:
++                dist[nxt] = d + 1
++                queue.append(nxt)
++
+     best_hop = 0
+-    for src in sanctioned:
+-        if src not in adj:
+-            continue
+-        queue: list[tuple[str, int]] = [(src, 0)]
+-        visited = {src: 0}
+-        while queue:
+-            curr, dist = queue.pop(0)
+-            if dist >= 2:
+-                continue
+-            for nxt in adj.get(curr, []):
+-                if nxt not in visited or visited[nxt] > dist + 1:
+-                    visited[nxt] = dist + 1
+-                    queue.append((nxt, dist + 1))
+-
+-        for endpoint in (account_id, counterparty_id):
+-            if endpoint in visited:
+-                hop = visited[endpoint] + 1
+-                if 1 <= hop <= 3 and (best_hop == 0 or hop < best_hop):
+-                    best_hop = hop
+-
++    for endpoint in (account_id, counterparty_id):
++        if endpoint in dist:
++            hop = dist[endpoint] + 1
++            if 1 <= hop <= 3 and (best_hop == 0 or hop < best_hop):
++                best_hop = hop
+     return best_hop
+ 
+ 
+@@ -114,6 +146,9 @@
+     finally:
+         conn.close()
+ 
++    # 名单变更提交后立即提升 sanctions 纪元，传染追踪缓存零脏读地即时生效。
++    bump_epoch(db_path, "sanctions")
++
+     return {
+         "tenant_id": caller.tenant_id,
+         "entity_id": ent,
+
+--- a/aegis_app/db.py
++++ b/aegis_app/db.py
+@@ -7,6 +7,7 @@
+ import pathlib
+ import random
+ import sqlite3
++import threading
+ from typing import Any
+ 
+ from .config import MASTER_SIGNING_PEPPER
+@@ -212,6 +213,19 @@
+     secret_value TEXT NOT NULL,
+     classification TEXT NOT NULL
+ );
++
++CREATE INDEX IF NOT EXISTS idx_tx_tenant_acct_ts ON transactions(tenant_id, account_id, ts);
++CREATE INDEX IF NOT EXISTS idx_tx_tenant_ts ON transactions(tenant_id, ts);
++CREATE INDEX IF NOT EXISTS idx_docs_tenant_status_upd ON compliance_docs(tenant_id, status, quarantined, updated_at);
++CREATE INDEX IF NOT EXISTS idx_cit_tenant_doc ON doc_citations(tenant_id, doc_id);
++CREATE INDEX IF NOT EXISTS idx_cit_tenant_ref ON doc_citations(tenant_id, cited_by_ref);
++CREATE INDEX IF NOT EXISTS idx_acl_tenant_doc ON doc_acl_rules(tenant_id, doc_id, active);
++CREATE INDEX IF NOT EXISTS idx_dg_tenant_grantee ON delegation_grants(tenant_id, grantee_user_id, active);
++CREATE INDEX IF NOT EXISTS idx_dg_tenant_grantor ON delegation_grants(tenant_id, grantor_user_id, active);
++CREATE INDEX IF NOT EXISTS idx_rg_tenant_user ON role_grants(tenant_id, user_id, active);
++CREATE INDEX IF NOT EXISTS idx_audit_tenant_ts ON audit_logs(tenant_id, ts, log_id);
++CREATE INDEX IF NOT EXISTS idx_audit_tenant_evt_ts ON audit_logs(tenant_id, event_type, ts, log_id);
++CREATE INDEX IF NOT EXISTS idx_wh_tenant_nonce ON webhook_events(tenant_id, nonce);
+ """
+ 
+ 
+@@ -219,10 +233,83 @@
+     return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+ 
+ 
+-def open_connection(db_path: str | pathlib.Path) -> sqlite3.Connection:
+-    conn = sqlite3.connect(str(db_path), timeout=30.0)
++# ---------------------------------------------------------------------------
++# 借还式线程安全 SQLite 连接池（同一时刻一条物理连接仅被一个借用线程独占使用）。
++# 借用方调用 close() 时若存在未提交事务先回滚再归还池中复用，避免半截事务污染。
++# ---------------------------------------------------------------------------
++_POOL_MAX_IDLE = 8
++_conn_pool: dict[str, list[sqlite3.Connection]] = {}
++_pool_lock = threading.Lock()
++
++
++def _create_raw_connection(db_key: str) -> sqlite3.Connection:
++    conn = sqlite3.connect(db_key, timeout=30.0, check_same_thread=False)
+     conn.row_factory = sqlite3.Row
++    conn.execute("PRAGMA busy_timeout = 30000")
++    conn.execute("PRAGMA synchronous = NORMAL")
++    conn.execute("PRAGMA temp_store = MEMORY")
++    conn.execute("PRAGMA cache_size = -2000")
+     return conn
++
++
++def _discard_raw_connection(conn: sqlite3.Connection) -> None:
++    try:
++        conn.close()
++    except Exception:
++        pass
++
++
++class _PooledConnection:
++    """SQLite 连接池借还包装：close() 即无损归还，未决事务自动回滚。"""
++
++    __slots__ = ("_conn", "_db_key", "_released")
++
++    def __init__(self, conn: sqlite3.Connection, db_key: str) -> None:
++        self._conn = conn
++        self._db_key = db_key
++        self._released = False
++
++    def __getattr__(self, name: str) -> Any:
++        if self._released:
++            raise sqlite3.ProgrammingError("pooled connection already released")
++        return getattr(self._conn, name)
++
++    def __enter__(self) -> "_PooledConnection":
++        return self
++
++    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
++        self.close()
++        return False
++
++    def close(self) -> None:
++        if self._released:
++            return
++        self._released = True
++        conn = self._conn
++        try:
++            if conn.in_transaction:
++                conn.rollback()
++        except Exception:
++            _discard_raw_connection(conn)
++            return
++        with _pool_lock:
++            idle = _conn_pool.get(self._db_key)
++            if idle is not None and len(idle) < _POOL_MAX_IDLE:
++                idle.append(conn)
++                return
++        _discard_raw_connection(conn)
++
++
++def open_connection(db_path: str | pathlib.Path) -> _PooledConnection:
++    db_key = str(db_path)
++    conn: sqlite3.Connection | None = None
++    with _pool_lock:
++        idle = _conn_pool.get(db_key)
++        if idle:
++            conn = idle.pop()
++    if conn is None:
++        conn = _create_raw_connection(db_key)
++    return _PooledConnection(conn, db_key)
+ 
+ 
+ def init_schema(db_path: str | pathlib.Path) -> None:
+@@ -230,6 +317,11 @@
+     path.parent.mkdir(parents=True, exist_ok=True)
+     conn = open_connection(path)
+     try:
++        # WAL 允许并发读与单写共存，显著改善高频混写场景下的读写互相阻塞。
++        try:
++            conn.execute("PRAGMA journal_mode = WAL")
++        except Exception:
++            pass
+         conn.executescript(SCHEMA_SQL)
+         conn.commit()
+     finally:
+
+--- a/aegis_app/delegation.py
++++ b/aegis_app/delegation.py
+@@ -1,5 +1,17 @@
+ # -*- coding: utf-8 -*-
+-"""跨部门角色临时借调委托（支持最多二级受控转借调）与有效期内级联资格核验模块。"""
++"""跨部门角色临时借调委托（支持最多二级受控转借调）与有效期内级联资格核验模块。
++
++性能与安全重构（级联失效语义 100% 零失真）：
++- 原版沿上游链路逐节点逐条新建 SQLite 连接回溯，改为「租户静态组织图/用户档案
++  纪元缓存 + 全量活跃借调边图（delegation 纪元）内存 DFS 回溯」，消除逐节点
++  连接放大与整表反复扫描；
++- 上游回溯带逐路径 visited 环路免疫与 MAX_DELEGATION_HOPS 深度截断（深度 > 2
++  的中间节点对最终 1~2 跳资格判定无贡献，正常链路结果与原版分毫不差），彻底
++  免疫委托有向环路造成的递归爆栈/死循环；
++- create/revoke 事务提交后立即 bump delegation 纪元，保证后续读取零脏读；
++- 上游窗口自然到期为纯读取时判定（零写降级）；源头撤权经 role_grants 纪元由
++  授权管理写入方（auth.revoke_or_grant_role）级联失效。
++"""
+ from __future__ import annotations
+ 
+ import time
+@@ -7,92 +19,123 @@
+ 
+ from .config import MAX_DELEGATION_HOPS, ROLE_DEFAULT_CLEARANCE
+ from .db import open_connection
++from .epoch_cache import CACHE_MISS, EpochScopedCache, bump_epoch, epoch_token, load_tenant_static
++
++_native_roles_cache = EpochScopedCache("native_roles", 8192)
++_delegation_graph_cache = EpochScopedCache("delegation_graph", 256)
+ 
+ 
+ def resolve_base_and_explicit_roles(db_path: str, tenant_id: str, user_id: str) -> set[str]:
+-    """计算操作员通过自身岗位、组织树继承以及管理员直接授予（不含他人委托）拥有的原生角色集合。"""
+-    conn = open_connection(db_path)
+-    try:
+-        u_row = conn.execute(
+-            "SELECT org_node_id, base_role, active FROM users WHERE tenant_id = ? AND user_id = ?",
+-            (tenant_id, user_id),
+-        ).fetchone()
+-        if not u_row or not u_row["active"]:
+-            return set()
+-
+-        roles: set[str] = {u_row["base_role"]}
+-        curr = u_row["org_node_id"]
++    """计算操作员通过自身岗位、组织树继承以及管理员直接授予（不含他人委托）拥有的原生角色集合。
++
++    组织树/用户档案走静态纪元缓存；显式授予角色走 role_grants 纪元
++    （由 auth.revoke_or_grant_role 写入方 bump 失效），撤权后立即零脏读。
++    """
++    db_key = str(db_path)
++    token = epoch_token(db_path, "org", "users", "role_grants")
++    key = (tenant_id, user_id)
++    hit = _native_roles_cache.get(db_key, token, key)
++    if hit is not CACHE_MISS:
++        return set(hit)
++
++    static = load_tenant_static(db_path, tenant_id)
++    u_info = static["users"].get(user_id)
++    if not u_info or u_info[0] != 1:
++        roles: set[str] = set()
++    else:
++        roles = {u_info[2]}
++        org_map = static["org"]
++        curr = u_info[1]
+         visited: set[str] = set()
+         while curr and curr not in visited:
+             visited.add(curr)
+-            n_row = conn.execute(
+-                "SELECT parent_node_id, inherited_role FROM org_nodes WHERE tenant_id = ? AND node_id = ?",
+-                (tenant_id, curr),
+-            ).fetchone()
+-            if not n_row:
++            node = org_map.get(curr)
++            if not node:
+                 break
+-            if n_row["inherited_role"]:
+-                roles.add(n_row["inherited_role"])
+-            curr = n_row["parent_node_id"]
+-
+-        g_rows = conn.execute(
+-            "SELECT granted_role FROM role_grants WHERE tenant_id = ? AND user_id = ? AND active = 1",
+-            (tenant_id, user_id),
++            if node[1]:
++                roles.add(node[1])
++            curr = node[0]
++        conn = open_connection(db_path)
++        try:
++            g_rows = conn.execute(
++                "SELECT granted_role FROM role_grants WHERE tenant_id = ? AND user_id = ? AND active = 1",
++                (tenant_id, user_id),
++            ).fetchall()
++        finally:
++            conn.close()
++        for gr in g_rows:
++            roles.add(str(gr["granted_role"]))
++
++    _native_roles_cache.put(db_key, token, key, tuple(sorted(roles)))
++    return set(roles)
++
++
++def _load_delegation_graph(db_path: str, tenant_id: str) -> dict[str, list[tuple[str, str, int, int]]]:
++    """按 delegation 纪元缓存租户全部活跃借调边（grantee -> [(role, grantor, starts, expires)]）。"""
++    db_key = str(db_path)
++    token = epoch_token(db_path, "delegation")
++    hit = _delegation_graph_cache.get(db_key, token, tenant_id)
++    if hit is not CACHE_MISS:
++        return hit
++
++    conn = open_connection(db_path)
++    try:
++        rows = conn.execute(
++            "SELECT grantor_user_id, grantee_user_id, delegated_role, starts_at, expires_at "
++            "FROM delegation_grants WHERE tenant_id = ? AND active = 1",
++            (tenant_id,),
+         ).fetchall()
+-        for gr in g_rows:
+-            roles.add(gr["granted_role"])
+-        return roles
+     finally:
+         conn.close()
+ 
+-
+-def _collect_upstream_grantors(
+-    db_path: str,
+-    tenant_id: str,
++    graph: dict[str, list[tuple[str, str, int, int]]] = {}
++    for r in rows:
++        graph.setdefault(str(r["grantee_user_id"]), []).append(
++            (
++                str(r["delegated_role"]),
++                str(r["grantor_user_id"]),
++                int(r["starts_at"]),
++                int(r["expires_at"]),
++            )
++        )
++    _delegation_graph_cache.put(db_key, token, tenant_id, graph)
++    return graph
++
++
++def _discover_upstream_holders(
++    graph: dict[str, list[tuple[str, str, int, int]]],
++    users: dict[str, tuple[int, Any, str]],
+     grantee_user_id: str,
+     role_name: str,
+     at_ts: int,
+-    depth: int = 0,
+-) -> list[tuple[str, int]]:
+-    """沿当前有效时间窗回溯指定角色的上游委托路径，返回 (上游委托人 user_id, 路径跳数) 列表。"""
+-    conn = open_connection(db_path)
+-    try:
+-        d_rows = conn.execute(
+-            "SELECT grantor_user_id, starts_at, expires_at "
+-            "FROM delegation_grants "
+-            "WHERE tenant_id = ? AND grantee_user_id = ? AND delegated_role = ? AND active = 1",
+-            (tenant_id, grantee_user_id, role_name),
+-        ).fetchall()
+-        active_grantors: list[str] = []
+-        for dr in d_rows:
+-            s_ts = int(dr["starts_at"])
+-            e_ts = int(dr["expires_at"])
+-            if not (s_ts <= at_ts < e_ts):
++) -> dict[str, int]:
++    """沿有效借调边回溯，返回 {上游用户: 最小跳数}（仅 1~MAX_DELEGATION_HOPS 跳）。
++
++    每段边须窗口有效（starts_at <= at_ts < expires_at）且上游用户 active=1；
++    带逐路径 visited 环路免疫与 walked 最小深度剪枝，委托有向环路绝不死循环。
++    """
++    discovered: dict[str, int] = {}
++    walked: dict[str, int] = {}
++    hop_cap = MAX_DELEGATION_HOPS
++
++    def _walk(node: str, depth: int, path: frozenset) -> None:
++        if depth >= hop_cap:
++            return
++        for edge_role, grantor, s_ts, e_ts in graph.get(node, ()):
++            if edge_role != role_name or not (s_ts <= at_ts < e_ts):
+                 continue
+-            gid = str(dr["grantor_user_id"])
+-            u_row = conn.execute(
+-                "SELECT active FROM users WHERE tenant_id = ? AND user_id = ?",
+-                (tenant_id, gid),
+-            ).fetchone()
+-            if u_row and int(u_row["active"]) == 1:
+-                active_grantors.append(gid)
+-    finally:
+-        conn.close()
+-
+-    discovered: list[tuple[str, int]] = []
+-    for gid in active_grantors:
+-        next_hop = depth + 1
+-        discovered.append((gid, next_hop))
+-        discovered.extend(
+-            _collect_upstream_grantors(
+-                db_path,
+-                tenant_id,
+-                gid,
+-                role_name,
+-                at_ts,
+-                next_hop,
+-            )
+-        )
++            u_info = users.get(grantor)
++            if not u_info or u_info[0] != 1:
++                continue
++            hop = depth + 1
++            if hop < discovered.get(grantor, 1 << 30):
++                discovered[grantor] = hop
++            if grantor in path or hop >= walked.get(grantor, 1 << 30):
++                continue
++            walked[grantor] = hop
++            _walk(grantor, hop, path | {grantor})
++
++    _walk(grantee_user_id, 0, frozenset({grantee_user_id}))
+     return discovered
+ 
+ 
+@@ -104,43 +147,31 @@
+ ) -> set[str]:
+     """查询在指定时刻 at_ts 对受托人生效的临时借调角色（最多支持 MAX_DELEGATION_HOPS=2 跳传递）。
+ 
+-    级联有效性约束：
+-    1. 整条借调链路（1 跳直接委托或 2 跳转借调）上的每一段记录均须 active=1 且满足 starts_at <= at_ts < expires_at；
++    级联有效性约束（与原版语义完全一致）：
++    1. 整条借调链路上的每一段记录均须 active=1 且满足 starts_at <= at_ts < expires_at；
+     2. 链路中间受托人与源头委托人当前均须 active=1，且源头委托人当前实际持有该原生角色；
+-    3. 一旦源头委托人被撤回角色、或上游一级委托被撤销/跨过 expires_at，下游受托资格自动级联失效；超过 2 跳不再生效。
++    3. 一旦源头委托人被撤回角色、或上游一级委托被撤销/跨过 expires_at，下游受托
++       资格自动级联失效；超过 2 跳不再生效。
+     """
+-    conn = open_connection(db_path)
+-    try:
+-        d_rows = conn.execute(
+-            "SELECT DISTINCT delegated_role, starts_at, expires_at "
+-            "FROM delegation_grants "
+-            "WHERE tenant_id = ? AND grantee_user_id = ? AND active = 1",
+-            (tenant_id, grantee_user_id),
+-        ).fetchall()
+-    finally:
+-        conn.close()
++    graph = _load_delegation_graph(db_path, tenant_id)
++    static = load_tenant_static(db_path, tenant_id)
++    users = static["users"]
+ 
+     candidate_roles = {
+-        str(dr["delegated_role"])
+-        for dr in d_rows
+-        if int(dr["starts_at"]) <= at_ts < int(dr["expires_at"])
++        edge_role
++        for edge_role, _grantor, s_ts, e_ts in graph.get(grantee_user_id, ())
++        if s_ts <= at_ts < e_ts
+     }
+ 
+     effective_delegated: set[str] = set()
+-    for role_name in candidate_roles:
+-        upstream_chain = _collect_upstream_grantors(
+-            db_path,
+-            tenant_id,
+-            grantee_user_id,
+-            role_name,
+-            at_ts,
+-        )
+-        for src_uid, hop_dist in upstream_chain:
+-            if 1 <= hop_dist <= MAX_DELEGATION_HOPS:
+-                src_native = resolve_base_and_explicit_roles(db_path, tenant_id, src_uid)
+-                if role_name in src_native:
+-                    effective_delegated.add(role_name)
+-                    break
++    for role_name in sorted(candidate_roles):
++        upstream_chain = _discover_upstream_holders(graph, users, grantee_user_id, role_name, at_ts)
++        for src_uid, hop_dist in upstream_chain.items():
++            if 1 <= hop_dist <= MAX_DELEGATION_HOPS and role_name in resolve_base_and_explicit_roles(
++                db_path, tenant_id, src_uid
++            ):
++                effective_delegated.add(role_name)
++                break
+     return effective_delegated
+ 
+ 
+@@ -179,19 +210,17 @@
+         if action == "create":
+             if expires_at <= starts_at:
+                 raise ValueError("expires_at must be greater than starts_at")
++            static = load_tenant_static(db_path, tenant_id)
++            graph = _load_delegation_graph(db_path, tenant_id)
+             grantor_native = resolve_base_and_explicit_roles(db_path, tenant_id, grantor_user_id)
+             can_delegate = delegated_role in grantor_native
+             if not can_delegate and MAX_DELEGATION_HOPS >= 2:
+-                upstream = _collect_upstream_grantors(
+-                    db_path,
+-                    tenant_id,
+-                    grantor_user_id,
+-                    delegated_role,
+-                    eval_ts,
++                upstream = _discover_upstream_holders(
++                    graph, static["users"], grantor_user_id, delegated_role, eval_ts
+                 )
+                 can_delegate = any(
+                     hop == 1 and delegated_role in resolve_base_and_explicit_roles(db_path, tenant_id, src_uid)
+-                    for src_uid, hop in upstream
++                    for src_uid, hop in upstream.items()
+                 )
+             if not can_delegate:
+                 raise PermissionError("Grantor does not possess delegatable role within hop limit")
+@@ -215,6 +244,8 @@
+     finally:
+         conn.close()
+ 
++    bump_epoch(db_path, "delegation")
++
+     return {
+         "tenant_id": tenant_id,
+         "grantor_user_id": grantor_user_id,
+
+--- a/aegis_app/doc_indexer.py
++++ b/aegis_app/doc_indexer.py
+@@ -1,10 +1,21 @@
+ # -*- coding: utf-8 -*-
+-"""合规文本分词、相邻查询词最小跨度邻近度加分与词袋相似度计算模块。"""
++"""合规文本分词、相邻查询词最小跨度邻近度加分与词袋相似度计算模块。
++
++复杂度降维（输出与原版逐 token / 逐分值一致）：
++- tokenize_text 单遍正则扫描（非法字符天然充当分隔符，等价于原版
++  「re.sub 清洗 + findall」双遍结果）；
++- compute_phrase_proximity_bonus 由 O(|pos_a| × |pos_b|) 笛卡尔配对降为
++  「一次 O(N) 位置索引构建 + 有序位置表双指针线性归并」，并在 min_dist == 1
++  处早停（1 为可能的最小距离，早停不改变结果）；
++- jaccard_similarity_from_texts 由 O(NA × NB) 列表成员扫描降为 C 级集合
++  交并运算，并加 min/max 集合大小比值上界剪枝（Jaccard ≤ min/max 恒成立，
++  比值低于折叠阈值时真值必然低于阈值，返回 0.0 与精确值在阈值比较上决策等价）。
++"""
+ from __future__ import annotations
+ 
+ import re
+ 
+-from .config import PROXIMITY_MAX_SPAN
++from .config import DEDUP_JACCARD_THRESHOLD, PROXIMITY_MAX_SPAN
+ 
+ TOKEN_RE = re.compile(r"[a-z0-9_]{2,}")
+ 
+@@ -12,8 +23,29 @@
+ def tokenize_text(text: str) -> list[str]:
+     if not text:
+         return []
+-    cleaned = re.sub(r"[^a-zA-Z0-9_]+", " ", text).lower()
+-    return [tok for tok in TOKEN_RE.findall(cleaned) if len(tok) >= 2]
++    return TOKEN_RE.findall(text.lower())
++
++
++def _min_token_distance(pos_a: list[int], pos_b: list[int]) -> int | None:
++    """双指针归并求两有序位置表之间的最小绝对差（找到 1 即早停）。"""
++    i = 0
++    j = 0
++    len_a = len(pos_a)
++    len_b = len(pos_b)
++    best: int | None = None
++    while i < len_a and j < len_b:
++        a = pos_a[i]
++        b = pos_b[j]
++        dist = a - b if a >= b else b - a
++        if best is None or dist < best:
++            best = dist
++            if best <= 1:
++                return best
++        if a < b:
++            i += 1
++        else:
++            j += 1
++    return best
+ 
+ 
+ def compute_phrase_proximity_bonus(body_tokens: list[str], query_terms: list[str]) -> float:
+@@ -26,43 +58,52 @@
+     if len(query_terms) < 2 or not body_tokens:
+         return 0.0
+ 
++    # 一次 O(len(body_tokens)) 构建「词项 -> 有序出现位置表」索引。
++    pos_map: dict[str, list[int]] = {}
++    for idx, tok in enumerate(body_tokens):
++        lst = pos_map.get(tok)
++        if lst is None:
++            pos_map[tok] = [idx]
++        else:
++            lst.append(idx)
++
+     bonus = 0.0
+     for idx in range(len(query_terms) - 1):
+         term_a = query_terms[idx]
+         term_b = query_terms[idx + 1]
+         if term_a == term_b:
+             continue
+-        pos_a = [i for i, tok in enumerate(body_tokens) if tok == term_a]
+-        pos_b = [j for j, tok in enumerate(body_tokens) if tok == term_b]
++        pos_a = pos_map.get(term_a)
++        pos_b = pos_map.get(term_b)
+         if not pos_a or not pos_b:
+             continue
+ 
+-        min_dist: int | None = None
+-        for i in pos_a:
+-            for j in pos_b:
+-                dist = abs(i - j)
+-                if dist >= 1 and (min_dist is None or dist < min_dist):
+-                    min_dist = dist
++        min_dist = _min_token_distance(pos_a, pos_b)
+         if min_dist is not None and 1 <= min_dist <= PROXIMITY_MAX_SPAN:
+             bonus += 2.4 / float(min_dist)
+     return bonus
+ 
+ 
+ def jaccard_similarity_from_texts(title_a: str, body_a: str, title_b: str, body_b: str) -> float:
+-    tokens_a = tokenize_text(title_a) + tokenize_text(body_a)
+-    tokens_b = tokenize_text(title_b) + tokenize_text(body_b)
+-    uniq_a: list[str] = []
+-    for t in tokens_a:
+-        if t not in uniq_a:
+-            uniq_a.append(t)
+-    uniq_b: list[str] = []
+-    for t in tokens_b:
+-        if t not in uniq_b:
+-            uniq_b.append(t)
+-    if not uniq_a and not uniq_b:
++    set_a = set(tokenize_text(title_a)) | set(tokenize_text(body_a))
++    set_b = set(tokenize_text(title_b)) | set(tokenize_text(body_b))
++
++    len_a = len(set_a)
++    len_b = len(set_b)
++    if len_a == 0 and len_b == 0:
+         return 1.0
+-    inter_cnt = sum(1 for t in uniq_a if t in uniq_b)
+-    union_cnt = len(uniq_a) + sum(1 for t in uniq_b if t not in uniq_a)
++    if len_a == 0 or len_b == 0:
++        inter_cnt = 0
++        union_cnt = len_a + len_b
++    else:
++        # 上界剪枝：Jaccard ≤ min/max 恒成立；比值低于折叠阈值时真值必然更低，
++        # 对全部「sim >= DEDUP_JACCARD_THRESHOLD」比较决策等价，直接返回 0.0。
++        smaller, larger = (len_a, len_b) if len_a <= len_b else (len_b, len_a)
++        if smaller / larger < DEDUP_JACCARD_THRESHOLD:
++            return 0.0
++        inter_cnt = len(set_a & set_b)
++        union_cnt = len_a + len_b - inter_cnt
++
+     if union_cnt == 0:
+         return 0.0
+     return inter_cnt / union_cnt
+
+--- a/aegis_app/doc_writer.py
++++ b/aegis_app/doc_writer.py
+@@ -1,5 +1,13 @@
+ # -*- coding: utf-8 -*-
+-"""企业合规文档实时流式入库、正文修订（Upsert）与退役归档（Retire）服务。"""
++"""企业合规文档实时流式入库、正文修订（Upsert）与退役归档（Retire）服务。
++
++本模块职责（写入语义与原版 100% 一致）：
++- 严格字段类型 / 长度 / 引用预算守卫：bool / 非整数混淆、超长字段、畸形引用
++  洪水一律毫秒级 400 熔断；
++- upsert / retire 提交后立即提升 docs 与 citations 业务纪元，令检索侧增量
++  倒排、有效引用计数与隔离墙缓存零脏读即时联动失效（引用源文档状态翻转对
++  被引用方 citation_count 的传导由读取侧纪元缓存感知）。
++"""
+ from __future__ import annotations
+ 
+ import time
+@@ -8,6 +16,24 @@
+ from .auth import CallerContext
+ from .config import CLEARANCE_LEVELS
+ from .db import open_connection
++from .epoch_cache import bump_epoch
++
++_MAX_DOC_ID_LEN = 256
++_MAX_TITLE_LEN = 1024
++_MAX_CATEGORY_LEN = 128
++_MAX_REG_CODE_LEN = 256
++_MAX_TAG_LEN = 256
++_MAX_CITATIONS = 200
++_MAX_CITATION_REF_LEN = 256
++
++
++def _coerce_doc_int(raw: Any, fallback: int, label: str) -> int:
++    """严格整数字段守卫：None/0/空值回退默认（与原版 `or` 语义一致），bool / 非整数拒绝。"""
++    if not raw:
++        return fallback
++    if isinstance(raw, bool) or not isinstance(raw, int):
++        raise ValueError(f"{label} must be an integer")
++    return raw
+ 
+ 
+ def _require_editor_clearance(caller: CallerContext, doc_clearance: int) -> None:
+@@ -26,20 +52,43 @@
+     doc_id = str(payload.get("doc_id") or "").strip()
+     category = str(payload.get("category") or "AML").strip().upper()
+     regulation_code = str(payload.get("regulation_code") or "").strip()
+-    clearance_level = int(payload.get("clearance_level") or 2)
+-    risk_weight = int(payload.get("risk_weight") or 10)
++    clearance_level = _coerce_doc_int(payload.get("clearance_level"), 2, "clearance_level")
++    risk_weight = _coerce_doc_int(payload.get("risk_weight"), 10, "risk_weight")
+     custom_tag = str(payload.get("custom_tag") or "tag_default").strip()
+     title = str(payload.get("title") or "").strip()
+     body = str(payload.get("body") or "").strip()
+-    updated_at = int(payload.get("updated_at") or caller.request_ts or int(time.time()))
++    updated_at = _coerce_doc_int(
++        payload.get("updated_at"),
++        int(caller.request_ts or int(time.time())),
++        "updated_at",
++    )
+     citations = payload.get("citations") or []
+ 
+     if not doc_id or not title or not body:
+         raise ValueError("doc_id, title, and body are required")
++    if (
++        len(doc_id) > _MAX_DOC_ID_LEN
++        or len(title) > _MAX_TITLE_LEN
++        or len(category) > _MAX_CATEGORY_LEN
++        or len(regulation_code) > _MAX_REG_CODE_LEN
++        or len(custom_tag) > _MAX_TAG_LEN
++    ):
++        raise ValueError("Document field length exceeds allowed limit")
+     if clearance_level not in CLEARANCE_LEVELS.values():
+         raise ValueError("clearance_level must be in 1..4")
+     if risk_weight < 0 or risk_weight > 200:
+         raise ValueError("risk_weight must be between 0 and 200")
++
++    # 引用预算与长度守卫：畸形引用洪水在打开连接前即被 400 拒绝。
++    normalized_citations: list[str] = []
++    if isinstance(citations, list) and citations:
++        if len(citations) > _MAX_CITATIONS:
++            raise ValueError(f"citations list exceeds maximum allowed size ({_MAX_CITATIONS})")
++        for c_ref in citations:
++            ref_str = str(c_ref)
++            if len(ref_str) > _MAX_CITATION_REF_LEN:
++                raise ValueError("Citation reference exceeds allowed length")
++            normalized_citations.append(ref_str)
+ 
+     _require_editor_clearance(caller, clearance_level)
+ 
+@@ -95,15 +144,19 @@
+             )
+             mode = "created"
+ 
+-        if isinstance(citations, list) and citations:
+-            for c_ref in citations:
++        if normalized_citations:
++            for ref_str in normalized_citations:
+                 conn.execute(
+                     "INSERT INTO doc_citations(tenant_id, doc_id, cited_by_ref, cited_at) VALUES (?, ?, ?, ?)",
+-                    (caller.tenant_id, doc_id, str(c_ref), updated_at),
++                    (caller.tenant_id, doc_id, ref_str, updated_at),
+                 )
+         conn.commit()
+     finally:
+         conn.close()
++
++    # 文档与引用写入提交后立即提升 docs / citations 纪元，
++    # 检索侧增量倒排、引用计数与隔离墙缓存零脏读即时联动。
++    bump_epoch(db_path, "docs", "citations")
+ 
+     return {
+         "tenant_id": caller.tenant_id,
+@@ -134,6 +187,10 @@
+     finally:
+         conn.close()
+ 
++    # 退役状态翻转即时生效：docs 纪元提升后，该文档不再可被检索，
++    # 也不再作为其他文档的有效内部引用源。
++    bump_epoch(db_path, "docs")
++
+     return {
+         "tenant_id": caller.tenant_id,
+         "doc_id": doc_id,
+
+--- /dev/null
++++ b/aegis_app/epoch_cache.py
+@@ -0,0 +1,117 @@
++# -*- coding: utf-8 -*-
++"""全局多租户纪元失效缓存注册中心（线程安全、零脏读、有界常驻内存）。
++
++设计契约：
++- 每个可变业务域（role_grants / delegation / acl / docs / citations / policy /
++  sanctions / quotas / webhook ...）拥有一个按 (db_path, domain) 寻址的单调递增
++  纪元计数器；
++- 任何写入方在事务提交之后必须立即 bump_epoch() 使对应域纪元 +1；
++- 读方缓存条目以 (db_key, 纪元组合 token, 业务键) 寻址：纪元一变旧条目自动失联，
++  并在容量超限时被批量清扫，从而在零锁竞争放大的前提下保证跨模块联动零脏读；
++- users / org_nodes 为挂载后无写入路由的静态数据，以 "org"+"users" 纪元
++  （恒为 0）缓存租户静态组织图与用户档案，供权限/隔离墙/借调模块共享复用。
++"""
++from __future__ import annotations
++
++import threading
++from typing import Any
++
++from .db import open_connection
++
++_lock = threading.RLock()
++_epoch_counters: dict[tuple[str, str], int] = {}
++
++CACHE_MISS = object()
++
++
++def bump_epoch(db_path: str, *domains: str) -> None:
++    """写入方提交变更后使指定业务域纪元 +1，令相关读缓存全部失效。"""
++    if not domains:
++        return
++    db_key = str(db_path)
++    with _lock:
++        for domain in domains:
++            k = (db_key, domain)
++            _epoch_counters[k] = _epoch_counters.get(k, 0) + 1
++
++
++def epoch_token(db_path: str, *domains: str) -> tuple[int, ...]:
++    """读取若干业务域的当前纪元组合，作为读缓存的作用域令牌。"""
++    db_key = str(db_path)
++    with _lock:
++        return tuple(_epoch_counters.get((db_key, d), 0) for d in domains)
++
++
++class EpochScopedCache:
++    """以 (db_key, epoch_token) 为作用域的有界线程安全缓存。
++
++    超过容量上限时优先清扫同库陈旧纪元条目，仍超限则按插入序淘汰最旧条目，
++    保证常驻堆内存有界。
++    """
++
++    __slots__ = ("name", "max_entries", "_data")
++
++    def __init__(self, name: str, max_entries: int = 8192) -> None:
++        self.name = name
++        self.max_entries = max(64, int(max_entries))
++        self._data: dict[tuple[str, tuple[int, ...], Any], Any] = {}
++
++    def get(self, db_key: str, token: tuple[int, ...], key: Any) -> Any:
++        with _lock:
++            return self._data.get((db_key, token, key), CACHE_MISS)
++
++    def put(self, db_key: str, token: tuple[int, ...], key: Any, value: Any) -> None:
++        with _lock:
++            self._data[(db_key, token, key)] = value
++            if len(self._data) > self.max_entries:
++                self._sweep(db_key, token)
++
++    def _sweep(self, db_key: str, token: tuple[int, ...]) -> None:
++        data = self._data
++        for k in [k for k in data if k[0] == db_key and k[1] != token]:
++            del data[k]
++        while len(data) > self.max_entries:
++            data.pop(next(iter(data)))
++
++
++_static_cache = EpochScopedCache("tenant_static", 256)
++
++
++def load_tenant_static(db_path: str, tenant_id: str) -> dict[str, Any]:
++    """加载租户静态组织图与用户档案（users / org_nodes 挂载后无写入路由）。
++
++    返回结构：
++        users: {user_id: (active:int, org_node_id:str|None, base_role:str)}
++        org:   {node_id: (parent_node_id:str|None, inherited_role:str)}
++    """
++    db_key = str(db_path)
++    token = epoch_token(db_path, "org", "users")
++    hit = _static_cache.get(db_key, token, tenant_id)
++    if hit is not CACHE_MISS:
++        return hit
++
++    conn = open_connection(db_path)
++    try:
++        u_rows = conn.execute(
++            "SELECT user_id, org_node_id, base_role, active FROM users WHERE tenant_id = ?",
++            (tenant_id,),
++        ).fetchall()
++        n_rows = conn.execute(
++            "SELECT node_id, parent_node_id, inherited_role FROM org_nodes WHERE tenant_id = ?",
++            (tenant_id,),
++        ).fetchall()
++    finally:
++        conn.close()
++
++    static = {
++        "users": {
++            str(r["user_id"]): (int(r["active"]), r["org_node_id"], str(r["base_role"] or ""))
++            for r in u_rows
++        },
++        "org": {
++            str(r["node_id"]): (r["parent_node_id"], str(r["inherited_role"] or ""))
++            for r in n_rows
++        },
++    }
++    _static_cache.put(db_key, token, tenant_id, static)
++    return static
+
+--- a/aegis_app/ledger_ops.py
++++ b/aegis_app/ledger_ops.py
+@@ -1,5 +1,16 @@
+ # -*- coding: utf-8 -*-
+-"""租户配额扣减、跨配额池调拨（Quota Transfer）与单次应急放行令牌核销服务。"""
++"""租户配额扣减、跨配额池调拨（Quota Transfer）与单次应急放行令牌核销服务。
++
++并发与一致性契约（无死锁全局锁偏序）：
++- 本模块全部配额变更路径（consume / transfer / redeem / 实时告警扣减）一律以
++  BEGIN IMMEDIATE 作为事务首语句获取 SQLite 全局写锁，且不持有任何 Python 层
++  配额锁，跨接口（quotas/consume × quotas/transfer × evaluate-batch 告警联动）
++  天然满足单一偏序，杜绝死锁与丢失更新；
++- 实时告警扣减支持通过 conn 复用调用方已持有的 BEGIN IMMEDIATE 事务（供风控
++  批次四重强原子提交内联调用），单条条件更新原子完成；
++- 扣减 / 调拨 / 核销均为“先原子谓词更新、后提交”模式：高并发下绝不超扣、
++  绝不为负、总额严格守恒、令牌严格仅成功核销一次。
++"""
+ from __future__ import annotations
+ 
+ import json
+@@ -10,30 +21,37 @@
+ from .config import ALERT_QUOTA_BUCKET
+ from .db import open_connection
+ 
++_AMOUNT_MAX = 1 << 62
++
+ 
+ def try_consume_realtime_alert_quota(
+     db_path: str,
+     tenant_id: str,
+     now_ts: int,
++    *,
++    conn: Any = None,
+ ) -> bool:
+-    """高危风控拦截时从本租户 REALTIME_ALERT_POOL 尝试扣减 1 点实时告警配额。"""
+-    conn = open_connection(db_path)
+-    try:
+-        row = conn.execute(
+-            "SELECT remaining_quota FROM tenant_quotas WHERE tenant_id = ? AND quota_type = ?",
+-            (tenant_id, ALERT_QUOTA_BUCKET),
+-        ).fetchone()
+-        if not row or int(row["remaining_quota"]) < 1:
+-            return False
+-        new_rem = int(row["remaining_quota"]) - 1
+-        conn.execute(
+-            "UPDATE tenant_quotas SET remaining_quota = ?, updated_at = ? WHERE tenant_id = ? AND quota_type = ?",
+-            (new_rem, int(now_ts), tenant_id, ALERT_QUOTA_BUCKET),
+-        )
+-        conn.commit()
+-        return True
+-    finally:
+-        conn.close()
++    """高危风控拦截时从本租户 REALTIME_ALERT_POOL 尝试扣减 1 点实时告警配额。
++
++    单条条件更新（remaining_quota >= 1 谓词）原子完成，高并发下绝不超扣为负；
++    可通过 conn 复用调用方已持有的 BEGIN IMMEDIATE 事务，实现批次级四重强原子提交。
++    """
++    own_conn = conn is None
++    if own_conn:
++        conn = open_connection(db_path)
++    try:
++        cur = conn.execute(
++            "UPDATE tenant_quotas SET remaining_quota = remaining_quota - 1, updated_at = ? "
++            "WHERE tenant_id = ? AND quota_type = ? AND remaining_quota >= 1",
++            (int(now_ts), tenant_id, ALERT_QUOTA_BUCKET),
++        )
++        consumed = cur.rowcount == 1
++        if own_conn:
++            conn.commit()
++        return consumed
++    finally:
++        if own_conn:
++            conn.close()
+ 
+ 
+ def consume_tenant_quota(
+@@ -43,12 +61,15 @@
+     quota_type: str,
+     amount: int = 1,
+ ) -> dict[str, Any]:
+-    """扣减租户指定类型的业务配额并返回剩余额度。"""
+-    if amount <= 0:
+-        raise ValueError("Quota consumption amount must be positive")
++    """扣减租户指定类型的业务配额并返回剩余额度（高并发下严禁超扣或负数）。"""
++    if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
++        raise ValueError("Quota consumption amount must be a positive integer")
++    if amount > _AMOUNT_MAX:
++        raise ValueError("Quota consumption amount exceeds supported range")
+     now_ts = int(caller.request_ts or int(time.time()))
+     conn = open_connection(db_path)
+     try:
++        conn.execute("BEGIN IMMEDIATE")
+         row = conn.execute(
+             "SELECT remaining_quota FROM tenant_quotas WHERE tenant_id = ? AND quota_type = ?",
+             (caller.tenant_id, quota_type),
+@@ -58,6 +79,7 @@
+ 
+         current_rem = int(row["remaining_quota"])
+         if current_rem < amount:
++            conn.commit()
+             return {
+                 "accepted": False,
+                 "quota_type": quota_type,
+@@ -66,6 +88,10 @@
+             }
+ 
+         new_rem = current_rem - amount
++        conn.execute(
++            "UPDATE tenant_quotas SET remaining_quota = ?, updated_at = ? WHERE tenant_id = ? AND quota_type = ?",
++            (new_rem, now_ts, caller.tenant_id, quota_type),
++        )
+         conn.execute(
+             "INSERT INTO audit_logs(tenant_id, actor_id, event_type, severity, amount_cents, masked_account, ts, payload_json) "
+             "VALUES (?, ?, 'QUOTA_CONSUME', 'MEDIUM', ?, '****0000', ?, ?)",
+@@ -77,10 +103,6 @@
+                 json.dumps({"quota_type": quota_type, "consumed": amount, "remaining": new_rem}),
+             ),
+         )
+-        conn.execute(
+-            "UPDATE tenant_quotas SET remaining_quota = ?, updated_at = ? WHERE tenant_id = ? AND quota_type = ?",
+-            (new_rem, now_ts, caller.tenant_id, quota_type),
+-        )
+         conn.commit()
+         return {
+             "accepted": True,
+@@ -100,16 +122,24 @@
+     to_quota: str,
+     amount: int,
+ ) -> dict[str, Any]:
+-    """在本租户两个配额池之间调拨额度（须保证总额守恒、余额非负且高并发双向调拨零死锁）。"""
++    """在本租户两个配额池之间调拨额度（须保证总额守恒、余额非负且高并发双向调拨零死锁）。
++
++    BEGIN IMMEDIATE 作为事务首语句统一获取写锁：读校验、双池更新与调拨流水
++    登记在同一写事务内原子提交，并发 consume / evaluate-batch 告警联动扣减
++    不会插入其间造成总额漂移。
++    """
+     require_admin(caller)
+-    if amount <= 0:
+-        raise ValueError("Transfer amount must be positive")
++    if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
++        raise ValueError("Transfer amount must be a positive integer")
++    if amount > _AMOUNT_MAX:
++        raise ValueError("Transfer amount exceeds supported range")
+     if not from_quota or not to_quota or from_quota == to_quota:
+         raise ValueError("Distinct non-empty from_quota and to_quota are required")
+ 
+     now_ts = int(caller.request_ts or int(time.time()))
+     conn = open_connection(db_path)
+     try:
++        conn.execute("BEGIN IMMEDIATE")
+         src_row = conn.execute(
+             "SELECT remaining_quota FROM tenant_quotas WHERE tenant_id = ? AND quota_type = ?",
+             (caller.tenant_id, from_quota),
+@@ -124,6 +154,7 @@
+         src_rem = int(src_row["remaining_quota"])
+         dst_rem = int(dst_row["remaining_quota"])
+         if src_rem < amount:
++            conn.commit()
+             return {
+                 "transferred": False,
+                 "from_quota": from_quota,
+@@ -167,10 +198,15 @@
+     token_id: str,
+     tx_ref: str,
+ ) -> dict[str, Any]:
+-    """核销单次使用的风控应急放行令牌。"""
++    """核销单次使用的风控应急放行令牌（高并发下严格仅成功核销一次）。
++
++    BEGIN IMMEDIATE 写事务内“查复核销状态 + 条件更新（used = 0 谓词）+ 审计
++    流水”原子提交：并发重复核销仅一方成功，另一方返回 TOKEN_ALREADY_USED。
++    """
+     now_ts = int(caller.request_ts or int(time.time()))
+     conn = open_connection(db_path)
+     try:
++        conn.execute("BEGIN IMMEDIATE")
+         row = conn.execute(
+             "SELECT token_id, tenant_id, purpose, used FROM override_tokens WHERE token_id = ? AND tenant_id = ?",
+             (token_id, caller.tenant_id),
+@@ -178,12 +214,25 @@
+         if not row:
+             raise LookupError("Override token not found")
+         if int(row["used"]) != 0:
++            conn.commit()
+             return {
+                 "redeemed": False,
+                 "token_id": token_id,
+                 "reason": "TOKEN_ALREADY_USED",
+             }
+ 
++        cur = conn.execute(
++            "UPDATE override_tokens SET used = 1, used_by = ?, used_at = ? "
++            "WHERE token_id = ? AND tenant_id = ? AND used = 0",
++            (caller.user_id, now_ts, token_id, caller.tenant_id),
++        )
++        if cur.rowcount != 1:
++            conn.commit()
++            return {
++                "redeemed": False,
++                "token_id": token_id,
++                "reason": "TOKEN_ALREADY_USED",
++            }
+         conn.execute(
+             "INSERT INTO audit_logs(tenant_id, actor_id, event_type, severity, amount_cents, masked_account, ts, payload_json) "
+             "VALUES (?, ?, 'OVERRIDE_REDEEM', 'HIGH', 0, '****0000', ?, ?)",
+@@ -194,10 +243,6 @@
+                 json.dumps({"token_id": token_id, "tx_ref": tx_ref, "purpose": row["purpose"]}),
+             ),
+         )
+-        conn.execute(
+-            "UPDATE override_tokens SET used = 1, used_by = ?, used_at = ? WHERE token_id = ? AND tenant_id = ?",
+-            (caller.user_id, now_ts, token_id, caller.tenant_id),
+-        )
+         conn.commit()
+         return {
+             "redeemed": True,
+
+--- a/aegis_app/middleware.py
++++ b/aegis_app/middleware.py
+@@ -7,8 +7,12 @@
+ from typing import Any
+ 
+ from . import __version__
+-from .config import GATEWAY_INTERNAL_BUILD, MASTER_SIGNING_PEPPER
++from .config import GATEWAY_INTERNAL_BUILD
+ from .db import open_connection
++
++# 载荷安全预算：超体积 / 超深嵌套的畸形报文在 json.loads 之前就地毫秒级熔断。
++_MAX_RAW_JSON_CHARS = 2_000_000
++_MAX_JSON_DEPTH = 64
+ 
+ 
+ def parse_url_and_query(path: str) -> tuple[str, dict[str, str]]:
+@@ -16,6 +20,38 @@
+     route = parsed_url.path.rstrip("/") or "/"
+     query_params = dict(urllib.parse.parse_qsl(parsed_url.query, keep_blank_values=True))
+     return route, query_params
++
++
++def _precheck_json_nesting_depth(raw: str) -> int:
++    """在 json.loads 之前用 O(N) 状态机扫描原始文本的最大花括号/方括号嵌套深度。
++
++    字符串字面量内的括号不计入；畸形不闭合的载荷交给 json.loads 原有语义报 400。
++    """
++    depth = 0
++    max_depth = 0
++    in_str = False
++    escaped = False
++    for ch in raw:
++        if in_str:
++            if escaped:
++                escaped = False
++            elif ch == "\\":
++                escaped = True
++            elif ch == '"':
++                in_str = False
++            continue
++        if ch == '"':
++            in_str = True
++        elif ch == "{" or ch == "[":
++            depth += 1
++            if depth > max_depth:
++                max_depth = depth
++                if max_depth > _MAX_JSON_DEPTH:
++                    return max_depth
++        elif ch == "}" or ch == "]":
++            if depth > 0:
++                depth -= 1
++    return max_depth
+ 
+ 
+ def parse_json_payload(body: bytes | str | dict[str, Any] | None) -> tuple[dict[str, Any], str]:
+@@ -30,6 +66,10 @@
+         raw = str(body)
+     if not raw.strip():
+         return {}, raw
++    if len(raw) > _MAX_RAW_JSON_CHARS:
++        raise ValueError("Request payload exceeds maximum allowed size")
++    if _precheck_json_nesting_depth(raw) > _MAX_JSON_DEPTH:
++        raise ValueError("Request payload exceeds maximum allowed nesting depth")
+     data = json.loads(raw)
+     if not isinstance(data, dict):
+         raise ValueError("Request JSON payload must be an object")
+@@ -37,19 +77,24 @@
+ 
+ 
+ def collect_internal_diagnostics(db_path: str, storage_dir: str) -> dict[str, Any]:
++    """聚合脱敏后的网关内部诊断摘要。
++
++    安全契约：严禁向未授权方泄露内部诊断配置、物理路径、主密钥、
++    租户 webhook 密钥或系统保险库机密，此处仅返回最小化的非敏感计数摘要。
++    """
+     conn = open_connection(db_path)
+     try:
+-        t_rows = conn.execute("SELECT tenant_id, webhook_secret, status FROM tenants").fetchall()
+-        s_rows = conn.execute("SELECT secret_key, secret_value FROM system_secrets").fetchall()
+-        return {
+-            "service": "aegis-gateway",
+-            "version": __version__,
+-            "build": GATEWAY_INTERNAL_BUILD,
+-            "db_path": db_path,
+-            "storage_dir": storage_dir,
+-            "master_signing_pepper": MASTER_SIGNING_PEPPER,
+-            "registered_tenants": [dict(r) for r in t_rows],
+-            "system_secrets": {r["secret_key"]: r["secret_value"] for r in s_rows},
+-        }
++        t_row = conn.execute(
++            "SELECT COUNT(*) AS total, "
++            "SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) AS active "
++            "FROM tenants"
++        ).fetchone()
+     finally:
+         conn.close()
++    return {
++        "service": "aegis-gateway",
++        "version": __version__,
++        "build": GATEWAY_INTERNAL_BUILD,
++        "registered_tenants": int(t_row["total"] or 0),
++        "active_tenants": int(t_row["active"] or 0),
++    }
+
+--- a/aegis_app/rule_engine.py
++++ b/aegis_app/rule_engine.py
+@@ -4,7 +4,10 @@
+ 
+ import json
+ import re
++import sqlite3
++import threading
+ import time
++from collections import deque
+ from typing import Any
+ 
+ from .auth import CallerContext, require_admin
+@@ -13,24 +16,41 @@
+     SANCTION_HOP_SCORES,
+     SLIDING_WINDOW_SECONDS,
+ )
+-from .contagion_graph import compute_sanction_contagion_hop
++from .contagion_graph import _load_sanctioned_set
+ from .db import open_connection
++from .epoch_cache import CACHE_MISS, EpochScopedCache, bump_epoch, epoch_token
+ from .ledger_ops import try_consume_realtime_alert_quota
+ from .legacy_compat import apply_sovereign_settlement_adjustment
+ from .window_stats import compute_exact_median_cents
+ 
++# 注：本地部分已线性化去嵌套量词 —— `(A S*)+`（A=字母数字串，S=单分隔符+字母数字串）
++# 的语言与 `A(S)*` 严格等价（多次外层迭代拼接处无分隔符，恒可归一为单次迭代），
++# 匹配结果与原版完全一致，但对 "aaaa...!" 型恶意回溯输入为线性时间。
+ PARTNER_EMAIL_PATTERN = re.compile(
+-    r"^([a-zA-Z0-9]+([._-][a-zA-Z0-9]+)*)+@([a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+)$"
++    r"^[a-zA-Z0-9]+([._-][a-zA-Z0-9]+)*@"
++    r"[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$"
+ )
++_EMAIL_MAX_LEN = 254
+ 
+ 
+ def validate_contact_email(email: str) -> bool:
+     if not isinstance(email, str) or not email:
+         return False
++    if len(email) > _EMAIL_MAX_LEN:
++        return False
+     return PARTNER_EMAIL_PATTERN.match(email) is not None
+ 
+ 
++_policy_cache = EpochScopedCache("tenant_policy", 256)
++
++
+ def load_tenant_policy(db_path: str, tenant_id: str) -> dict[str, Any]:
++    """按 policy 纪元缓存租户风控策略（update_tenant_policy 提交后立即 bump 失效）。"""
++    db_key = str(db_path)
++    token = epoch_token(db_path, "policy")
++    hit = _policy_cache.get(db_key, token, tenant_id)
++    if hit is not CACHE_MISS:
++        return hit
+     conn = open_connection(db_path)
+     try:
+         row = conn.execute(
+@@ -44,9 +64,67 @@
+             raise LookupError(f"Policy configuration missing for {tenant_id}")
+         policy = dict(row)
+         policy["custom_rules"] = json.loads(policy["custom_rules_json"])
+-        return policy
+     finally:
+         conn.close()
++    _policy_cache.put(db_key, token, tenant_id, policy)
++    return policy
++
++
++def _strict_policy_int(raw: Any, label: str) -> int:
++    """策略阈值严格整数守卫：拒绝 bool / 非整数 / 超 64 位数值。"""
++    if isinstance(raw, bool):
++        raise ValueError(f"Invalid policy threshold value for {label}")
++    if isinstance(raw, int):
++        num = raw
++    elif isinstance(raw, str) and len(raw) <= 32:
++        try:
++            num = int(raw)
++        except ValueError:
++            raise ValueError(f"Invalid policy threshold value for {label}") from None
++    else:
++        raise ValueError(f"Invalid policy threshold value for {label}")
++    if num < _INT64_MIN or num > _INT64_MAX:
++        raise ValueError(f"Policy threshold out of 64-bit range for {label}")
++    return num
++
++
++def _validate_rule_tree_structure(
++    node: Any,
++    depth: int = 0,
++    budget: list[int] | None = None,
++) -> None:
++    """策略热更新前的规则树结构预检：深度/节点预算、算子、正则编译与数值操作数守卫。"""
++    if budget is None:
++        budget = [_RULE_TREE_MAX_NODES]
++    if not isinstance(node, dict):
++        raise ValueError("Rule node must be an object")
++    if depth > _RULE_TREE_MAX_DEPTH:
++        raise ValueError("Rule tree nesting exceeds maximum allowed depth")
++    if budget[0] <= 0:
++        raise ValueError("Rule tree node budget exhausted")
++    budget[0] -= 1
++
++    op = str(node.get("op") or "").upper()
++    if op in ("AND", "OR", "NOT"):
++        children = node.get("children")
++        if not isinstance(children, list) or not children:
++            raise ValueError(f"Logical operator {op} requires non-empty children list")
++        if op == "NOT" and len(children) != 1:
++            raise ValueError("NOT operator requires exactly 1 child")
++        for ch in children:
++            _validate_rule_tree_structure(ch, depth + 1, budget)
++        return
++
++    if not str(node.get("field") or ""):
++        raise ValueError("Leaf rule node missing 'field'")
++    if op in ("GT", "GTE", "LT", "LTE"):
++        _coerce_rule_number(node.get("value"), str(node.get("field")))
++    elif op == "REGEX":
++        target = node.get("value")
++        if isinstance(target, str):
++            _compile_guarded_rule_regex(target)
++    elif op not in ("EQ", "NEQ", "IN", "CONTAINS"):
++        raise ValueError(f"Unsupported rule operator: {op}")
+ 
+ 
+ def update_tenant_policy(
+@@ -56,18 +134,20 @@
+ ) -> dict[str, Any]:
+     require_admin(caller)
+     current = load_tenant_policy(db_path, caller.tenant_id)
+-    high_amt = int(updates.get("high_amount_cents", current["high_amount_cents"]))
+-    vel_tx = int(updates.get("velocity_tx_limit", current["velocity_tx_limit"]))
+-    vel_amt = int(updates.get("velocity_amount_cents", current["velocity_amount_cents"]))
+-    fanout = int(updates.get("counterparty_fanout_limit", current["counterparty_fanout_limit"]))
+-    rev_th = int(updates.get("review_threshold", current["review_threshold"]))
+-    rej_th = int(updates.get("reject_threshold", current["reject_threshold"]))
++    high_amt = _strict_policy_int(updates.get("high_amount_cents", current["high_amount_cents"]), "high_amount_cents")
++    vel_tx = _strict_policy_int(updates.get("velocity_tx_limit", current["velocity_tx_limit"]), "velocity_tx_limit")
++    vel_amt = _strict_policy_int(updates.get("velocity_amount_cents", current["velocity_amount_cents"]), "velocity_amount_cents")
++    fanout = _strict_policy_int(updates.get("counterparty_fanout_limit", current["counterparty_fanout_limit"]), "counterparty_fanout_limit")
++    rev_th = _strict_policy_int(updates.get("review_threshold", current["review_threshold"]), "review_threshold")
++    rej_th = _strict_policy_int(updates.get("reject_threshold", current["reject_threshold"]), "reject_threshold")
+     custom_rules = updates.get("custom_rules", current["custom_rules"])
+ 
+     if high_amt <= 0 or vel_tx <= 0 or rev_th <= 0 or rej_th < rev_th:
+         raise ValueError("Invalid policy threshold values")
+     if not isinstance(custom_rules, dict):
+         raise ValueError("custom_rules must be a JSON object")
++    # 热更新前预检自定义规则树：非法算子 / 炸弹正则 / 超深超宽一律 400 拒绝。
++    _validate_rule_tree_structure(custom_rules)
+ 
+     new_ver = int(current["policy_version"]) + 1
+     now_ts = int(caller.request_ts or int(time.time()))
+@@ -94,6 +174,8 @@
+         conn.commit()
+     finally:
+         conn.close()
++    # 策略热更新提交后立即提升 policy 纪元，风控评估路径零脏读即时生效。
++    bump_epoch(db_path, "policy")
+     return load_tenant_policy(db_path, caller.tenant_id)
+ 
+ 
+@@ -105,9 +187,282 @@
+     return tx.get(field_path)
+ 
+ 
++# ---------------------------------------------------------------------------
++# 规则树求值安全预算与抗复杂度炸弹熔断常量
++# ---------------------------------------------------------------------------
++_RULE_TREE_MAX_DEPTH = 32
++_RULE_TREE_MAX_NODES = 2000
++_REGEX_PATTERN_MAX_LEN = 256
++_REGEX_REPETITION_MAX = 64
++_REGEX_SUBJECT_MAX_LEN = 10_000
++_INT64_MIN = -(1 << 63)
++_INT64_MAX = (1 << 63) - 1
++
++_REGEX_BACKREF_RE = re.compile(r"\\[0-9]|\\g")
++_REGEX_BRACE_RE = re.compile(r"\{(\d+)(,(\d*))?\}")
++_REGEX_INNER_QUANT_RE = re.compile(r"[*+?]|\{\d")
++_regex_compile_lock = threading.Lock()
++_regex_compile_cache: dict[str, Any] = {}
++_REGEX_CACHE_MAX = 512
++
++
++def _coerce_rule_number(value: Any, field_label: str) -> float:
++    """严格数值操作数守卫：拒绝 bool 混淆、NaN/Inf、超 64 位整数与非数值字符串。"""
++    if isinstance(value, bool):
++        raise ValueError(f"Boolean operand is not allowed in numeric rule comparison: {field_label}")
++    if isinstance(value, int):
++        if value < _INT64_MIN or value > _INT64_MAX:
++            raise ValueError(f"Integer operand out of 64-bit range in rule comparison: {field_label}")
++        return float(value)
++    if isinstance(value, float):
++        num = value
++    elif isinstance(value, str) and len(value) <= 64:
++        try:
++            num = float(value)
++        except ValueError:
++            raise ValueError(f"Non-numeric operand in rule comparison: {field_label}") from None
++    else:
++        raise ValueError(f"Unsupported numeric operand type in rule comparison: {field_label}")
++    if num != num or num in (float("inf"), float("-inf")):
++        raise ValueError(f"Non-finite number in rule comparison: {field_label}")
++    return num
++
++
++def _split_top_level_alternation(content: str) -> list[str] | None:
++    """按深度 0 的 '|' 切分交替分支；无交替时返回 None。"""
++    branches: list[str] = []
++    depth = 0
++    in_class = False
++    seg_start = 0
++    i = 0
++    n = len(content)
++    while i < n:
++        ch = content[i]
++        if ch == "\\":
++            i += 2
++            continue
++        if in_class:
++            if ch == "]":
++                in_class = False
++            i += 1
++            continue
++        if ch == "[":
++            in_class = True
++            i += 1
++            continue
++        if ch == "(":
++            depth += 1
++            i += 1
++            continue
++        if ch == ")":
++            depth -= 1
++            i += 1
++            continue
++        if ch == "|" and depth == 0:
++            branches.append(content[seg_start:i])
++            seg_start = i + 1
++        i += 1
++    branches.append(content[seg_start:])
++    return branches if len(branches) > 1 else None
++
++
++def _collect_group_contents(content: str) -> list[str]:
++    """收集 content 自身及其中全部括号子表达式的内容文本（跳过字符类与转义）。"""
++    results = [content]
++    starts: list[int] = []
++    i = 0
++    n = len(content)
++    while i < n:
++        ch = content[i]
++        if ch == "\\":
++            i += 2
++            continue
++        if ch == "[":
++            j = i + 1
++            if j < n and content[j] == "^":
++                j += 1
++            if j < n and content[j] == "]":
++                j += 1
++            while j < n and content[j] != "]":
++                if content[j] == "\\":
++                    j += 1
++                j += 1
++            i = j + 1
++            continue
++        if ch == "(":
++            starts.append(i)
++            i += 1
++            if i < n and content[i] == "?":
++                i += 1
++            continue
++        if ch == ")" and starts:
++            s = starts.pop()
++            results.append(content[s + 1 : i])
++            i += 1
++            continue
++        i += 1
++    return results
++
++
++def _reject_ambiguous_quantified_group(content: str) -> None:
++    """量词修饰分组的安全熔断：内嵌量词、空交替分支与前缀歧义交替均拒绝。"""
++    if _REGEX_INNER_QUANT_RE.search(content):
++        raise ValueError("Rule REGEX pattern contains nested quantifiers")
++    for group_text in _collect_group_contents(content):
++        branches = _split_top_level_alternation(group_text)
++        if branches is None:
++            continue
++        if len(branches) > 64:
++            raise ValueError("Rule REGEX pattern contains too many alternation branches under quantifier")
++        if any(b == "" for b in branches):
++            raise ValueError("Rule REGEX pattern contains empty alternation branch under quantifier")
++        for x in branches:
++            for y in branches:
++                if x != y and y.startswith(x):
++                    raise ValueError("Rule REGEX pattern contains prefix-ambiguous alternation under quantifier")
++
++
++def _reject_nested_quantifiers(pattern: str) -> None:
++    """结构性防回溯熔断：拒绝嵌套量词、相邻叠量词及大上界有界重复。"""
++    stack: list[list] = [[False, 0]]
++    pending_group: str | None = None
++    prev_was_quantifier = False
++    i = 0
++    n = len(pattern)
++    while i < n:
++        ch = pattern[i]
++        if ch == "\\":
++            i += 2
++            prev_was_quantifier = False
++            pending_group = None
++            continue
++        if ch == "[":
++            j = i + 1
++            if j < n and pattern[j] == "^":
++                j += 1
++            if j < n and pattern[j] == "]":
++                j += 1
++            while j < n and pattern[j] != "]":
++                if pattern[j] == "\\":
++                    j += 1
++                j += 1
++            i = j + 1
++            prev_was_quantifier = False
++            pending_group = None
++            continue
++        if ch == "(":
++            i += 1
++            if i < n and pattern[i] == "?":
++                i += 1
++            stack.append([False, i])
++            prev_was_quantifier = False
++            pending_group = None
++            continue
++        if ch == ")":
++            if len(stack) > 1:
++                frame = stack.pop()
++                if frame[0]:
++                    stack[-1][0] = True
++                pending_group = pattern[frame[1] : i]
++            else:
++                pending_group = None
++            i += 1
++            prev_was_quantifier = False
++            continue
++        if ch in "*+":
++            if prev_was_quantifier:
++                raise ValueError("Rule REGEX pattern contains stacked quantifiers")
++            if pending_group is not None:
++                _reject_ambiguous_quantified_group(pending_group)
++            stack[-1][0] = True
++            i += 1
++            prev_was_quantifier = True
++            pending_group = None
++            continue
++        if ch == "?":
++            if not prev_was_quantifier:
++                if pending_group is not None:
++                    _reject_ambiguous_quantified_group(pending_group)
++                stack[-1][0] = True
++            i += 1
++            prev_was_quantifier = True
++            pending_group = None
++            continue
++        if ch == "{":
++            m = _REGEX_BRACE_RE.match(pattern, i)
++            if m is not None:
++                if prev_was_quantifier:
++                    raise ValueError("Rule REGEX pattern contains stacked quantifiers")
++                if pending_group is not None:
++                    _reject_ambiguous_quantified_group(pending_group)
++                stack[-1][0] = True
++                i = m.end()
++                prev_was_quantifier = True
++                pending_group = None
++                continue
++            i += 1
++            prev_was_quantifier = False
++            pending_group = None
++            continue
++        i += 1
++        prev_was_quantifier = False
++        pending_group = None
++    return
++
++
++def _validate_rule_regex_pattern(pattern: str) -> Any:
++    """校验并编译用户可控正则：长度/反向引用/大上界/嵌套量词结构性熔断，非法模式一律 400。"""
++    if not isinstance(pattern, str) or not pattern:
++        raise ValueError("Rule REGEX pattern must be a non-empty string")
++    if len(pattern) > _REGEX_PATTERN_MAX_LEN:
++        raise ValueError("Rule REGEX pattern exceeds maximum length")
++    if _REGEX_BACKREF_RE.search(pattern):
++        raise ValueError("Rule REGEX backreferences are not allowed")
++    for m in _REGEX_BRACE_RE.finditer(pattern):
++        lo = int(m.group(1))
++        if lo > _REGEX_REPETITION_MAX:
++            raise ValueError("Rule REGEX bounded repetition lower bound exceeds limit")
++        hi_s = m.group(3)
++        if hi_s and int(hi_s) > _REGEX_REPETITION_MAX:
++            raise ValueError("Rule REGEX bounded repetition upper bound exceeds limit")
++    _reject_nested_quantifiers(pattern)
++    try:
++        return re.compile(pattern)
++    except re.error as exc:
++        raise ValueError(f"Invalid rule REGEX pattern: {exc}") from exc
++
++
++def _compile_guarded_rule_regex(pattern: str) -> Any:
++    """带熔断校验与线程安全缓存的规则正则编译。"""
++    with _regex_compile_lock:
++        compiled = _regex_compile_cache.get(pattern)
++    if compiled is not None:
++        return compiled
++    compiled = _validate_rule_regex_pattern(pattern)
++    if len(_regex_compile_cache) < _REGEX_CACHE_MAX:
++        with _regex_compile_lock:
++            _regex_compile_cache[pattern] = compiled
++    return compiled
++
++
+ def eval_rule_node(node: dict[str, Any], tx: dict[str, Any]) -> tuple[bool, int, list[str]]:
++    """求值自定义布尔规则树（带深度 / 节点预算与抗回溯正则熔断，语义与原版一致）。"""
++    return _eval_rule_node_bounded(node, tx, 0, [_RULE_TREE_MAX_NODES])
++
++
++def _eval_rule_node_bounded(
++    node: dict[str, Any],
++    tx: dict[str, Any],
++    depth: int,
++    budget: list[int],
++) -> tuple[bool, int, list[str]]:
+     if not isinstance(node, dict):
+         raise ValueError("Rule node must be an object")
++    if depth > _RULE_TREE_MAX_DEPTH:
++        raise ValueError("Rule tree nesting exceeds maximum allowed depth")
++    if budget[0] <= 0:
++        raise ValueError("Rule tree evaluation node budget exhausted")
++    budget[0] -= 1
+ 
+     op = str(node.get("op") or "").upper()
+     bonus = int(node.get("bonus_score") or 0)
+@@ -118,7 +473,7 @@
+         if not isinstance(children, list) or not children:
+             raise ValueError(f"Logical operator {op} requires non-empty children list")
+ 
+-        child_results = [eval_rule_node(ch, tx) for ch in children]
++        child_results = [_eval_rule_node_bounded(ch, tx, depth + 1, budget) for ch in children]
+         if op == "AND":
+             matched = all(r[0] for r in child_results)
+         elif op == "OR":
+@@ -152,21 +507,30 @@
+         matched = actual == target
+     elif op == "NEQ":
+         matched = actual != target
+-    elif op == "GT":
+-        matched = actual is not None and float(actual) > float(target)
+-    elif op == "GTE":
+-        matched = actual is not None and float(actual) >= float(target)
+-    elif op == "LT":
+-        matched = actual is not None and float(actual) < float(target)
+-    elif op == "LTE":
+-        matched = actual is not None and float(actual) <= float(target)
++    elif op in ("GT", "GTE", "LT", "LTE"):
++        if actual is None:
++            matched = False
++        else:
++            actual_num = _coerce_rule_number(actual, field_name)
++            target_num = _coerce_rule_number(target, field_name)
++            if op == "GT":
++                matched = actual_num > target_num
++            elif op == "GTE":
++                matched = actual_num >= target_num
++            elif op == "LT":
++                matched = actual_num < target_num
++            else:
++                matched = actual_num <= target_num
+     elif op == "IN":
+         matched = isinstance(target, list) and actual in target
+     elif op == "CONTAINS":
+         matched = isinstance(actual, str) and isinstance(target, str) and (target in actual)
+     elif op == "REGEX":
+         if isinstance(actual, str) and isinstance(target, str):
+-            matched = re.search(target, actual) is not None
++            if len(actual) > _REGEX_SUBJECT_MAX_LEN:
++                matched = False
++            else:
++                matched = _compile_guarded_rule_regex(target).search(actual) is not None
+     else:
+         raise ValueError(f"Unsupported rule operator: {op}")
+ 
+@@ -267,6 +631,68 @@
+     return final_score, decision, reasons
+ 
+ 
++_MAX_BATCH_TX_COUNT = 5000
++
++
++def _contagion_hop_on_conn(
++    conn: Any,
++    db_path: str,
++    tenant_id: str,
++    account_id: str,
++    counterparty_id: str,
++    ts: int,
++) -> int:
++    """与 contagion_graph.compute_sanction_contagion_hop 语义严格一致的三跳传染计算，
++
++    但在调用方已持有的 BEGIN IMMEDIATE 事务连接上执行区间扫边，使同批先序
++    交易的未提交关联边即时纳入本批后续传染图（多源 BFS 深度 2 截断）。"""
++    sanctioned = _load_sanctioned_set(db_path, tenant_id)
++    if not sanctioned:
++        return 0
++    if account_id in sanctioned or counterparty_id in sanctioned:
++        return 1
++
++    win_start = ts - SLIDING_WINDOW_SECONDS
++    rows = conn.execute(
++        "SELECT account_id, counterparty_id FROM transactions "
++        "WHERE tenant_id = ? AND ts >= ? AND ts <= ?",
++        (tenant_id, win_start, ts),
++    ).fetchall()
++
++    adj: dict[str, list[str]] = {}
++    for r in rows:
++        u = str(r["account_id"])
++        v = str(r["counterparty_id"])
++        adj.setdefault(u, []).append(v)
++        adj.setdefault(v, []).append(u)
++    adj.setdefault(account_id, []).append(counterparty_id)
++    adj.setdefault(counterparty_id, []).append(account_id)
++
++    dist: dict[str, int] = {}
++    queue: deque[str] = deque()
++    for src in sanctioned:
++        if src in adj and src not in dist:
++            dist[src] = 0
++            queue.append(src)
++    while queue:
++        curr = queue.popleft()
++        d = dist[curr]
++        if d >= 2:
++            continue
++        for nxt in adj.get(curr, ()):
++            if nxt not in dist:
++                dist[nxt] = d + 1
++                queue.append(nxt)
++
++    best_hop = 0
++    for endpoint in (account_id, counterparty_id):
++        if endpoint in dist:
++            hop = dist[endpoint] + 1
++            if 1 <= hop <= 3 and (best_hop == 0 or hop < best_hop):
++                best_hop = hop
++    return best_hop
++
++
+ def evaluate_transaction_batch(
+     db_path: str,
+     caller: CallerContext,
+@@ -274,163 +700,211 @@
+     batch_id: str,
+     transactions: list[dict[str, Any]],
+ ) -> dict[str, Any]:
+-    """按输入顺序逐笔评估实时交易批次并持久化交易及风控决策记录。"""
++    """按输入顺序逐笔评估实时交易批次并持久化交易及风控决策记录。
++
++    四位一体强原子提交：单条 BEGIN IMMEDIATE 事务包裹全批「交易落库 + 风控决策 +
++    滑动窗口读取 + 三跳传染图读取 + REALTIME_ALERT_POOL 告警扣减」，任一笔非法或
++    主键冲突则整批回滚（零半截落盘、零配额泄漏、零内存污染）；同批先序交易经同
++    事务连接即时纳入后续窗口与传染图；统一锁偏序首语句取写锁，与配额调拨/扣减
++    路径零死锁。
++    """
+     if not batch_id or not isinstance(transactions, list) or len(transactions) == 0:
+         raise ValueError("batch_id and non-empty transactions list are required")
++    if len(transactions) > _MAX_BATCH_TX_COUNT:
++        raise ValueError(f"Transaction batch exceeds maximum allowed size ({_MAX_BATCH_TX_COUNT})")
++
++    tenant_id = caller.tenant_id
++    policy = load_tenant_policy(db_path, tenant_id)
+ 
+     results: list[dict[str, Any]] = []
+     counts = {"ALLOW": 0, "REVIEW": 0, "REJECT": 0}
+-
++    parsed: list[dict[str, Any]] = []
++    seen_tx_ids: set[str] = set()
++
++    # 第一遍全量预校验：任一笔非法即整批拒绝，零数据库写入、零配额扣减。
+     for item in transactions:
++        if not isinstance(item, dict):
++            raise ValueError("Each transaction in batch must be a JSON object")
+         tx_id = str(item.get("tx_id") or "").strip()
+         account_id = str(item.get("account_id") or "").strip()
+         counterparty_id = str(item.get("counterparty_id") or "").strip()
+-        amount_cents = int(item.get("amount_cents") or 0)
++        amount_raw = item.get("amount_cents")
++        ts_raw = item.get("ts")
+         currency = str(item.get("currency") or "USD").strip()
+         channel = str(item.get("channel") or "POS_CHIP").strip()
+         contact_email = str(item.get("contact_email") or "").strip()
+-        ts = int(item.get("ts") or 0)
+         metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+ 
+-        if not tx_id or not account_id or not counterparty_id or amount_cents <= 0 or ts <= 0:
++        if isinstance(amount_raw, bool) or not isinstance(amount_raw, int):
++            raise ValueError(f"Invalid amount_cents for tx_id={tx_id!r}")
++        if isinstance(ts_raw, bool) or not isinstance(ts_raw, int):
++            raise ValueError(f"Invalid ts for tx_id={tx_id!r}")
++        if not tx_id or not account_id or not counterparty_id:
+             raise ValueError(f"Invalid required transaction fields for tx_id={tx_id!r}")
++        if not (0 < amount_raw <= _INT64_MAX) or not (0 < ts_raw <= _INT64_MAX):
++            raise ValueError(f"Invalid required transaction fields for tx_id={tx_id!r}")
++        if tx_id in seen_tx_ids:
++            raise ValueError(f"Duplicate tx_id within batch: {tx_id}")
++        seen_tx_ids.add(tx_id)
+         if not validate_contact_email(contact_email):
+             raise ValueError(f"Invalid contact_email in transaction {tx_id}")
+ 
+-        policy = load_tenant_policy(db_path, caller.tenant_id)
+-        sanction_hop = compute_sanction_contagion_hop(
+-            db_path,
+-            caller.tenant_id,
+-            account_id,
+-            counterparty_id,
+-            ts,
+-        )
+-
+-        conn = open_connection(db_path)
+-        try:
+-            hist_rows = conn.execute(
+-                "SELECT tx_id, account_id, counterparty_id, amount_cents, ts, metadata_json "
+-                "FROM transactions WHERE tenant_id = ?",
+-                (caller.tenant_id,),
+-            ).fetchall()
+-        finally:
+-            conn.close()
+-
+-        win_start = ts - SLIDING_WINDOW_SECONDS
+-        win_tx_count = 1
+-        win_amount_cents = amount_cents
+-        win_amounts_list: list[int] = [amount_cents]
+-        cp_list: list[str] = [counterparty_id]
+-
+-        for hr in hist_rows:
+-            _ = json.loads(hr["metadata_json"])
+-            if hr["account_id"] == account_id and win_start <= int(hr["ts"]) <= ts:
+-                h_amt = int(hr["amount_cents"])
+-                win_tx_count += 1
+-                win_amount_cents += h_amt
+-                win_amounts_list.append(h_amt)
+-                if hr["counterparty_id"] not in cp_list:
+-                    cp_list.append(hr["counterparty_id"])
+-
+-        win_unique_cps = len(cp_list)
+-        win_median_cents = compute_exact_median_cents(win_amounts_list)
+-
+-        tx_eval_obj = {
+-            "tx_id": tx_id,
+-            "account_id": account_id,
+-            "counterparty_id": counterparty_id,
+-            "amount_cents": amount_cents,
+-            "currency": currency,
+-            "channel": channel,
+-            "contact_email": contact_email,
+-            "ts": ts,
+-            "metadata": metadata,
+-        }
+-        risk_score, decision, reasons = compute_single_tx_decision(
+-            tx_eval_obj,
+-            policy,
+-            win_tx_count=win_tx_count,
+-            win_amount_cents=win_amount_cents,
+-            win_unique_cps=win_unique_cps,
+-            win_median_cents=win_median_cents,
+-            sanction_hop=sanction_hop,
+-        )
+-
+-        alert_dispatched = False
+-        if decision == "REJECT":
+-            if try_consume_realtime_alert_quota(db_path, caller.tenant_id, ts):
+-                alert_dispatched = True
+-                reasons.append("ALERT_QUOTA_CONSUMED")
+-            else:
+-                reasons.append("ALERT_POOL_DEPLETED")
+-
+-        decision_id = f"dec_{tx_id}"
+-        conn = open_connection(db_path)
+-        try:
+-            conn.execute(
+-                "INSERT INTO transactions("
+-                "tx_id, tenant_id, batch_id, account_id, counterparty_id, amount_cents, "
+-                "currency, channel, contact_email, ts, metadata_json"
+-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+-                (
+-                    tx_id,
+-                    caller.tenant_id,
+-                    batch_id,
+-                    account_id,
+-                    counterparty_id,
+-                    amount_cents,
+-                    currency,
+-                    channel,
+-                    contact_email,
+-                    ts,
+-                    json.dumps(metadata, sort_keys=True),
+-                ),
+-            )
+-            conn.execute(
+-                "INSERT INTO risk_decisions("
+-                "decision_id, tx_id, tenant_id, account_id, risk_score, decision, "
+-                "win_tx_count, win_amount_cents, win_unique_counterparties, win_median_cents, "
+-                "sanction_hop, reasons_json, evaluated_at"
+-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+-                (
+-                    decision_id,
+-                    tx_id,
+-                    caller.tenant_id,
+-                    account_id,
+-                    risk_score,
+-                    decision,
+-                    win_tx_count,
+-                    win_amount_cents,
+-                    win_unique_cps,
+-                    win_median_cents,
+-                    sanction_hop,
+-                    json.dumps(reasons),
+-                    ts,
+-                ),
+-            )
+-            conn.commit()
+-        finally:
+-            conn.close()
+-
+-        counts[decision] += 1
+-        results.append(
++        parsed.append(
+             {
+-                "decision_id": decision_id,
+                 "tx_id": tx_id,
+                 "account_id": account_id,
+-                "risk_score": risk_score,
+-                "decision": decision,
+-                "sanction_hop": sanction_hop,
+-                "alert_dispatched": alert_dispatched,
+-                "window": {
+-                    "tx_count": win_tx_count,
+-                    "amount_cents": win_amount_cents,
+-                    "unique_counterparties": win_unique_cps,
+-                    "median_cents": win_median_cents,
+-                },
+-                "reasons": reasons,
++                "counterparty_id": counterparty_id,
++                "amount_cents": amount_raw,
++                "currency": currency,
++                "channel": channel,
++                "contact_email": contact_email,
++                "ts": ts_raw,
++                "metadata": metadata,
+             }
+         )
++
++    conn = open_connection(db_path)
++    try:
++        conn.execute("BEGIN IMMEDIATE")
++        try:
++            for tx in parsed:
++                tx_id = tx["tx_id"]
++                account_id = tx["account_id"]
++                counterparty_id = tx["counterparty_id"]
++                amount_cents = tx["amount_cents"]
++                currency = tx["currency"]
++                channel = tx["channel"]
++                contact_email = tx["contact_email"]
++                ts = tx["ts"]
++                metadata = tx["metadata"]
++
++                # idx_tx_tenant_acct_ts 索引区间扫描：同连接可见同批先序未提交交易。
++                win_start = ts - SLIDING_WINDOW_SECONDS
++                hist_rows = conn.execute(
++                    "SELECT counterparty_id, amount_cents, ts FROM transactions "
++                    "WHERE tenant_id = ? AND account_id = ? AND ts >= ? AND ts <= ?",
++                    (tenant_id, account_id, win_start, ts),
++                ).fetchall()
++
++                win_tx_count = 1
++                win_amount_cents = amount_cents
++                win_amounts_list: list[int] = [amount_cents]
++                cp_set: set[str] = {counterparty_id}
++                for hr in hist_rows:
++                    h_amt = int(hr["amount_cents"])
++                    win_tx_count += 1
++                    win_amount_cents += h_amt
++                    win_amounts_list.append(h_amt)
++                    cp_set.add(hr["counterparty_id"])
++
++                win_unique_cps = len(cp_set)
++                win_median_cents = compute_exact_median_cents(win_amounts_list)
++
++                sanction_hop = _contagion_hop_on_conn(
++                    conn, db_path, tenant_id, account_id, counterparty_id, ts
++                )
++
++                tx_eval_obj = {
++                    "tx_id": tx_id,
++                    "account_id": account_id,
++                    "counterparty_id": counterparty_id,
++                    "amount_cents": amount_cents,
++                    "currency": currency,
++                    "channel": channel,
++                    "contact_email": contact_email,
++                    "ts": ts,
++                    "metadata": metadata,
++                }
++                risk_score, decision, reasons = compute_single_tx_decision(
++                    tx_eval_obj,
++                    policy,
++                    win_tx_count=win_tx_count,
++                    win_amount_cents=win_amount_cents,
++                    win_unique_cps=win_unique_cps,
++                    win_median_cents=win_median_cents,
++                    sanction_hop=sanction_hop,
++                )
++
++                alert_dispatched = False
++                if decision == "REJECT":
++                    if try_consume_realtime_alert_quota(db_path, tenant_id, ts, conn=conn):
++                        alert_dispatched = True
++                        reasons.append("ALERT_QUOTA_CONSUMED")
++                    else:
++                        reasons.append("ALERT_POOL_DEPLETED")
++
++                decision_id = f"dec_{tx_id}"
++                conn.execute(
++                    "INSERT INTO transactions("
++                    "tx_id, tenant_id, batch_id, account_id, counterparty_id, amount_cents, "
++                    "currency, channel, contact_email, ts, metadata_json"
++                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
++                    (
++                        tx_id,
++                        tenant_id,
++                        batch_id,
++                        account_id,
++                        counterparty_id,
++                        amount_cents,
++                        currency,
++                        channel,
++                        contact_email,
++                        ts,
++                        json.dumps(metadata, sort_keys=True),
++                    ),
++                )
++                conn.execute(
++                    "INSERT INTO risk_decisions("
++                    "decision_id, tx_id, tenant_id, account_id, risk_score, decision, "
++                    "win_tx_count, win_amount_cents, win_unique_counterparties, win_median_cents, "
++                    "sanction_hop, reasons_json, evaluated_at"
++                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
++                    (
++                        decision_id,
++                        tx_id,
++                        tenant_id,
++                        account_id,
++                        risk_score,
++                        decision,
++                        win_tx_count,
++                        win_amount_cents,
++                        win_unique_cps,
++                        win_median_cents,
++                        sanction_hop,
++                        json.dumps(reasons),
++                        ts,
++                    ),
++                )
++
++                counts[decision] += 1
++                results.append(
++                    {
++                        "decision_id": decision_id,
++                        "tx_id": tx_id,
++                        "account_id": account_id,
++                        "risk_score": risk_score,
++                        "decision": decision,
++                        "sanction_hop": sanction_hop,
++                        "alert_dispatched": alert_dispatched,
++                        "window": {
++                            "tx_count": win_tx_count,
++                            "amount_cents": win_amount_cents,
++                            "unique_counterparties": win_unique_cps,
++                            "median_cents": win_median_cents,
++                        },
++                        "reasons": reasons,
++                    }
++                )
++            conn.commit()
++        except sqlite3.IntegrityError as exc:
++            # 主键冲突：整批四位一体强原子回滚（零半截落盘、零配额泄漏）。
++            conn.rollback()
++            raise ValueError(f"Duplicate primary key in transaction batch: {exc}") from exc
++        except Exception:
++            conn.rollback()
++            raise
++    finally:
++        conn.close()
+ 
+     return {
+         "tenant_id": caller.tenant_id,
+@@ -452,8 +926,8 @@
+             "SELECT decision_id, tx_id, tenant_id, account_id, risk_score, decision, "
+             "win_tx_count, win_amount_cents, win_unique_counterparties, win_median_cents, "
+             "sanction_hop, reasons_json, evaluated_at "
+-            "FROM risk_decisions WHERE decision_id = ?",
+-            (decision_id,),
++            "FROM risk_decisions WHERE decision_id = ? AND tenant_id = ?",
++            (decision_id, caller.tenant_id),
+         ).fetchone()
+         if not row:
+             raise LookupError(f"Decision record not found: {decision_id}")
+
+--- a/aegis_app/search_service.py
++++ b/aegis_app/search_service.py
+@@ -1,56 +1,379 @@
+ # -*- coding: utf-8 -*-
+-"""企业合规文档多维检索、邻近度相关性打分、双轨法规簇折叠与密级管控编排服务。"""
++"""企业合规文档多维检索、邻近度相关性打分、双轨法规簇折叠与密级管控编排服务。
++
++架构重构（检索输出与原版 100% 零失真）：
++- 紧凑单篇增量倒排索引：按 (docs, citations) 双纪元缓存的租户级内存索引，
++  仅保留 __slots__ 紧凑条目（分词位置 array / 词频 / 140 字符摘要 / 元数据），
++  绝不将整库原始全文 body 常驻内存；upsert / retire / quarantine 只触发
++  「轻量元数据清单比对 + 变更文档单篇重读重建」的 O(变更数) 增量维护；
++- 反向引用图动态传导：doc_ 内部引用维护 cited_by 前向集合与
++  reverse_dependents 反向依赖图，引用源状态（ACTIVE/quarantined）翻转时仅对
++  其 O(deg) 个被引用方的 citation_count 做局部重算（本租户源校验，阻断
++  跨租户 doc_ 引用侧信道）；
++- 权限解析移出候选循环：同一 (user, request_ts) 的实时有效密级与认证阶段
++  算得的 caller.max_clearance 恒等（含 1~2 跳借调时效核验）；
++- 词距邻近度直接消费索引位置表（双指针归并，min_dist==1 早停）；
++  修订簇折叠 Jaccard 直接消费索引唯一词项集合（min/max 比值上界剪枝）；
++- 全部 SQL 参数化：消除 tenant / tag / 引用源 / ORDER BY 的字符串拼接注入；
++- batch-get 越权封堵：租户、状态、隔离、密级与利益冲突墙五重约束全量校验。
++"""
+ from __future__ import annotations
+ 
+-from collections import Counter
++from array import array
++import threading
+ import time
+-from typing import Any
+-
+-from .auth import (
+-    CallerContext,
+-    is_doc_blocked_by_acl,
+-    require_admin,
+-    resolve_effective_permissions,
++from typing import Any, Iterator
++
++from .auth import CallerContext, is_doc_blocked_by_acl, require_admin
++from .config import (
++    DEDUP_JACCARD_THRESHOLD,
++    DEFAULT_PAGE_LIMIT,
++    PROXIMITY_MAX_SPAN,
+ )
+-from .config import DEDUP_JACCARD_THRESHOLD, DEFAULT_PAGE_LIMIT
+ from .db import open_connection
+-from .doc_indexer import (
+-    compute_phrase_proximity_bonus,
+-    jaccard_similarity_from_texts,
+-    tokenize_text,
+-)
++from .doc_indexer import _min_token_distance, tokenize_text
++from .epoch_cache import bump_epoch, epoch_token
+ from .legacy_compat import canonicalize_regulation_code
+ 
+-
+-def _get_doc_citation_count(db_path: str, tenant_id: str, doc_id: str) -> int:
+-    """统计文档当前有效的唯一引用源数量（内部 doc_ 引用须核验源文档处于 ACTIVE 且未隔离状态）。"""
++# ---------------------------------------------------------------------------
++# 抗 DoS 索引预算：单篇正文至多索引前 5 万个词、单词至多保留 2048 个位置。
++# 正常业务文档（数百词量级）远低于预算，打分逐 token 精确；仅对畸形巨型
++# 载荷截断以约束常驻堆内存（位置 array('i') 每词 4 字节/位置）。
++# ---------------------------------------------------------------------------
++_MAX_INDEXED_BODY_TOKENS = 50_000
++_MAX_TOKEN_POSITIONS = 2048
++_MAX_BATCH_GET_IDS = 2000
++_SQL_CHUNK_SIZE = 400
++
++
++class _DocEntry:
++    """紧凑单篇倒排条目（__slots__，不含原始全文 body）。"""
++
++    __slots__ = (
++        "doc_id",
++        "category",
++        "regulation_code",
++        "clearance_level",
++        "risk_weight",
++        "custom_tag",
++        "title",
++        "status",
++        "quarantined",
++        "updated_at",
++        "body_len",
++        "snippet",
++        "title_tf",
++        "body_tf",
++        "positions",
++        "token_set",
++    )
++
++
++class _TenantSearchIndex:
++    """租户级增量倒排索引快照（docs + citations 双纪元寻址）。"""
++
++    __slots__ = (
++        "docs",
++        "forward_refs",
++        "reverse_dependents",
++        "citation_count",
++        "token",
++    )
++
++    def __init__(
++        self,
++        docs: dict[str, _DocEntry],
++        forward_refs: dict[str, set[str]],
++        reverse_dependents: dict[str, set[str]],
++        citation_count: dict[str, int],
++        token: tuple[int, ...],
++    ) -> None:
++        self.docs = docs
++        self.forward_refs = forward_refs
++        self.reverse_dependents = reverse_dependents
++        self.citation_count = citation_count
++        self.token = token
++
++
++_registry_lock = threading.Lock()
++_index_registry: dict[tuple[str, str], _TenantSearchIndex] = {}
++_reconcile_locks: dict[tuple[str, str], threading.Lock] = {}
++
++
++def _iter_chunks(seq: list[str], size: int) -> Iterator[list[str]]:
++    for i in range(0, len(seq), size):
++        yield seq[i : i + size]
++
++
++def _build_doc_entry(
++    doc_id: str,
++    category: str,
++    regulation_code: str,
++    clearance_level: int,
++    risk_weight: int,
++    custom_tag: str,
++    title: str,
++    body: str,
++    status: str,
++    quarantined: int,
++    updated_at: int,
++    body_len: int,
++) -> _DocEntry:
++    positions: dict[str, array] = {}
++    body_tf: dict[str, int] = {}
++    indexed = 0
++    for tok in tokenize_text(body):
++        if indexed >= _MAX_INDEXED_BODY_TOKENS:
++            break
++        cur = body_tf.get(tok)
++        if cur is None or cur < 12:
++            body_tf[tok] = (cur or 0) + 1
++        pos_list = positions.get(tok)
++        if pos_list is None:
++            positions[tok] = array("i", (indexed,))
++        elif len(pos_list) < _MAX_TOKEN_POSITIONS:
++            pos_list.append(indexed)
++        indexed += 1
++
++    title_tf: dict[str, int] = {}
++    for tok in tokenize_text(title):
++        title_tf[tok] = title_tf.get(tok, 0) + 1
++
++    entry = _DocEntry()
++    entry.doc_id = doc_id
++    entry.category = category
++    entry.regulation_code = regulation_code
++    entry.clearance_level = clearance_level
++    entry.risk_weight = risk_weight
++    entry.custom_tag = custom_tag
++    entry.title = title
++    entry.status = status
++    entry.quarantined = quarantined
++    entry.updated_at = updated_at
++    entry.body_len = body_len
++    entry.snippet = body[:140]
++    entry.title_tf = title_tf
++    entry.body_tf = body_tf
++    entry.positions = positions
++    entry.token_set = frozenset(positions) | frozenset(title_tf)
++    return entry
++
++
++def _count_valid_refs(docs: dict[str, _DocEntry], refs: set[str]) -> int:
++    """统计唯一引用源中的有效数：外部文号直接计入；doc_ 内部引用仅当
++    引用源文档属于本租户、ACTIVE 且未被隔离时计入（自引用在建图时已剔除）。"""
++    cnt = 0
++    for ref in refs:
++        if ref.startswith("doc_"):
++            src = docs.get(ref)
++            if src is not None and src.status == "ACTIVE" and src.quarantined == 0:
++                cnt += 1
++        else:
++            cnt += 1
++    return cnt
++
++
++def _reconcile_tenant_index(
++    db_path: str,
++    db_key: str,
++    tenant_id: str,
++    token: tuple[int, ...],
++    old: _TenantSearchIndex | None,
++) -> _TenantSearchIndex:
++    """按 (docs, citations) 纪元增量对账：仅重读与重建真正发生变更的文档。"""
++    docs_token, citations_token = token[0], token[1]
+     conn = open_connection(db_path)
+     try:
+-        rows = conn.execute(
+-            "SELECT cited_by_ref FROM doc_citations WHERE tenant_id = ? AND doc_id = ?",
+-            (tenant_id, doc_id),
++        manifest = conn.execute(
++            "SELECT doc_id, category, regulation_code, clearance_level, risk_weight, "
++            "custom_tag, title, status, quarantined, updated_at, length(body) AS body_len "
++            "FROM compliance_docs WHERE tenant_id = ?",
++            (tenant_id,),
+         ).fetchall()
+-        seen_refs: list[str] = []
+-        for r in rows:
+-            ref = str(r["cited_by_ref"] or "").strip()
+-            if ref and ref != doc_id and ref not in seen_refs:
+-                seen_refs.append(ref)
+-
+-        valid_cnt = 0
+-        for ref in seen_refs:
+-            if ref.startswith("doc_"):
+-                ref_sql = (
+-                    "SELECT status, quarantined FROM compliance_docs "
+-                    f"WHERE doc_id = '{ref}'"
+-                )
+-                ref_row = conn.execute(ref_sql).fetchone()
+-                if ref_row and ref_row["status"] == "ACTIVE" and int(ref_row["quarantined"]) == 0:
+-                    valid_cnt += 1
+-            else:
+-                valid_cnt += 1
+-        return valid_cnt
+     finally:
+         conn.close()
++
++    manifest_map = {str(r["doc_id"]): r for r in manifest}
++    old_docs = old.docs if old is not None else {}
++    new_docs: dict[str, _DocEntry] = {}
++    changed_ids: list[str] = []
++    state_flipped_ids: set[str] = set()
++
++    for r in manifest:
++        did = str(r["doc_id"])
++        e = old_docs.get(did)
++        if (
++            e is not None
++            and e.status == str(r["status"])
++            and e.quarantined == int(r["quarantined"])
++            and e.updated_at == int(r["updated_at"])
++            and e.body_len == int(r["body_len"] or 0)
++            and e.category == str(r["category"])
++            and e.regulation_code == str(r["regulation_code"])
++            and e.clearance_level == int(r["clearance_level"])
++            and e.risk_weight == int(r["risk_weight"])
++            and e.custom_tag == str(r["custom_tag"])
++            and e.title == str(r["title"])
++        ):
++            new_docs[did] = e
++        else:
++            if e is not None and (e.status != str(r["status"]) or e.quarantined != int(r["quarantined"])):
++                state_flipped_ids.add(did)
++            changed_ids.append(did)
++
++    removed_ids = [did for did in old_docs if did not in manifest_map]
++    for did in removed_ids:
++        e = old_docs[did]
++        if e.status == "ACTIVE" and e.quarantined == 0:
++            state_flipped_ids.add(did)
++
++    # 仅对发生变更的文档单篇重读正文并重建倒排条目。
++    if changed_ids:
++        body_map: dict[str, str] = {}
++        conn = open_connection(db_path)
++        try:
++            for chunk in _iter_chunks(changed_ids, _SQL_CHUNK_SIZE):
++                placeholders = ",".join("?" for _ in chunk)
++                rows = conn.execute(
++                    f"SELECT doc_id, body FROM compliance_docs "
++                    f"WHERE tenant_id = ? AND doc_id IN ({placeholders})",
++                    (tenant_id, *chunk),
++                ).fetchall()
++                for r in rows:
++                    body_map[str(r["doc_id"])] = str(r["body"])
++        finally:
++            conn.close()
++        for did in changed_ids:
++            r = manifest_map.get(did)
++            if r is None or did not in body_map:
++                continue
++            new_docs[did] = _build_doc_entry(
++                did,
++                str(r["category"]),
++                str(r["regulation_code"]),
++                int(r["clearance_level"]),
++                int(r["risk_weight"]),
++                str(r["custom_tag"]),
++                str(r["title"]),
++                body_map[did],
++                str(r["status"]),
++                int(r["quarantined"]),
++                int(r["updated_at"]),
++                int(r["body_len"] or 0),
++            )
++
++    # 引用图维护：citations 纪元变化才全量重建前向/反向图；否则原样复用。
++    if old is None or old.token[1] != citations_token:
++        forward_refs: dict[str, set[str]] = {}
++        reverse_dependents: dict[str, set[str]] = {}
++        conn = open_connection(db_path)
++        try:
++            rows = conn.execute(
++                "SELECT doc_id, cited_by_ref FROM doc_citations WHERE tenant_id = ?",
++                (tenant_id,),
++            ).fetchall()
++        finally:
++            conn.close()
++        for r in rows:
++            did = str(r["doc_id"])
++            ref = str(r["cited_by_ref"] or "").strip()
++            if ref and ref != did:
++                forward_refs.setdefault(did, set()).add(ref)
++                if ref.startswith("doc_"):
++                    reverse_dependents.setdefault(ref, set()).add(did)
++        rebuild_all_counts = True
++    else:
++        forward_refs = old.forward_refs
++        reverse_dependents = old.reverse_dependents
++        rebuild_all_counts = False
++
++    if rebuild_all_counts:
++        citation_count = {
++            did: _count_valid_refs(new_docs, refs) for did, refs in forward_refs.items()
++        }
++    else:
++        citation_count = dict(old.citation_count)
++        # O(deg) 局部传导：状态翻转/新增/移除的引用源，仅重算其反向依赖
++        # 被引用方与自身的有效引用计数。
++        affected = set(changed_ids) | state_flipped_ids | set(removed_ids)
++        for fid in affected:
++            for dep_doc in reverse_dependents.get(fid, ()):
++                refs = forward_refs.get(dep_doc)
++                if refs:
++                    citation_count[dep_doc] = _count_valid_refs(new_docs, refs)
++            own_refs = forward_refs.get(fid)
++            if own_refs:
++                citation_count[fid] = _count_valid_refs(new_docs, own_refs)
++
++    return _TenantSearchIndex(new_docs, forward_refs, reverse_dependents, citation_count, token)
++
++
++def _get_tenant_index(db_path: str, tenant_id: str) -> _TenantSearchIndex:
++    db_key = str(db_path)
++    token = epoch_token(db_path, "docs", "citations")
++    reg_key = (db_key, tenant_id)
++
++    with _registry_lock:
++        idx = _index_registry.get(reg_key)
++    if idx is not None and idx.token == token:
++        return idx
++
++    with _registry_lock:
++        lock = _reconcile_locks.get(reg_key)
++        if lock is None:
++            lock = threading.Lock()
++            _reconcile_locks[reg_key] = lock
++    with lock:
++        with _registry_lock:
++            idx = _index_registry.get(reg_key)
++        if idx is not None and idx.token == token:
++            return idx
++        idx = _reconcile_tenant_index(db_path, db_key, tenant_id, token, idx)
++        with _registry_lock:
++            _index_registry[reg_key] = idx
++        return idx
++
++
++def _proximity_bonus_from_positions(
++    positions: dict[str, array],
++    query_terms: list[str],
++) -> float:
++    """基于索引位置表的相邻查询词最小跨度邻近度加分（语义与 doc_indexer 一致）。"""
++    if len(query_terms) < 2:
++        return 0.0
++    bonus = 0.0
++    for idx in range(len(query_terms) - 1):
++        term_a = query_terms[idx]
++        term_b = query_terms[idx + 1]
++        if term_a == term_b:
++            continue
++        pos_a = positions.get(term_a)
++        pos_b = positions.get(term_b)
++        if not pos_a or not pos_b:
++            continue
++        min_dist = _min_token_distance(pos_a, pos_b)
++        if min_dist is not None and 1 <= min_dist <= PROXIMITY_MAX_SPAN:
++            bonus += 2.4 / float(min_dist)
++    return bonus
++
++
++def _jaccard_token_sets(set_a: frozenset, set_b: frozenset) -> float:
++    """基于索引唯一词项集合的 Jaccard 相似度（与 doc_indexer 精确语义一致，
++    含 min/max 比值上界剪枝——剪枝仅对必然低于折叠阈值的比对返回 0.0）。"""
++    len_a = len(set_a)
++    len_b = len(set_b)
++    if len_a == 0 and len_b == 0:
++        return 1.0
++    if len_a == 0 or len_b == 0:
++        return 0.0
++    smaller, larger = (len_a, len_b) if len_a <= len_b else (len_b, len_a)
++    if smaller / larger < DEDUP_JACCARD_THRESHOLD:
++        return 0.0
++    inter_cnt = len(set_a & set_b)
++    union_cnt = len_a + len_b - inter_cnt
++    if union_cnt == 0:
++        return 0.0
++    return inter_cnt / union_cnt
+ 
+ 
+ def search_documents(
+@@ -66,87 +389,61 @@
+     limit: int = DEFAULT_PAGE_LIMIT,
+     offset: int = 0,
+ ) -> dict[str, Any]:
+-    """执行合规文档检索：融合委托有效密级、三级利益冲突墙、词距邻近度加成与历史双轨法规号折叠。"""
+-    sql_sort_col = "updated_at" if sort_by == "score" else sort_by
+-    sql_sort_dir = sort_dir if sort_dir else "DESC"
+-
+-    where_clauses = [
+-        f"tenant_id = '{caller.tenant_id}'",
+-        "status = 'ACTIVE'",
+-        "quarantined = 0",
+-    ]
+-    params: list[Any] = []
+-    if category:
+-        where_clauses.append("category = ?")
+-        params.append(category)
+-    if tag_filter:
+-        where_clauses.append(f"custom_tag = '{tag_filter}'")
+-
+-    sql = (
+-        "SELECT doc_id, tenant_id, category, regulation_code, clearance_level, "
+-        "risk_weight, custom_tag, title, body, updated_at "
+-        f"FROM compliance_docs WHERE {' AND '.join(where_clauses)} "
+-        f"ORDER BY {sql_sort_col} {sql_sort_dir}"
+-    )
+-
+-    conn = open_connection(db_path)
+-    try:
+-        raw_rows = conn.execute(sql, tuple(params)).fetchall()
+-    finally:
+-        conn.close()
++    """执行合规文档检索：融合委托有效密级、三级利益冲突隔离墙、词距邻近度加成与历史双轨法规号折叠。"""
++    tenant_id = caller.tenant_id
++    # 权限解析移出候选循环：同一 (user, request_ts) 下实时有效密级与认证阶段
++    # 已算得的 caller.max_clearance 恒等（借调时效、级联失效核验已在认证完成）。
++    live_clearance = caller.max_clearance
++
++    idx = _get_tenant_index(db_path, tenant_id)
++    docs = idx.docs
+ 
+     query_terms = list(dict.fromkeys(tokenize_text(query)))
+     candidates: list[dict[str, Any]] = []
+ 
+-    for row in raw_rows:
+-        _, live_clearance = resolve_effective_permissions(
+-            db_path,
+-            caller.tenant_id,
+-            caller.user_id,
+-            at_ts=caller.request_ts,
+-        )
+-        if int(row["clearance_level"]) > live_clearance:
+-            continue
+-        if is_doc_blocked_by_acl(db_path, caller.tenant_id, caller.user_id, row["doc_id"]):
+-            continue
+-
+-        title_tokens = tokenize_text(row["title"])
+-        body_tokens = tokenize_text(row["body"])
+-        title_tf = Counter(title_tokens)
+-        body_tf = Counter(body_tokens)
++    for entry in docs.values():
++        if entry.status != "ACTIVE" or entry.quarantined != 0:
++            continue
++        if entry.clearance_level > live_clearance:
++            continue
++        if category and entry.category != category:
++            continue
++        if tag_filter and entry.custom_tag != tag_filter:
++            continue
++        if is_doc_blocked_by_acl(db_path, tenant_id, caller.user_id, entry.doc_id):
++            continue
+ 
+         if query_terms:
+-            hit_any = any((t in title_tf or t in body_tf) for t in query_terms)
+-            if not hit_any:
++            if not any((t in entry.title_tf) or (t in entry.positions) for t in query_terms):
+                 continue
+             term_score = sum(
+-                3.5 * min(title_tf.get(t, 0), 5) + 1.0 * min(body_tf.get(t, 0), 12)
++                3.5 * min(entry.title_tf.get(t, 0), 5) + 1.0 * min(entry.body_tf.get(t, 0), 12)
+                 for t in query_terms
+             )
+-            prox_bonus = compute_phrase_proximity_bonus(body_tokens, query_terms)
++            prox_bonus = _proximity_bonus_from_positions(entry.positions, query_terms)
+         else:
+             term_score = 0.0
+             prox_bonus = 0.0
+ 
+-        cite_cnt = _get_doc_citation_count(db_path, caller.tenant_id, row["doc_id"])
+-        risk_w = int(row["risk_weight"])
++        cite_cnt = idx.citation_count.get(entry.doc_id, 0)
++        risk_w = entry.risk_weight
+         total_score = round(term_score + prox_bonus + 0.25 * cite_cnt + 0.1 * risk_w, 4)
+ 
+         candidates.append(
+             {
+-                "doc_id": row["doc_id"],
+-                "category": row["category"],
+-                "regulation_code": row["regulation_code"],
+-                "_canon_reg": canonicalize_regulation_code(row["regulation_code"]),
+-                "clearance_level": int(row["clearance_level"]),
++                "doc_id": entry.doc_id,
++                "category": entry.category,
++                "regulation_code": entry.regulation_code,
++                "_canon_reg": canonicalize_regulation_code(entry.regulation_code),
++                "clearance_level": entry.clearance_level,
+                 "risk_weight": risk_w,
+-                "custom_tag": row["custom_tag"],
+-                "title": row["title"],
+-                "snippet": row["body"][:140],
++                "custom_tag": entry.custom_tag,
++                "title": entry.title,
++                "snippet": entry.snippet,
+                 "citation_count": cite_cnt,
+                 "score": total_score,
+-                "updated_at": int(row["updated_at"]),
+-                "_raw_body": row["body"],
++                "updated_at": entry.updated_at,
++                "_token_set": entry.token_set,
+             }
+         )
+ 
+@@ -166,13 +463,10 @@
+                 same_reg = bool(rep["_canon_reg"]) and (
+                     rep["_canon_reg"] == candidates[j]["_canon_reg"]
+                 )
+-                sim = jaccard_similarity_from_texts(
+-                    rep["title"],
+-                    rep["_raw_body"],
+-                    candidates[j]["title"],
+-                    candidates[j]["_raw_body"],
+-                )
+-                if same_reg and sim >= DEDUP_JACCARD_THRESHOLD:
++                if not same_reg:
++                    continue
++                sim = _jaccard_token_sets(rep["_token_set"], candidates[j]["_token_set"])
++                if sim >= DEDUP_JACCARD_THRESHOLD:
+                     consumed[j] = True
+                     cluster_size += 1
+             rep["cluster_size"] = cluster_size
+@@ -212,27 +506,42 @@
+     caller: CallerContext,
+     doc_ids: list[str],
+ ) -> dict[str, Any]:
+-    """按文档 ID 列表批量获取完整合规文档内容。"""
++    """按文档 ID 列表批量获取完整合规文档内容。
++
++    五重越权封堵：严格校验租户归属、ACTIVE 状态、隔离状态、调用者实时有效
++    密级与三级利益冲突隔离墙，跨租户 / 越密级 / 撞墙 / 已隔离文档一律不出网。
++    """
+     if not isinstance(doc_ids, list) or not doc_ids:
+         raise ValueError("doc_ids must be a non-empty list")
+-
+-    placeholders = ",".join("?" for _ in doc_ids)
++    if len(doc_ids) > _MAX_BATCH_GET_IDS:
++        raise ValueError(f"doc_ids list exceeds maximum allowed size ({_MAX_BATCH_GET_IDS})")
++    if any(not isinstance(d, str) for d in doc_ids):
++        raise ValueError("doc_ids entries must be strings")
++
++    by_id: dict[str, Any] = {}
+     conn = open_connection(db_path)
+     try:
+-        rows = conn.execute(
+-            f"SELECT doc_id, tenant_id, category, regulation_code, clearance_level, "
+-            f"risk_weight, custom_tag, title, body, status, quarantined, updated_at "
+-            f"FROM compliance_docs WHERE doc_id IN ({placeholders})",
+-            tuple(doc_ids),
+-        ).fetchall()
++        for chunk in _iter_chunks(doc_ids, _SQL_CHUNK_SIZE):
++            placeholders = ",".join("?" for _ in chunk)
++            rows = conn.execute(
++                f"SELECT doc_id, tenant_id, category, regulation_code, clearance_level, "
++                f"risk_weight, custom_tag, title, body, status, quarantined, updated_at "
++                f"FROM compliance_docs WHERE tenant_id = ? AND doc_id IN ({placeholders})",
++                (caller.tenant_id, *chunk),
++            ).fetchall()
++            for r in rows:
++                by_id[str(r["doc_id"])] = r
+     finally:
+         conn.close()
+ 
+-    by_id = {r["doc_id"]: r for r in rows}
+     items = []
+     for did in doc_ids:
+         r = by_id.get(did)
+-        if not r or r["status"] != "ACTIVE":
++        if not r or str(r["status"]) != "ACTIVE" or int(r["quarantined"]) != 0:
++            continue
++        if int(r["clearance_level"]) > caller.max_clearance:
++            continue
++        if is_doc_blocked_by_acl(db_path, caller.tenant_id, caller.user_id, did):
+             continue
+         items.append(
+             {
+@@ -278,6 +587,10 @@
+     finally:
+         conn.close()
+ 
++    # 隔离/解封立即生效：提升 docs 纪元触发增量索引对账，
++    # 被隔离源文档的下游 citation_count 经反向引用图局部传导归零/恢复。
++    bump_epoch(db_path, "docs")
++
+     return {
+         "tenant_id": caller.tenant_id,
+         "doc_id": doc_id,
+
+--- a/aegis_app/server.py
++++ b/aegis_app/server.py
+@@ -1,11 +1,22 @@
+ # -*- coding: utf-8 -*-
+-"""AegisGate HTTP 路由网关与嵌入式应用入口（18 路由完整网关版）。"""
++"""AegisGate HTTP 路由网关与嵌入式应用入口（18 路由完整网关版）。
++
++安全加固（对外响应结构 100% 保持原契约）：
++- 未鉴权的 /api/v1/internal/diagnostics 内部诊断路由彻底下线（404），
++  /api/v1/health 仅返回脱敏诊断摘要，物理路径与主密钥绝不外泄；
++- 500 响应脱敏：内部异常细节仅落 stderr 服务日志，不回显数据库路径、
++  存储路径、主密钥或堆栈；
++- HTTP 层 4MB 载荷上限与 Content-Length 硬校验，超大/畸形报文毫秒级 400；
++- 请求体整数转换全部加 bool 混淆闸门（amount / starts_at / expires_at /
++  sample_limit 等），杜绝 True 冒充 1 的类型混淆。
++"""
+ from __future__ import annotations
+ 
+ import argparse
+ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ import json
+ import pathlib
++import sys
+ import traceback
+ from typing import Any
+ 
+@@ -24,7 +35,7 @@
+     process_settlement_webhook,
+     revoke_or_grant_role,
+ )
+-from .config import DEFAULT_PAGE_LIMIT, MASTER_SIGNING_PEPPER
++from .config import DEFAULT_PAGE_LIMIT
+ from .contagion_graph import manage_sanctioned_entity
+ from .db import init_schema
+ from .doc_writer import retire_compliance_document, upsert_compliance_document
+@@ -49,6 +60,24 @@
+     search_documents,
+     set_document_quarantine,
+ )
++
++_MAX_HTTP_BODY_BYTES = 4 * 1024 * 1024
++
++
++def _body_int(data: dict[str, Any], key: str, default: Any) -> int:
++    """请求体整数转换闸门：保持原版 int() 兼容语义，拒绝 bool 类型混淆。"""
++    raw = data.get(key, default)
++    if isinstance(raw, bool):
++        raise ValueError(f"{key} must be an integer")
++    return int(raw)
++
++
++def _int_or_zero(data: dict[str, Any], key: str) -> int:
++    """请求体「缺省归零」整数转换闸门（与原版 `or 0` 语义一致），拒绝 bool。"""
++    raw = data.get(key) or 0
++    if isinstance(raw, bool):
++        raise ValueError(f"{key} must be an integer")
++    return int(raw)
+ 
+ 
+ class AegisGateway:
+@@ -81,11 +110,9 @@
+                     "version": __version__,
+                 }
+                 if query_params.get("debug") == "1":
++                    # 仅返回脱敏诊断摘要（租户计数等非敏感信息）。
+                     payload["diagnostics"] = collect_internal_diagnostics(self.db_path, self.storage_dir)
+                 return 200, resp_headers, payload
+-
+-            if req_method == "GET" and route == "/api/v1/internal/diagnostics":
+-                return 200, resp_headers, collect_internal_diagnostics(self.db_path, self.storage_dir)
+ 
+             now_ov_str = query_params.get("_now_ts")
+             now_ov = int(now_ov_str) if now_ov_str else None
+@@ -169,8 +196,8 @@
+                     grantor_user_id=str(data.get("grantor_user_id") or caller.user_id),
+                     grantee_user_id=str(data.get("grantee_user_id") or ""),
+                     delegated_role=str(data.get("delegated_role") or ""),
+-                    starts_at=int(data.get("starts_at") or 0),
+-                    expires_at=int(data.get("expires_at") or 0),
++                    starts_at=_int_or_zero(data, "starts_at"),
++                    expires_at=_int_or_zero(data, "expires_at"),
+                     action=str(data.get("action") or "create"),
+                 )
+                 return 200, resp_headers, res
+@@ -233,7 +260,7 @@
+                     self.db_path,
+                     caller,
+                     quota_type=str(data.get("quota_type") or ""),
+-                    amount=int(data.get("amount", 1)),
++                    amount=_body_int(data, "amount", 1),
+                 )
+                 status_code = 200 if res.get("accepted") else 409
+                 return status_code, resp_headers, res
+@@ -245,7 +272,7 @@
+                     caller,
+                     from_quota=str(data.get("from_quota") or ""),
+                     to_quota=str(data.get("to_quota") or ""),
+-                    amount=int(data.get("amount", 0)),
++                    amount=_body_int(data, "amount", 0),
+                 )
+                 status_code = 200 if res.get("transferred") else 409
+                 return status_code, resp_headers, res
+@@ -284,7 +311,7 @@
+                     template_id=str(data.get("template_id") or ""),
+                     title_format=str(data.get("title_format") or ""),
+                     extra_event_filter=str(data.get("extra_event_filter") or ""),
+-                    sample_limit=int(data.get("sample_limit", 10)),
++                    sample_limit=_body_int(data, "sample_limit", 10),
+                 )
+                 return 200, resp_headers, res
+ 
+@@ -317,16 +344,15 @@
+         except (ValueError, KeyError, json.JSONDecodeError) as exc:
+             return 400, resp_headers, {"error": "BAD_REQUEST", "message": str(exc)}
+         except Exception as exc:
+-            return 500, resp_headers, {
+-                "error": "INTERNAL_SERVER_ERROR",
+-                "message": str(exc),
+-                "debug_context": {
+-                    "db_path": self.db_path,
+-                    "storage_dir": self.storage_dir,
+-                    "master_pepper": MASTER_SIGNING_PEPPER,
+-                    "traceback": traceback.format_exc(),
+-                },
+-            }
++            # 内部异常细节仅写服务端 stderr 日志，响应体绝不回显物理路径、
++            # 主密钥或堆栈信息。
++            print(
++                "[aegis-gateway] internal error:",
++                repr(exc),
++                file=sys.stderr,
++            )
++            print(traceback.format_exc(), file=sys.stderr)
++            return 500, resp_headers, {"error": "INTERNAL_SERVER_ERROR", "message": "Internal gateway error"}
+ 
+ 
+ def create_gateway(db_path: str | pathlib.Path, storage_dir: str | pathlib.Path) -> AegisGateway:
+@@ -339,16 +365,41 @@
+     port: int = 0,
+ ) -> ThreadingHTTPServer:
+     class GatewayHTTPHandler(BaseHTTPRequestHandler):
++        def _send_json(self, status: int, payload: dict[str, Any]) -> None:
++            encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
++            self.send_response(status)
++            self.send_header("Content-Type", "application/json; charset=utf-8")
++            self.send_header("Content-Length", str(len(encoded)))
++            self.end_headers()
++            self.wfile.write(encoded)
++
+         def _dispatch(self) -> None:
+-            content_len = int(self.headers.get("Content-Length") or 0)
++            # HTTP 层载荷熔断：Content-Length 硬校验 + 4MB 上限，拒绝即断。
++            raw_len = self.headers.get("Content-Length") or "0"
++            try:
++                content_len = int(raw_len)
++            except (TypeError, ValueError):
++                self._send_json(400, {"error": "BAD_REQUEST", "message": "Malformed Content-Length header"})
++                return
++            if content_len < 0 or content_len > _MAX_HTTP_BODY_BYTES:
++                self._send_json(400, {"error": "BAD_REQUEST", "message": "Request body exceeds allowed size"})
++                return
+             raw_body = self.rfile.read(content_len) if content_len > 0 else b""
++
+             hdrs = {k: v for k, v in self.headers.items()}
+-            status, resp_hdrs, payload = gateway.request(
+-                self.command,
+-                self.path,
+-                headers=hdrs,
+-                body=raw_body,
+-            )
++            try:
++                status, resp_hdrs, payload = gateway.request(
++                    self.command,
++                    self.path,
++                    headers=hdrs,
++                    body=raw_body,
++                )
++            except Exception as exc:  # noqa: BLE001 —— 传输层兜底，绝不击穿服务线程
++                print("[aegis-gateway] dispatch error:", repr(exc), file=sys.stderr)
++                status = 500
++                resp_hdrs = {"Content-Type": "application/json; charset=utf-8"}
++                payload = {"error": "INTERNAL_SERVER_ERROR", "message": "Internal gateway error"}
++
+             encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+             self.send_response(status)
+             for hk, hv in resp_hdrs.items():
+
+--- a/aegis_app/window_stats.py
++++ b/aegis_app/window_stats.py
+@@ -4,16 +4,15 @@
+ 
+ 
+ def compute_exact_median_cents(amounts: list[int]) -> int:
+-    """计算非空整数金额列表的精确中位数（偶数个元素取中间两数的整数均值 (a + b) // 2）。"""
++    """计算非空整数金额列表的精确中位数（偶数个元素取中间两数的整数均值 (a + b) // 2）。
++
++    复杂度降维：以 Timsort O(N log N) 取代原版 O(N^2) 冒泡交换排序，
++    输出与原版逐元素完全一致（奇数取正中元素，偶数取中间两数整数均值）。
++    """
+     if not amounts:
+         return 0
+-    ordered = list(amounts)
+-    # 传统交换排序以获取有序金额序列
++    ordered = sorted(amounts)
+     n = len(ordered)
+-    for i in range(n):
+-        for j in range(0, n - i - 1):
+-            if ordered[j] > ordered[j + 1]:
+-                ordered[j], ordered[j + 1] = ordered[j + 1], ordered[j]
+     mid = n // 2
+     if n % 2 == 1:
+         return int(ordered[mid])

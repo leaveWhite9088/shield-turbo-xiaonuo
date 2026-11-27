@@ -1,0 +1,4651 @@
+--- a/aegis_app/acl_wall.py
++++ b/aegis_app/acl_wall.py
+@@ -1,5 +1,5 @@
+ # -*- coding: utf-8 -*-
+-"""三级优先级利益冲突隔离墙（Chinese Wall）裁决引擎。
++"""三级优先级利益冲突隔离墙（Chinese Wall）裁决引擎（独立 ACL 纪元缓存版）。
+ 
+ 裁决优先级规则（从高到低）：
+ 1. 个人显式豁免（subject_type='USER', effect='ALLOW'）—— 最高优先级直接放行；
+@@ -13,66 +13,90 @@
+ import time
+ from typing import Any
+ 
+-from .db import open_connection
++from .state import GatewayState, get_gateway_state
++
++
++class _TenantAclCache:
++    __slots__ = ("epoch", "org_parents", "rules_by_doc")
++
++    def __init__(self, epoch: int, org_parents: dict[str, str | None], rules_by_doc: dict[str, list[tuple[str, str, str]]]) -> None:
++        self.epoch = epoch
++        self.org_parents = org_parents
++        self.rules_by_doc = rules_by_doc
++
++
++def _get_acl_cache(gw_state: GatewayState, tenant_id: str) -> _TenantAclCache:
++    t_state = gw_state.tenant(tenant_id)
++    cache = t_state.acl_cache
++    if cache is not None and cache.epoch == t_state.acl_epoch:
++        return cache
++    with t_state.acl_lock:
++        cache = t_state.acl_cache
++        if cache is not None and cache.epoch == t_state.acl_epoch:
++            return cache
++        epoch = t_state.acl_epoch
++        with gw_state.pool.borrow() as conn:
++            org_rows = conn.execute(
++                "SELECT node_id, parent_node_id FROM org_nodes WHERE tenant_id = ?",
++                (tenant_id,),
++            ).fetchall()
++            acl_rows = conn.execute(
++                "SELECT doc_id, subject_type, subject_id, effect FROM doc_acl_rules "
++                "WHERE tenant_id = ? AND active = 1",
++                (tenant_id,),
++            ).fetchall()
++        org_parents = {r["node_id"]: r["parent_node_id"] for r in org_rows}
++        rules_by_doc: dict[str, list[tuple[str, str, str]]] = {}
++        for r in acl_rows:
++            rules_by_doc.setdefault(r["doc_id"], []).append(
++                (r["subject_type"], r["subject_id"], str(r["effect"]).upper())
++            )
++        cache = _TenantAclCache(epoch, org_parents, rules_by_doc)
++        t_state.acl_cache = cache
++        return cache
++
++
++def get_org_lineage_from_map(org_parents: dict[str, str | None], start_node_id: str) -> list[str]:
++    lineage: list[str] = []
++    curr: str | None = start_node_id
++    visited: set[str] = set()
++    while curr and curr not in visited:
++        visited.add(curr)
++        lineage.append(curr)
++        curr = org_parents.get(curr)
++    return lineage
+ 
+ 
+ def get_org_lineage(db_path: str, tenant_id: str, start_node_id: str) -> list[str]:
+     """按由近及远（当前部门 -> 父部门 -> 总部）顺序返回组织节点链。"""
+-    lineage: list[str] = []
+-    curr = start_node_id
+-    visited: set[str] = set()
+-    while curr and curr not in visited:
+-        visited.add(curr)
+-        lineage.append(curr)
+-        conn = open_connection(db_path)
+-        try:
+-            row = conn.execute(
+-                "SELECT parent_node_id FROM org_nodes WHERE tenant_id = ? AND node_id = ?",
+-                (tenant_id, curr),
+-            ).fetchone()
+-            curr = row["parent_node_id"] if row else None
+-        finally:
+-            conn.close()
+-    return lineage
++    gw_state = get_gateway_state(db_path)
++    cache = _get_acl_cache(gw_state, tenant_id)
++    return get_org_lineage_from_map(cache.org_parents, start_node_id)
+ 
+ 
+-def is_doc_blocked_by_wall(db_path: str, tenant_id: str, user_id: str, doc_id: str) -> bool:
+-    """按三级优先级判定指定操作员是否被利益冲突隔离墙禁止访问目标文档。"""
+-    conn = open_connection(db_path)
+-    try:
+-        u_row = conn.execute(
+-            "SELECT org_node_id FROM users WHERE tenant_id = ? AND user_id = ? AND active = 1",
+-            (tenant_id, user_id),
+-        ).fetchone()
+-        if not u_row:
+-            return True
++def evaluate_wall_rules(
++    rules: list[tuple[str, str, str]] | None,
++    user_id: str,
++    lineage: list[str],
++) -> bool:
++    if not rules:
++        return False
++    user_allow = False
++    user_deny = False
++    org_effects_by_node: dict[str, set[str]] = {}
++    for stype, sid, eff in rules:
++        if stype == "USER" and sid == user_id:
++            if eff == "ALLOW":
++                user_allow = True
++            elif eff == "DENY":
++                user_deny = True
++        elif stype == "ORG_NODE":
++            org_effects_by_node.setdefault(sid, set()).add(eff)
+ 
+-        acl_rows = conn.execute(
+-            "SELECT subject_type, subject_id, effect FROM doc_acl_rules "
+-            "WHERE tenant_id = ? AND doc_id = ? AND active = 1",
+-            (tenant_id, doc_id),
+-        ).fetchall()
+-    finally:
+-        conn.close()
+-
+-    if not acl_rows:
++    if user_allow:
+         return False
+-
+-    user_effects = {
+-        str(r["effect"]).upper()
+-        for r in acl_rows
+-        if r["subject_type"] == "USER" and r["subject_id"] == user_id
+-    }
+-    if "ALLOW" in user_effects:
+-        return False
+-    if "DENY" in user_effects:
++    if user_deny:
+         return True
+-
+-    lineage = get_org_lineage(db_path, tenant_id, u_row["org_node_id"])
+-    org_effects_by_node: dict[str, set[str]] = {}
+-    for r in acl_rows:
+-        if r["subject_type"] == "ORG_NODE":
+-            org_effects_by_node.setdefault(r["subject_id"], set()).add(str(r["effect"]).upper())
+ 
+     for node_id in lineage:
+         effs = org_effects_by_node.get(node_id)
+@@ -81,8 +105,36 @@
+                 return True
+             if "ALLOW" in effs:
+                 return False
++    return False
+ 
+-    return False
++
++def is_doc_blocked_by_wall(
++    db_path: str,
++    tenant_id: str,
++    user_id: str,
++    doc_id: str,
++    *,
++    org_node_id: str | None = None,
++) -> bool:
++    """按三级优先级判定指定操作员是否被利益冲突隔离墙禁止访问目标文档。"""
++    gw_state = get_gateway_state(db_path)
++    cache = _get_acl_cache(gw_state, tenant_id)
++    rules = cache.rules_by_doc.get(doc_id)
++    if not rules:
++        return False
++
++    if org_node_id is None:
++        with gw_state.pool.borrow() as conn:
++            u_row = conn.execute(
++                "SELECT org_node_id FROM users WHERE tenant_id = ? AND user_id = ? AND active = 1",
++                (tenant_id, user_id),
++            ).fetchone()
++            if not u_row:
++                return True
++            org_node_id = u_row["org_node_id"]
++
++    lineage = get_org_lineage_from_map(cache.org_parents, org_node_id)
++    return evaluate_wall_rules(rules, user_id, lineage)
+ 
+ 
+ def upsert_doc_acl_rule(
+@@ -95,7 +147,7 @@
+     effect: str = "DENY",
+     active: bool = True,
+ ) -> dict[str, Any]:
+-    """配置或停用文档利益冲突隔离墙规则（支持 USER / ORG_NODE 与 DENY / ALLOW）。"""
++    """配置或停用文档利益冲突隔离墙规则（仅递增 acl_epoch，不污染文档倒排索引）。"""
+     norm_type = str(subject_type or "").upper()
+     norm_effect = str(effect or "DENY").upper()
+     if norm_type not in ("USER", "ORG_NODE"):
+@@ -104,30 +156,33 @@
+         raise ValueError("effect must be DENY or ALLOW")
+ 
+     now_ts = int(time.time())
+-    conn = open_connection(db_path)
+-    try:
+-        doc_row = conn.execute(
+-            "SELECT doc_id FROM compliance_docs WHERE tenant_id = ? AND doc_id = ?",
+-            (tenant_id, doc_id),
+-        ).fetchone()
+-        if not doc_row:
+-            raise LookupError(f"Document not found in tenant: {doc_id}")
++    gw_state = get_gateway_state(db_path)
++    t_state = gw_state.tenant(tenant_id)
++    with t_state.acl_lock:
++        with gw_state.pool.borrow() as conn:
++            conn.execute("BEGIN IMMEDIATE")
++            doc_row = conn.execute(
++                "SELECT doc_id FROM compliance_docs WHERE tenant_id = ? AND doc_id = ?",
++                (tenant_id, doc_id),
++            ).fetchone()
++            if not doc_row:
++                conn.rollback()
++                raise LookupError(f"Document not found in tenant: {doc_id}")
+ 
+-        if active:
+-            conn.execute(
+-                "INSERT INTO doc_acl_rules(tenant_id, doc_id, subject_type, subject_id, effect, active, updated_at) "
+-                "VALUES (?, ?, ?, ?, ?, 1, ?)",
+-                (tenant_id, doc_id, norm_type, subject_id, norm_effect, now_ts),
+-            )
+-        else:
+-            conn.execute(
+-                "UPDATE doc_acl_rules SET active = 0, updated_at = ? "
+-                "WHERE tenant_id = ? AND doc_id = ? AND subject_type = ? AND subject_id = ? AND effect = ?",
+-                (now_ts, tenant_id, doc_id, norm_type, subject_id, norm_effect),
+-            )
+-        conn.commit()
+-    finally:
+-        conn.close()
++            if active:
++                conn.execute(
++                    "INSERT INTO doc_acl_rules(tenant_id, doc_id, subject_type, subject_id, effect, active, updated_at) "
++                    "VALUES (?, ?, ?, ?, ?, 1, ?)",
++                    (tenant_id, doc_id, norm_type, subject_id, norm_effect, now_ts),
++                )
++            else:
++                conn.execute(
++                    "UPDATE doc_acl_rules SET active = 0, updated_at = ? "
++                    "WHERE tenant_id = ? AND doc_id = ? AND subject_type = ? AND subject_id = ? AND effect = ?",
++                    (now_ts, tenant_id, doc_id, norm_type, subject_id, norm_effect),
++                )
++            conn.commit()
++        t_state.acl_epoch += 1
+ 
+     return {
+         "tenant_id": tenant_id,
+
+--- a/aegis_app/audit_export.py
++++ b/aegis_app/audit_export.py
+@@ -1,75 +1,73 @@
+ # -*- coding: utf-8 -*-
+-"""合规审计流水汇总摘要导出、自定义报表模板渲染与季度归档快照读取服务。"""
++"""合规审计流水流式游标摘要导出、字面沙箱报表模板渲染与锚定快照读取服务。"""
+ from __future__ import annotations
+ 
+-import copy
+ import hashlib
+ import json
+-import os
+ import pathlib
+ import time
+ import urllib.parse
+ from typing import Any
+ 
+ from .auth import CallerContext, require_admin
+-from .config import RUNTIME_ENV
+-from .db import open_connection
+-
+-
+-def _compute_digest_from_records(
++from .state import get_gateway_state
++from .validation import (
++    EVENT_FILTER_RE,
++    parse_strict_int,
++    render_literal_template,
++    validate_literal_template,
++)
++
++_STREAM_CHUNK_SIZE = 512
++
++
++def _stream_digest_from_cursor(
+     tenant_id: str,
+-    raw_rows: list[Any],
++    cur: Any,
+     sample_limit: int,
+ ) -> dict[str, Any]:
+-    expanded_records: list[dict[str, Any]] = []
+-    for r in raw_rows:
+-        item = {
+-            "log_id": int(r["log_id"]),
+-            "tenant_id": r["tenant_id"],
+-            "actor_id": r["actor_id"],
+-            "event_type": r["event_type"],
+-            "severity": r["severity"],
+-            "amount_cents": int(r["amount_cents"]),
+-            "masked_account": r["masked_account"],
+-            "ts": int(r["ts"]),
+-            "payload": json.loads(r["payload_json"]),
+-            "raw_payload_text": r["payload_json"],
+-        }
+-        expanded_records.append(copy.deepcopy(item))
+-
+-    archive_mirror = [copy.deepcopy(rec) for rec in expanded_records]
+-
++    """流式游标分批读取审计记录并计算滚动 SHA-256，保持 O(1) 常驻内存。"""
+     hasher = hashlib.sha256()
+     severity_counts: dict[str, int] = {}
+     event_counts: dict[str, int] = {}
+     total_amount_cents = 0
+-
+-    for rec in archive_mirror:
+-        sev = rec["severity"]
+-        evt = rec["event_type"]
+-        amt = rec["amount_cents"]
+-        severity_counts[sev] = severity_counts.get(sev, 0) + 1
+-        event_counts[evt] = event_counts.get(evt, 0) + 1
+-        total_amount_cents += amt
+-        line = f"{rec['log_id']}|{evt}|{sev}|{amt}|{rec['masked_account']}|{rec['ts']}\n"
+-        hasher.update(line.encode("utf-8"))
+-
++    total_records = 0
+     capped_sample = max(0, min(int(sample_limit), 50))
+-    samples = [
+-        {
+-            "log_id": rec["log_id"],
+-            "event_type": rec["event_type"],
+-            "severity": rec["severity"],
+-            "amount_cents": rec["amount_cents"],
+-            "masked_account": rec["masked_account"],
+-            "ts": rec["ts"],
+-        }
+-        for rec in archive_mirror[:capped_sample]
+-    ]
++    samples: list[dict[str, Any]] = []
++
++    while True:
++        chunk = cur.fetchmany(_STREAM_CHUNK_SIZE)
++        if not chunk:
++            break
++        for r in chunk:
++            log_id = int(r["log_id"])
++            evt = r["event_type"]
++            sev = r["severity"]
++            amt = int(r["amount_cents"])
++            masked_acc = r["masked_account"]
++            ts_val = int(r["ts"])
++
++            total_records += 1
++            total_amount_cents += amt
++            severity_counts[sev] = severity_counts.get(sev, 0) + 1
++            event_counts[evt] = event_counts.get(evt, 0) + 1
++            hasher.update(f"{log_id}|{evt}|{sev}|{amt}|{masked_acc}|{ts_val}\n".encode("utf-8"))
++
++            if len(samples) < capped_sample:
++                samples.append(
++                    {
++                        "log_id": log_id,
++                        "event_type": evt,
++                        "severity": sev,
++                        "amount_cents": amt,
++                        "masked_account": masked_acc,
++                        "ts": ts_val,
++                    }
++                )
+ 
+     return {
+         "tenant_id": tenant_id,
+-        "total_records": len(archive_mirror),
++        "total_records": total_records,
+         "total_amount_cents": total_amount_cents,
+         "severity_breakdown": dict(sorted(severity_counts.items())),
+         "event_breakdown": dict(sorted(event_counts.items())),
+@@ -87,32 +85,28 @@
+     severity: str = "",
+     sample_limit: int = 10,
+ ) -> dict[str, Any]:
+-    """统计指定时间窗口内的审计事件分布并计算顺序滚动完整性校验哈希。"""
++    """统计指定时间窗口内的审计事件分布并流式计算顺序滚动完整性校验哈希。"""
+     clauses = ["tenant_id = ?"]
+     params: list[Any] = [caller.tenant_id]
+     if start_ts is not None:
+         clauses.append("ts >= ?")
+-        params.append(int(start_ts))
++        params.append(parse_strict_int(start_ts, "start_ts"))
+     if end_ts is not None:
+         clauses.append("ts <= ?")
+-        params.append(int(end_ts))
++        params.append(parse_strict_int(end_ts, "end_ts"))
+     if severity:
+         clauses.append("severity = ?")
+-        params.append(severity)
++        params.append(str(severity))
+ 
+     sql = (
+-        "SELECT log_id, tenant_id, actor_id, event_type, severity, amount_cents, "
+-        "masked_account, ts, payload_json "
++        "SELECT log_id, event_type, severity, amount_cents, masked_account, ts "
+         f"FROM audit_logs WHERE {' AND '.join(clauses)} ORDER BY log_id ASC"
+     )
+ 
+-    conn = open_connection(db_path)
+-    try:
+-        raw_rows = conn.execute(sql, tuple(params)).fetchall()
+-    finally:
+-        conn.close()
+-
+-    return _compute_digest_from_records(caller.tenant_id, raw_rows, sample_limit)
++    gw_state = get_gateway_state(db_path)
++    with gw_state.pool.borrow() as conn:
++        cur = conn.execute(sql, tuple(params))
++        return _stream_digest_from_cursor(caller.tenant_id, cur, sample_limit)
+ 
+ 
+ def save_report_template(
+@@ -124,23 +118,23 @@
+     extra_event_filter: str = "",
+     sample_limit: int = 10,
+ ) -> dict[str, Any]:
+-    """保存租户自定义审计汇总报表配置模板（供周期性渲染报表复用）。
+-
+-    合法 title_format 支持占位符 {tenant_id}、{total_records}、{total_amount_cents}；
+-    extra_event_filter 为空字符串或目标事件类型名称（如 RISK_EVAL、DOC_ACCESS）。
+-    """
++    """保存租户自定义审计汇总报表配置模板（严格校验字面占位符白名单与事件过滤名）。"""
+     if "SENIOR_AUDITOR" not in caller.effective_roles and "COMPLIANCE_ADMIN" not in caller.effective_roles:
+         require_admin(caller)
+     tpl_id = str(template_id or "").strip()
+     t_fmt = str(title_format or "").strip()
+     evt_flt = str(extra_event_filter or "").strip()
+-    s_lim = max(0, min(int(sample_limit), 50))
++    s_lim = max(0, min(parse_strict_int(sample_limit, "sample_limit"), 50))
+     if not tpl_id or not t_fmt or len(t_fmt) > 200:
+         raise ValueError("Valid template_id and title_format are required")
++    validate_literal_template(t_fmt)
++    if evt_flt and not EVENT_FILTER_RE.match(evt_flt):
++        raise ValueError("extra_event_filter contains invalid characters")
+ 
+     now_ts = int(caller.request_ts or int(time.time()))
+-    conn = open_connection(db_path)
+-    try:
++    gw_state = get_gateway_state(db_path)
++    with gw_state.pool.borrow() as conn:
++        conn.execute("BEGIN IMMEDIATE")
+         conn.execute(
+             "INSERT OR REPLACE INTO report_templates("
+             "tenant_id, template_id, title_format, extra_event_filter, sample_limit, created_by, updated_at"
+@@ -148,8 +142,6 @@
+             (caller.tenant_id, tpl_id, t_fmt, evt_flt, s_lim, caller.user_id, now_ts),
+         )
+         conn.commit()
+-    finally:
+-        conn.close()
+ 
+     return {
+         "tenant_id": caller.tenant_id,
+@@ -168,9 +160,9 @@
+     start_ts: int | None = None,
+     end_ts: int | None = None,
+ ) -> dict[str, Any]:
+-    """读取已保存的报表模板并渲染生成带格式化标题的审计汇总报告。"""
+-    conn = open_connection(db_path)
+-    try:
++    """读取已保存的报表模板并参数化查询、字面沙箱渲染审计汇总报告。"""
++    gw_state = get_gateway_state(db_path)
++    with gw_state.pool.borrow() as conn:
+         tpl = conn.execute(
+             "SELECT template_id, title_format, extra_event_filter, sample_limit "
+             "FROM report_templates WHERE tenant_id = ? AND template_id = ?",
+@@ -179,32 +171,33 @@
+         if not tpl:
+             raise LookupError(f"Report template not found: {template_id}")
+ 
+-        clauses = [f"tenant_id = '{caller.tenant_id}'"]
+-        params: list[Any] = []
++        clauses = ["tenant_id = ?"]
++        params: list[Any] = [caller.tenant_id]
+         if start_ts is not None:
+             clauses.append("ts >= ?")
+-            params.append(int(start_ts))
++            params.append(parse_strict_int(start_ts, "start_ts"))
+         if end_ts is not None:
+             clauses.append("ts <= ?")
+-            params.append(int(end_ts))
+-        if tpl["extra_event_filter"]:
+-            clauses.append(f"event_type = '{tpl['extra_event_filter']}'")
++            params.append(parse_strict_int(end_ts, "end_ts"))
++        evt_flt = str(tpl["extra_event_filter"] or "").strip()
++        if evt_flt:
++            if not EVENT_FILTER_RE.match(evt_flt):
++                raise ValueError("Invalid extra_event_filter in template")
++            clauses.append("event_type = ?")
++            params.append(evt_flt)
+ 
+         sql = (
+-            "SELECT log_id, tenant_id, actor_id, event_type, severity, amount_cents, "
+-            "masked_account, ts, payload_json "
++            "SELECT log_id, event_type, severity, amount_cents, masked_account, ts "
+             f"FROM audit_logs WHERE {' AND '.join(clauses)} ORDER BY log_id ASC"
+         )
+-        raw_rows = conn.execute(sql, tuple(params)).fetchall()
+-    finally:
+-        conn.close()
+-
+-    digest = _compute_digest_from_records(caller.tenant_id, raw_rows, int(tpl["sample_limit"]))
+-    rendered_title = str(tpl["title_format"]).format(
++        cur = conn.execute(sql, tuple(params))
++        digest = _stream_digest_from_cursor(caller.tenant_id, cur, int(tpl["sample_limit"]))
++
++    rendered_title = render_literal_template(
++        str(tpl["title_format"]),
+         tenant_id=caller.tenant_id,
+         total_records=digest["total_records"],
+         total_amount_cents=digest["total_amount_cents"],
+-        env=RUNTIME_ENV,
+     )
+     return {
+         "template_id": tpl["template_id"],
+@@ -218,15 +211,29 @@
+     caller: CallerContext,
+     snapshot_name: str,
+ ) -> dict[str, Any]:
+-    """读取当前租户归档目录下的合规季度快照文件。"""
+-    if not snapshot_name:
++    """严格锚定租户 snapshots/ 目录并阻止多层编码、反斜杠与符号链接穿越。"""
++    if not snapshot_name or not isinstance(snapshot_name, str):
+         raise ValueError("snapshot_name is required")
+ 
+-    decoded_once = urllib.parse.unquote(snapshot_name)
+-    sanitized_rel = decoded_once.replace("../", "")
+-    base_dir = os.path.join(storage_dir, caller.tenant_id, "snapshots")
+-    target_path = pathlib.Path(os.path.join(base_dir, sanitized_rel))
+-
++    decoded = snapshot_name
++    for _ in range(3):
++        nxt = urllib.parse.unquote(decoded)
++        if nxt == decoded:
++            break
++        decoded = nxt
++
++    if "\x00" in snapshot_name or "\x00" in decoded:
++        raise ValueError("Invalid snapshot_name")
++    if "/" in decoded or "\\" in decoded or ".." in decoded:
++        raise PermissionError("Path traversal is not permitted")
++
++    base_dir = (pathlib.Path(storage_dir) / caller.tenant_id / "snapshots").resolve()
++    raw_target = base_dir / decoded
++    if raw_target.is_symlink():
++        raise PermissionError("Symlink snapshot access is not permitted")
++    target_path = raw_target.resolve()
++    if target_path == base_dir or not target_path.is_relative_to(base_dir):
++        raise PermissionError("Snapshot path escapes tenant directory")
+     if not target_path.is_file():
+         raise LookupError(f"Snapshot file not found: {snapshot_name}")
+ 
+
+--- a/aegis_app/auth.py
++++ b/aegis_app/auth.py
+@@ -6,17 +6,22 @@
+ import hashlib
+ import hmac
+ import json
++import sqlite3
+ import time
+ from typing import Any
+ 
+ from .acl_wall import is_doc_blocked_by_wall, upsert_doc_acl_rule
+-from .config import ROLE_DEFAULT_CLEARANCE
+-from .db import hash_api_token, open_connection
++from .config import ROLE_DEFAULT_CLEARANCE, WEBHOOK_TOLERANCE_SECONDS
++from .db import hash_api_token
+ from .delegation import (
+     create_or_revoke_delegation,
+-    resolve_active_delegated_roles,
+-    resolve_base_and_explicit_roles,
++    get_perm_cache,
++    resolve_active_delegated_roles_from_cache,
+ )
++from .state import get_gateway_state
++from .validation import parse_strict_int
++
++_DUMMY_TOKEN_HASH = hashlib.sha256(b"aegis-dummy-constant-time-mask").hexdigest()
+ 
+ 
+ class AuthError(Exception):
+@@ -45,11 +50,13 @@
+ ) -> tuple[set[str], int]:
+     """合并操作员原生角色、组织继承角色、显式授予角色以及在 at_ts 时刻有效且未级联失效的借调角色。"""
+     eval_ts = int(at_ts if at_ts is not None else time.time())
+-    roles = resolve_base_and_explicit_roles(db_path, tenant_id, user_id)
++    gw_state = get_gateway_state(db_path)
++    cache = get_perm_cache(gw_state, tenant_id)
++    roles = set(cache.get_native_roles(user_id))
+     if not roles:
+         return set(), 0
+ 
+-    delegated = resolve_active_delegated_roles(db_path, tenant_id, user_id, eval_ts)
++    delegated = resolve_active_delegated_roles_from_cache(cache, user_id, eval_ts)
+     all_roles = roles | delegated
+     max_clearance = max((ROLE_DEFAULT_CLEARANCE.get(r, 1) for r in all_roles), default=1)
+     return all_roles, max_clearance
+@@ -61,7 +68,7 @@
+     *,
+     now_override: int | None = None,
+ ) -> CallerContext:
+-    """校验请求头凭证并组装带实时借调权限的操作员上下文。"""
++    """校验请求头凭证并组装带实时借调权限的操作员上下文（含未知租户/用户常量时间掩蔽）。"""
+     norm_headers = {k.lower(): v for k, v in (headers or {}).items()}
+     tenant_id = (norm_headers.get("x-aegis-tenant") or "").strip()
+     user_id = (norm_headers.get("x-aegis-user") or "").strip()
+@@ -71,43 +78,45 @@
+         raise AuthError("Missing authentication headers", 401)
+ 
+     req_ts = int(now_override if now_override is not None else time.time())
+-    conn = open_connection(db_path)
+-    try:
++    provided_hash = hash_api_token(raw_token)
++    gw_state = get_gateway_state(db_path)
++
++    with gw_state.pool.borrow() as conn:
+         t_row = conn.execute(
+             "SELECT tenant_id, status FROM tenants WHERE tenant_id = ?",
+             (tenant_id,),
+         ).fetchone()
+-        if not t_row or t_row["status"] != "ACTIVE":
+-            raise AuthError("Unknown or inactive tenant", 403)
+-
+-        u_row = conn.execute(
+-            "SELECT user_id, tenant_id, username, org_node_id, base_role, api_token_hash, active "
+-            "FROM users WHERE user_id = ? AND tenant_id = ?",
+-            (user_id, tenant_id),
+-        ).fetchone()
+-        if not u_row or not u_row["active"]:
+-            raise AuthError("Invalid operator identity", 401)
+-
+-        if u_row["api_token_hash"] != hash_api_token(raw_token):
+-            raise AuthError("Invalid access token", 401)
+-
+-        roles, max_cl = resolve_effective_permissions(
+-            db_path,
+-            tenant_id,
+-            user_id,
+-            at_ts=req_ts,
+-        )
+-        return CallerContext(
+-            tenant_id=tenant_id,
+-            user_id=user_id,
+-            username=u_row["username"],
+-            org_node_id=u_row["org_node_id"],
+-            effective_roles=roles,
+-            max_clearance=max_cl,
+-            request_ts=req_ts,
+-        )
+-    finally:
+-        conn.close()
++
++    if not t_row or t_row["status"] != "ACTIVE":
++        hmac.compare_digest(_DUMMY_TOKEN_HASH, provided_hash)
++        raise AuthError("Unknown or inactive tenant", 403)
++
++    cache = get_perm_cache(gw_state, tenant_id)
++    u_info = cache.users.get(user_id)
++    if not u_info or u_info[4] != 1:
++        hmac.compare_digest(_DUMMY_TOKEN_HASH, provided_hash)
++        raise AuthError("Invalid operator identity", 401)
++
++    org_node_id, _, stored_hash, username, _ = u_info
++    if not hmac.compare_digest(stored_hash, provided_hash):
++        raise AuthError("Invalid access token", 401)
++
++    native_roles = set(cache.get_native_roles(user_id))
++    if not native_roles:
++        raise AuthError("Invalid operator identity", 401)
++    delegated = resolve_active_delegated_roles_from_cache(cache, user_id, req_ts)
++    all_roles = native_roles | delegated
++    max_cl = max((ROLE_DEFAULT_CLEARANCE.get(r, 1) for r in all_roles), default=1)
++
++    return CallerContext(
++        tenant_id=tenant_id,
++        user_id=user_id,
++        username=username,
++        org_node_id=org_node_id,
++        effective_roles=all_roles,
++        max_clearance=max_cl,
++        request_ts=req_ts,
++    )
+ 
+ 
+ def require_admin(caller: CallerContext) -> None:
+@@ -182,33 +191,38 @@
+     if role_name not in ROLE_DEFAULT_CLEARANCE:
+         raise ValueError(f"Unsupported role: {role_name}")
+     now_ts = int(caller.request_ts)
+-    conn = open_connection(db_path)
+-    try:
+-        target = conn.execute(
+-            "SELECT user_id FROM users WHERE tenant_id = ? AND user_id = ?",
+-            (caller.tenant_id, target_user_id),
+-        ).fetchone()
+-        if not target:
+-            raise LookupError("Target operator not found in tenant")
+-
+-        if action == "revoke":
+-            cur = conn.execute(
+-                "UPDATE role_grants SET active = 0, updated_at = ? "
+-                "WHERE tenant_id = ? AND user_id = ? AND granted_role = ? AND active = 1",
+-                (now_ts, caller.tenant_id, target_user_id, role_name),
+-            )
+-            changed = cur.rowcount
+-        elif action == "grant":
+-            conn.execute(
+-                "INSERT INTO role_grants(tenant_id, user_id, granted_role, active, updated_at) VALUES (?, ?, ?, 1, ?)",
+-                (caller.tenant_id, target_user_id, role_name, now_ts),
+-            )
+-            changed = 1
+-        else:
+-            raise ValueError("action must be 'grant' or 'revoke'")
+-        conn.commit()
+-    finally:
+-        conn.close()
++    gw_state = get_gateway_state(db_path)
++    t_state = gw_state.tenant(caller.tenant_id)
++
++    with t_state.perm_lock:
++        with gw_state.pool.borrow() as conn:
++            conn.execute("BEGIN IMMEDIATE")
++            target = conn.execute(
++                "SELECT user_id FROM users WHERE tenant_id = ? AND user_id = ?",
++                (caller.tenant_id, target_user_id),
++            ).fetchone()
++            if not target:
++                conn.rollback()
++                raise LookupError("Target operator not found in tenant")
++
++            if action == "revoke":
++                cur = conn.execute(
++                    "UPDATE role_grants SET active = 0, updated_at = ? "
++                    "WHERE tenant_id = ? AND user_id = ? AND granted_role = ? AND active = 1",
++                    (now_ts, caller.tenant_id, target_user_id, role_name),
++                )
++                changed = cur.rowcount
++            elif action == "grant":
++                conn.execute(
++                    "INSERT INTO role_grants(tenant_id, user_id, granted_role, active, updated_at) VALUES (?, ?, ?, 1, ?)",
++                    (caller.tenant_id, target_user_id, role_name, now_ts),
++                )
++                changed = 1
++            else:
++                conn.rollback()
++                raise ValueError("action must be 'grant' or 'revoke'")
++            conn.commit()
++        t_state.perm_epoch += 1
+ 
+     eff_roles, eff_cl = resolve_effective_permissions(
+         db_path,
+@@ -234,7 +248,7 @@
+     *,
+     now_override: int | None = None,
+ ) -> dict[str, Any]:
+-    """验证外部清算中心回调签名并登记入账通知。"""
++    """验证外部清算中心回调签名、时间窗与原子 Nonce 防重放后登记入账通知。"""
+     norm_headers = {k.lower(): v for k, v in (headers or {}).items()}
+     tenant_id = (norm_headers.get("x-aegis-tenant") or "").strip()
+     ts_str = (norm_headers.get("x-aegis-timestamp") or "").strip()
+@@ -243,19 +257,26 @@
+ 
+     if not tenant_id or not ts_str or not nonce or not sig_header:
+         raise AuthError("Missing webhook signature headers", 401)
++    if len(nonce) > 128:
++        raise AuthError("Webhook nonce too long", 400)
+ 
+     try:
+-        callback_ts = int(ts_str)
++        callback_ts = parse_strict_int(ts_str, "x-aegis-timestamp")
+     except ValueError as exc:
+         raise AuthError("Malformed webhook timestamp", 400) from exc
+ 
+-    conn = open_connection(db_path)
+-    try:
++    now_ts = int(now_override if now_override is not None else time.time())
++    if abs(now_ts - callback_ts) > WEBHOOK_TOLERANCE_SECONDS:
++        raise AuthError("Webhook timestamp outside tolerance window", 401)
++
++    gw_state = get_gateway_state(db_path)
++    with gw_state.pool.borrow() as conn:
+         t_row = conn.execute(
+             "SELECT webhook_secret, status FROM tenants WHERE tenant_id = ?",
+             (tenant_id,),
+         ).fetchone()
+         if not t_row or t_row["status"] != "ACTIVE":
++            hmac.compare_digest(_DUMMY_TOKEN_HASH, sig_header)
+             raise AuthError("Unknown webhook tenant", 403)
+ 
+         signing_input = f"{tenant_id}.{callback_ts}.{nonce}.{raw_body}"
+@@ -265,28 +286,33 @@
+             hashlib.sha256,
+         ).hexdigest()
+ 
+-        provided_sig = sig_header.removeprefix("sha256=").strip()
+-        if provided_sig != expected_sig:
++        provided_sig = sig_header.removeprefix("sha256=").strip().lower()
++        if not hmac.compare_digest(provided_sig, expected_sig.lower()):
+             raise AuthError("Webhook signature verification failed", 401)
+ 
+         payload = json.loads(raw_body)
+-        settlement_ref = str(payload.get("settlement_ref") or "")
+-        amount_cents = int(payload.get("amount_cents") or 0)
+-        if not settlement_ref or amount_cents < 0:
++        if not isinstance(payload, dict):
++            raise ValueError("Webhook payload must be a JSON object")
++        settlement_ref = str(payload.get("settlement_ref") or "").strip()
++        amount_cents = parse_strict_int(payload.get("amount_cents", 0), "amount_cents", min_val=0)
++        if not settlement_ref:
+             raise ValueError("Invalid settlement payload fields")
+ 
+-        now_ts = int(now_override if now_override is not None else time.time())
+-        conn.execute(
+-            "INSERT INTO webhook_events(tenant_id, nonce, callback_ts, settlement_ref, amount_cents, raw_payload, created_at) "
+-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+-            (tenant_id, nonce, callback_ts, settlement_ref, amount_cents, raw_body, now_ts),
+-        )
+-        conn.commit()
++        try:
++            conn.execute("BEGIN IMMEDIATE")
++            conn.execute(
++                "INSERT INTO webhook_events(tenant_id, nonce, callback_ts, settlement_ref, amount_cents, raw_payload, created_at) "
++                "VALUES (?, ?, ?, ?, ?, ?, ?)",
++                (tenant_id, nonce, callback_ts, settlement_ref, amount_cents, raw_body, now_ts),
++            )
++            conn.commit()
++        except sqlite3.IntegrityError as exc:
++            conn.rollback()
++            raise AuthError("Duplicate webhook nonce (replay detected)", 409) from exc
++
+         return {
+             "acknowledged": True,
+             "tenant_id": tenant_id,
+             "settlement_ref": settlement_ref,
+             "amount_cents": amount_cents,
+         }
+-    finally:
+-        conn.close()
+
+--- a/aegis_app/contagion_graph.py
++++ b/aegis_app/contagion_graph.py
+@@ -1,24 +1,145 @@
+ # -*- coding: utf-8 -*-
+-"""三跳受制裁黑名单实体资金传染链路追踪（3-Hop Contagion Graph）与名单管理模块。
+-
+-图连通与传染跳数定义：
+-- 在租户 24 小时活跃窗口 [ts - 86400, ts] 内，每笔交易 (account_id, counterparty_id) 构成一条双向资金关联边；
+-- 当前正在评估的交易自身的边 (tx.account_id, tx.counterparty_id) 同步计入当前图；
+-- 设活跃受制裁实体集合为 S（sanctioned_entities 表中 active=1 的 entity_id）：
+-  * 若 tx.account_id in S 或 tx.counterparty_id in S（即本次交易两端直接命中制裁名单），则传染跳数 hop = 1；
+-  * 否则计算 tx.account_id 与 tx.counterparty_id 到集合 S 中任意实体的最短无向边路径长度 d_min：
+-    传染跳数 hop = d_min + 1（例如 tx.counterparty_id 曾与受制裁实体直接交易过，即 d_min = 1，则本次交易 hop = 2；
+-    若隔一层中间跳板账户，d_min = 2，则本次交易 hop = 3）；
+-  * 若 hop > 3 或不可达，记为 0（无三跳内制裁传染）。
+-"""
++"""三跳受制裁黑名单实体资金传染链路追踪（2-Hop 双向邻域 BFS + 增量时间边索引）与名单管理模块。"""
+ from __future__ import annotations
+ 
++import bisect
++from collections import deque
+ import time
+ from typing import Any
+ 
+ from .auth import CallerContext, require_admin
+ from .config import SLIDING_WINDOW_SECONDS
+-from .db import open_connection
++from .state import GatewayState, TenantState, get_gateway_state
++from .window_stats import AccountWindowTracker
++
++
++class TenantRiskGraphState:
++    """单租户交易资金图与账户滑动窗口统一内存状态（支持事务级增量与回滚）。"""
++
++    def __init__(self, tenant_id: str) -> None:
++        self.tenant_id = tenant_id
++        self.sanction_epoch: int = -1
++        self.sanctioned: set[str] = set()
++        self.adj: dict[str, dict[str, list[int]]] = {}
++        self.accounts: dict[str, AccountWindowTracker] = {}
++
++    def load_from_db(self, gw_state: GatewayState, t_state: TenantState) -> None:
++        with gw_state.pool.borrow() as conn:
++            s_rows = conn.execute(
++                "SELECT entity_id FROM sanctioned_entities WHERE tenant_id = ? AND active = 1",
++                (self.tenant_id,),
++            ).fetchall()
++            tx_rows = conn.execute(
++                "SELECT account_id, counterparty_id, amount_cents, ts FROM transactions WHERE tenant_id = ?",
++                (self.tenant_id,),
++            ).fetchall()
++
++        self.sanctioned = {r["entity_id"] for r in s_rows}
++        self.sanction_epoch = t_state.sanction_epoch
++
++        acct_raw: dict[str, list[tuple[int, int, str]]] = {}
++        for r in tx_rows:
++            u = r["account_id"]
++            v = r["counterparty_id"]
++            amt = int(r["amount_cents"])
++            r_ts = int(r["ts"])
++            acct_raw.setdefault(u, []).append((r_ts, amt, v))
++            self.adj.setdefault(u, {}).setdefault(v, []).append(r_ts)
++            self.adj.setdefault(v, {}).setdefault(u, []).append(r_ts)
++
++        for neighbors in self.adj.values():
++            for ts_list in neighbors.values():
++                ts_list.sort()
++
++        for acct_id, recs in acct_raw.items():
++            self.accounts[acct_id] = AccountWindowTracker(recs)
++
++    def refresh_sanctions_if_needed(self, gw_state: GatewayState, t_state: TenantState) -> None:
++        if self.sanction_epoch == t_state.sanction_epoch:
++            return
++        with gw_state.pool.borrow() as conn:
++            s_rows = conn.execute(
++                "SELECT entity_id FROM sanctioned_entities WHERE tenant_id = ? AND active = 1",
++                (self.tenant_id,),
++            ).fetchall()
++        self.sanctioned = {r["entity_id"] for r in s_rows}
++        self.sanction_epoch = t_state.sanction_epoch
++
++    def add_edge(self, u: str, v: str, ts: int) -> None:
++        bisect.insort(self.adj.setdefault(u, {}).setdefault(v, []), ts)
++        bisect.insort(self.adj.setdefault(v, {}).setdefault(u, []), ts)
++
++    def rollback_edges(self, edges: list[tuple[str, str, int]]) -> None:
++        for u, v, ts in edges:
++            for a, b in ((u, v), (v, u)):
++                neighbors = self.adj.get(a)
++                if not neighbors:
++                    continue
++                ts_list = neighbors.get(b)
++                if not ts_list:
++                    continue
++                pos = bisect.bisect_left(ts_list, ts)
++                if pos < len(ts_list) and ts_list[pos] == ts:
++                    ts_list.pop(pos)
++                    if not ts_list:
++                        del neighbors[b]
++
++
++def get_or_load_risk_graph(gw_state: GatewayState, t_state: TenantState) -> TenantRiskGraphState:
++    rg = t_state.risk_graph_state
++    if rg is None:
++        rg = TenantRiskGraphState(t_state.tenant_id)
++        rg.load_from_db(gw_state, t_state)
++        t_state.risk_graph_state = rg
++    else:
++        rg.refresh_sanctions_if_needed(gw_state, t_state)
++    return rg
++
++
++def _edge_active(ts_list: list[int], win_start: int, ts: int) -> bool:
++    idx = bisect.bisect_left(ts_list, win_start)
++    return idx < len(ts_list) and ts_list[idx] <= ts
++
++
++def compute_hop_from_graph(
++    sanctioned: set[str],
++    adj: dict[str, dict[str, list[int]]],
++    account_id: str,
++    counterparty_id: str,
++    ts: int,
++) -> int:
++    """从交易两端出发执行最多 2 层时间窗邻域 BFS，等价求三跳制裁传染最小跳数。"""
++    if not sanctioned:
++        return 0
++    if account_id in sanctioned or counterparty_id in sanctioned:
++        return 1
++
++    win_start = ts - SLIDING_WINDOW_SECONDS
++    visited: dict[str, int] = {account_id: 0}
++    q: deque[tuple[str, int]] = deque([(account_id, 0)])
++    if counterparty_id != account_id:
++        visited[counterparty_id] = 0
++        q.append((counterparty_id, 0))
++
++    while q:
++        curr, dist = q.popleft()
++        if dist >= 2:
++            continue
++        neighbors = adj.get(curr)
++        if not neighbors:
++            continue
++        nd = dist + 1
++        for nxt, ts_list in neighbors.items():
++            if nxt in visited:
++                continue
++            if not _edge_active(ts_list, win_start, ts):
++                continue
++            if nxt in sanctioned:
++                return nd + 1
++            visited[nxt] = nd
++            if nd < 2:
++                q.append((nxt, nd))
++    return 0
+ 
+ 
+ def compute_sanction_contagion_hop(
+@@ -29,61 +150,11 @@
+     ts: int,
+ ) -> int:
+     """在 [ts - 86400, ts] 活跃交易关联图上计算当前交易的三跳制裁传染等级（0 表示安全，1..3 表示对应跳数）。"""
+-    conn = open_connection(db_path)
+-    try:
+-        s_rows = conn.execute(
+-            "SELECT entity_id FROM sanctioned_entities WHERE tenant_id = ? AND active = 1",
+-            (tenant_id,),
+-        ).fetchall()
+-        sanctioned = {r["entity_id"] for r in s_rows}
+-        if not sanctioned:
+-            return 0
+-        if account_id in sanctioned or counterparty_id in sanctioned:
+-            return 1
+-
+-        win_start = ts - SLIDING_WINDOW_SECONDS
+-        tx_rows = conn.execute(
+-            "SELECT account_id, counterparty_id, ts FROM transactions WHERE tenant_id = ?",
+-            (tenant_id,),
+-        ).fetchall()
+-    finally:
+-        conn.close()
+-
+-    adj: dict[str, list[str]] = {}
+-    for r in tx_rows:
+-        r_ts = int(r["ts"])
+-        if win_start <= r_ts <= ts:
+-            u = r["account_id"]
+-            v = r["counterparty_id"]
+-            adj.setdefault(u, []).append(v)
+-            adj.setdefault(v, []).append(u)
+-
+-    adj.setdefault(account_id, []).append(counterparty_id)
+-    adj.setdefault(counterparty_id, []).append(account_id)
+-
+-    # 从每个受制裁源点执行广度优先搜索，计算到达 account_id 或 counterparty_id 的最小边距离
+-    best_hop = 0
+-    for src in sanctioned:
+-        if src not in adj:
+-            continue
+-        queue: list[tuple[str, int]] = [(src, 0)]
+-        visited = {src: 0}
+-        while queue:
+-            curr, dist = queue.pop(0)
+-            if dist >= 2:
+-                continue
+-            for nxt in adj.get(curr, []):
+-                if nxt not in visited or visited[nxt] > dist + 1:
+-                    visited[nxt] = dist + 1
+-                    queue.append((nxt, dist + 1))
+-
+-        for endpoint in (account_id, counterparty_id):
+-            if endpoint in visited:
+-                hop = visited[endpoint] + 1
+-                if 1 <= hop <= 3 and (best_hop == 0 or hop < best_hop):
+-                    best_hop = hop
+-
+-    return best_hop
++    gw_state = get_gateway_state(db_path)
++    t_state = gw_state.tenant(tenant_id)
++    with t_state.risk_lock:
++        rg = get_or_load_risk_graph(gw_state, t_state)
++        return compute_hop_from_graph(rg.sanctioned, rg.adj, account_id, counterparty_id, ts)
+ 
+ 
+ def manage_sanctioned_entity(
+@@ -101,18 +172,21 @@
+         raise ValueError("entity_id is required")
+     now_ts = int(caller.request_ts or int(time.time()))
+     act_val = 1 if active else 0
+-    conn = open_connection(db_path)
+-    try:
+-        conn.execute(
+-            "INSERT INTO sanctioned_entities(tenant_id, entity_id, list_source, active, updated_at) "
+-            "VALUES (?, ?, ?, ?, ?) "
+-            "ON CONFLICT(tenant_id, entity_id) DO UPDATE SET list_source = excluded.list_source, "
+-            "active = excluded.active, updated_at = excluded.updated_at",
+-            (caller.tenant_id, ent, str(list_source or "CUSTOM"), act_val, now_ts),
+-        )
+-        conn.commit()
+-    finally:
+-        conn.close()
++
++    gw_state = get_gateway_state(db_path)
++    t_state = gw_state.tenant(caller.tenant_id)
++    with t_state.sanction_lock:
++        with gw_state.pool.borrow() as conn:
++            conn.execute("BEGIN IMMEDIATE")
++            conn.execute(
++                "INSERT INTO sanctioned_entities(tenant_id, entity_id, list_source, active, updated_at) "
++                "VALUES (?, ?, ?, ?, ?) "
++                "ON CONFLICT(tenant_id, entity_id) DO UPDATE SET list_source = excluded.list_source, "
++                "active = excluded.active, updated_at = excluded.updated_at",
++                (caller.tenant_id, ent, str(list_source or "CUSTOM"), act_val, now_ts),
++            )
++            conn.commit()
++        t_state.sanction_epoch += 1
+ 
+     return {
+         "tenant_id": caller.tenant_id,
+
+--- a/aegis_app/db.py
++++ b/aegis_app/db.py
+@@ -212,6 +212,25 @@
+     secret_value TEXT NOT NULL,
+     classification TEXT NOT NULL
+ );
++
++CREATE INDEX IF NOT EXISTS idx_org_nodes_tenant_node ON org_nodes(tenant_id, node_id);
++CREATE INDEX IF NOT EXISTS idx_users_tenant_user ON users(tenant_id, user_id);
++CREATE INDEX IF NOT EXISTS idx_role_grants_tenant_user_active ON role_grants(tenant_id, user_id, active);
++CREATE INDEX IF NOT EXISTS idx_delegations_grantee ON delegation_grants(tenant_id, grantee_user_id, active);
++CREATE INDEX IF NOT EXISTS idx_delegations_grantor ON delegation_grants(tenant_id, grantor_user_id, active);
++CREATE INDEX IF NOT EXISTS idx_doc_acl_tenant_doc_active ON doc_acl_rules(tenant_id, doc_id, active);
++CREATE INDEX IF NOT EXISTS idx_sanctions_tenant_active ON sanctioned_entities(tenant_id, active);
++CREATE INDEX IF NOT EXISTS idx_docs_tenant_status_q ON compliance_docs(tenant_id, status, quarantined);
++CREATE INDEX IF NOT EXISTS idx_doc_citations_tenant_doc ON doc_citations(tenant_id, doc_id);
++CREATE INDEX IF NOT EXISTS idx_doc_citations_tenant_ref ON doc_citations(tenant_id, cited_by_ref);
++CREATE INDEX IF NOT EXISTS idx_tx_tenant_acct_ts ON transactions(tenant_id, account_id, ts);
++CREATE INDEX IF NOT EXISTS idx_tx_tenant_ts ON transactions(tenant_id, ts);
++CREATE INDEX IF NOT EXISTS idx_risk_dec_tenant_id ON risk_decisions(tenant_id, decision_id);
++CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_tenant_nonce ON webhook_events(tenant_id, nonce);
++CREATE INDEX IF NOT EXISTS idx_audit_tenant_log ON audit_logs(tenant_id, log_id);
++CREATE INDEX IF NOT EXISTS idx_audit_tenant_ts_log ON audit_logs(tenant_id, ts, log_id);
++CREATE INDEX IF NOT EXISTS idx_audit_tenant_sev_ts_log ON audit_logs(tenant_id, severity, ts, log_id);
++CREATE INDEX IF NOT EXISTS idx_audit_tenant_evt_ts_log ON audit_logs(tenant_id, event_type, ts, log_id);
+ """
+ 
+ 
+@@ -220,8 +239,11 @@
+ 
+ 
+ def open_connection(db_path: str | pathlib.Path) -> sqlite3.Connection:
+-    conn = sqlite3.connect(str(db_path), timeout=30.0)
++    conn = sqlite3.connect(str(db_path), timeout=30.0, check_same_thread=False)
+     conn.row_factory = sqlite3.Row
++    conn.execute("PRAGMA busy_timeout=30000")
++    conn.execute("PRAGMA temp_store=MEMORY")
++    conn.execute("PRAGMA cache_size=-16384")
+     return conn
+ 
+ 
+@@ -230,6 +252,8 @@
+     path.parent.mkdir(parents=True, exist_ok=True)
+     conn = open_connection(path)
+     try:
++        conn.execute("PRAGMA journal_mode=WAL")
++        conn.execute("PRAGMA synchronous=NORMAL")
+         conn.executescript(SCHEMA_SQL)
+         conn.commit()
+     finally:
+
+--- a/aegis_app/delegation.py
++++ b/aegis_app/delegation.py
+@@ -1,147 +1,242 @@
+ # -*- coding: utf-8 -*-
+-"""跨部门角色临时借调委托（支持最多二级受控转借调）与有效期内级联资格核验模块。"""
++"""跨部门角色临时借调委托（支持最多二级受控转借调）、防环路检测与独立 perm_epoch 缓存模块。"""
+ from __future__ import annotations
+ 
+ import time
+ from typing import Any
+ 
+ from .config import MAX_DELEGATION_HOPS, ROLE_DEFAULT_CLEARANCE
+-from .db import open_connection
+-
+-
+-def resolve_base_and_explicit_roles(db_path: str, tenant_id: str, user_id: str) -> set[str]:
+-    """计算操作员通过自身岗位、组织树继承以及管理员直接授予（不含他人委托）拥有的原生角色集合。"""
+-    conn = open_connection(db_path)
+-    try:
+-        u_row = conn.execute(
+-            "SELECT org_node_id, base_role, active FROM users WHERE tenant_id = ? AND user_id = ?",
+-            (tenant_id, user_id),
+-        ).fetchone()
+-        if not u_row or not u_row["active"]:
+-            return set()
+-
+-        roles: set[str] = {u_row["base_role"]}
+-        curr = u_row["org_node_id"]
++from .state import GatewayState, get_gateway_state
++from .validation import parse_strict_int
++
++
++class TenantPermCache:
++    """单租户身份、组织继承角色、显式授牌与活跃借调委托表快照（按 perm_epoch 失效）。"""
++
++    __slots__ = (
++        "epoch",
++        "users",
++        "org_nodes",
++        "role_grants",
++        "delegations_by_grantee",
++        "native_roles_cache",
++    )
++
++    def __init__(
++        self,
++        epoch: int,
++        users: dict[str, tuple[str, str, str, str, int]],
++        org_nodes: dict[str, tuple[str | None, str | None]],
++        role_grants: dict[str, set[str]],
++        delegations_by_grantee: dict[str, list[tuple[str, str, int, int]]],
++    ) -> None:
++        self.epoch = epoch
++        self.users = users
++        self.org_nodes = org_nodes
++        self.role_grants = role_grants
++        self.delegations_by_grantee = delegations_by_grantee
++        self.native_roles_cache: dict[str, frozenset[str]] = {}
++
++    def get_native_roles(self, user_id: str) -> frozenset[str]:
++        cached = self.native_roles_cache.get(user_id)
++        if cached is not None:
++            return cached
++        u_info = self.users.get(user_id)
++        if not u_info or u_info[4] != 1:
++            self.native_roles_cache[user_id] = frozenset()
++            return frozenset()
++
++        org_node_id, base_role, _, _, _ = u_info
++        roles: set[str] = {base_role}
++        curr: str | None = org_node_id
+         visited: set[str] = set()
+         while curr and curr not in visited:
+             visited.add(curr)
+-            n_row = conn.execute(
+-                "SELECT parent_node_id, inherited_role FROM org_nodes WHERE tenant_id = ? AND node_id = ?",
+-                (tenant_id, curr),
+-            ).fetchone()
+-            if not n_row:
++            node = self.org_nodes.get(curr)
++            if not node:
+                 break
+-            if n_row["inherited_role"]:
+-                roles.add(n_row["inherited_role"])
+-            curr = n_row["parent_node_id"]
+-
+-        g_rows = conn.execute(
+-            "SELECT granted_role FROM role_grants WHERE tenant_id = ? AND user_id = ? AND active = 1",
+-            (tenant_id, user_id),
+-        ).fetchall()
+-        for gr in g_rows:
+-            roles.add(gr["granted_role"])
+-        return roles
+-    finally:
+-        conn.close()
+-
+-
+-def _collect_upstream_grantors(
+-    db_path: str,
+-    tenant_id: str,
++            parent_id, inherited_role = node
++            if inherited_role:
++                roles.add(inherited_role)
++            curr = parent_id
++
++        extra = self.role_grants.get(user_id)
++        if extra:
++            roles.update(extra)
++        res = frozenset(roles)
++        self.native_roles_cache[user_id] = res
++        return res
++
++
++def get_perm_cache(gw_state: GatewayState, tenant_id: str) -> TenantPermCache:
++    t_state = gw_state.tenant(tenant_id)
++    cache = t_state.perm_cache
++    if cache is not None and cache.epoch == t_state.perm_epoch:
++        return cache
++    with t_state.perm_lock:
++        cache = t_state.perm_cache
++        if cache is not None and cache.epoch == t_state.perm_epoch:
++            return cache
++        epoch = t_state.perm_epoch
++        with gw_state.pool.borrow() as conn:
++            u_rows = conn.execute(
++                "SELECT user_id, org_node_id, base_role, api_token_hash, username, active "
++                "FROM users WHERE tenant_id = ?",
++                (tenant_id,),
++            ).fetchall()
++            n_rows = conn.execute(
++                "SELECT node_id, parent_node_id, inherited_role FROM org_nodes WHERE tenant_id = ?",
++                (tenant_id,),
++            ).fetchall()
++            g_rows = conn.execute(
++                "SELECT user_id, granted_role FROM role_grants WHERE tenant_id = ? AND active = 1",
++                (tenant_id,),
++            ).fetchall()
++            d_rows = conn.execute(
++                "SELECT grantor_user_id, grantee_user_id, delegated_role, starts_at, expires_at "
++                "FROM delegation_grants WHERE tenant_id = ? AND active = 1",
++                (tenant_id,),
++            ).fetchall()
++
++        users = {
++            r["user_id"]: (
++                r["org_node_id"],
++                r["base_role"],
++                r["api_token_hash"],
++                r["username"],
++                int(r["active"]),
++            )
++            for r in u_rows
++        }
++        org_nodes = {
++            r["node_id"]: (r["parent_node_id"], r["inherited_role"])
++            for r in n_rows
++        }
++        role_grants: dict[str, set[str]] = {}
++        for r in g_rows:
++            role_grants.setdefault(r["user_id"], set()).add(r["granted_role"])
++        delegations_by_grantee: dict[str, list[tuple[str, str, int, int]]] = {}
++        for r in d_rows:
++            delegations_by_grantee.setdefault(r["grantee_user_id"], []).append(
++                (
++                    str(r["grantor_user_id"]),
++                    str(r["delegated_role"]),
++                    int(r["starts_at"]),
++                    int(r["expires_at"]),
++                )
++            )
++        cache = TenantPermCache(epoch, users, org_nodes, role_grants, delegations_by_grantee)
++        t_state.perm_cache = cache
++        return cache
++
++
++def resolve_base_and_explicit_roles(db_path: str, tenant_id: str, user_id: str) -> set[str]:
++    """计算操作员通过自身岗位、组织树继承以及管理员直接授予（不含他人委托）拥有的原生角色集合。"""
++    gw_state = get_gateway_state(db_path)
++    cache = get_perm_cache(gw_state, tenant_id)
++    return set(cache.get_native_roles(user_id))
++
++
++def _collect_upstream_grantors_mem(
++    cache: TenantPermCache,
+     grantee_user_id: str,
+     role_name: str,
+     at_ts: int,
+     depth: int = 0,
++    visited: set[str] | None = None,
+ ) -> list[tuple[str, int]]:
+-    """沿当前有效时间窗回溯指定角色的上游委托路径，返回 (上游委托人 user_id, 路径跳数) 列表。"""
+-    conn = open_connection(db_path)
+-    try:
+-        d_rows = conn.execute(
+-            "SELECT grantor_user_id, starts_at, expires_at "
+-            "FROM delegation_grants "
+-            "WHERE tenant_id = ? AND grantee_user_id = ? AND delegated_role = ? AND active = 1",
+-            (tenant_id, grantee_user_id, role_name),
+-        ).fetchall()
+-        active_grantors: list[str] = []
+-        for dr in d_rows:
+-            s_ts = int(dr["starts_at"])
+-            e_ts = int(dr["expires_at"])
+-            if not (s_ts <= at_ts < e_ts):
+-                continue
+-            gid = str(dr["grantor_user_id"])
+-            u_row = conn.execute(
+-                "SELECT active FROM users WHERE tenant_id = ? AND user_id = ?",
+-                (tenant_id, gid),
+-            ).fetchone()
+-            if u_row and int(u_row["active"]) == 1:
+-                active_grantors.append(gid)
+-    finally:
+-        conn.close()
++    if depth >= MAX_DELEGATION_HOPS:
++        return []
++    if visited is None:
++        visited = {grantee_user_id}
+ 
+     discovered: list[tuple[str, int]] = []
+-    for gid in active_grantors:
++    for gid, d_role, s_ts, e_ts in cache.delegations_by_grantee.get(grantee_user_id, ()):
++        if d_role != role_name:
++            continue
++        if not (s_ts <= at_ts < e_ts):
++            continue
++        if gid in visited:
++            continue
++        u_info = cache.users.get(gid)
++        if not u_info or u_info[4] != 1:
++            continue
+         next_hop = depth + 1
+         discovered.append((gid, next_hop))
+-        discovered.extend(
+-            _collect_upstream_grantors(
+-                db_path,
+-                tenant_id,
+-                gid,
+-                role_name,
+-                at_ts,
+-                next_hop,
++        if next_hop < MAX_DELEGATION_HOPS:
++            visited.add(gid)
++            discovered.extend(
++                _collect_upstream_grantors_mem(
++                    cache,
++                    gid,
++                    role_name,
++                    at_ts,
++                    next_hop,
++                    visited,
++                )
+             )
+-        )
++            visited.discard(gid)
+     return discovered
+ 
+ 
+-def resolve_active_delegated_roles(
+-    db_path: str,
+-    tenant_id: str,
++def resolve_active_delegated_roles_from_cache(
++    cache: TenantPermCache,
+     grantee_user_id: str,
+     at_ts: int,
+ ) -> set[str]:
+-    """查询在指定时刻 at_ts 对受托人生效的临时借调角色（最多支持 MAX_DELEGATION_HOPS=2 跳传递）。
+-
+-    级联有效性约束：
+-    1. 整条借调链路（1 跳直接委托或 2 跳转借调）上的每一段记录均须 active=1 且满足 starts_at <= at_ts < expires_at；
+-    2. 链路中间受托人与源头委托人当前均须 active=1，且源头委托人当前实际持有该原生角色；
+-    3. 一旦源头委托人被撤回角色、或上游一级委托被撤销/跨过 expires_at，下游受托资格自动级联失效；超过 2 跳不再生效。
+-    """
+-    conn = open_connection(db_path)
+-    try:
+-        d_rows = conn.execute(
+-            "SELECT DISTINCT delegated_role, starts_at, expires_at "
+-            "FROM delegation_grants "
+-            "WHERE tenant_id = ? AND grantee_user_id = ? AND active = 1",
+-            (tenant_id, grantee_user_id),
+-        ).fetchall()
+-    finally:
+-        conn.close()
+-
+     candidate_roles = {
+-        str(dr["delegated_role"])
+-        for dr in d_rows
+-        if int(dr["starts_at"]) <= at_ts < int(dr["expires_at"])
++        d_role
++        for _, d_role, s_ts, e_ts in cache.delegations_by_grantee.get(grantee_user_id, ())
++        if s_ts <= at_ts < e_ts
+     }
+-
+     effective_delegated: set[str] = set()
+     for role_name in candidate_roles:
+-        upstream_chain = _collect_upstream_grantors(
+-            db_path,
+-            tenant_id,
++        upstream_chain = _collect_upstream_grantors_mem(
++            cache,
+             grantee_user_id,
+             role_name,
+             at_ts,
+         )
+         for src_uid, hop_dist in upstream_chain:
+             if 1 <= hop_dist <= MAX_DELEGATION_HOPS:
+-                src_native = resolve_base_and_explicit_roles(db_path, tenant_id, src_uid)
+-                if role_name in src_native:
++                if role_name in cache.get_native_roles(src_uid):
+                     effective_delegated.add(role_name)
+                     break
+     return effective_delegated
++
++
++def resolve_active_delegated_roles(
++    db_path: str,
++    tenant_id: str,
++    grantee_user_id: str,
++    at_ts: int,
++) -> set[str]:
++    """查询在指定时刻 at_ts 对受托人生效的临时借调角色（最多支持 MAX_DELEGATION_HOPS=2 跳传递）。"""
++    gw_state = get_gateway_state(db_path)
++    cache = get_perm_cache(gw_state, tenant_id)
++    return resolve_active_delegated_roles_from_cache(cache, grantee_user_id, at_ts)
++
++
++def _would_create_cycle(
++    cache: TenantPermCache,
++    grantor_user_id: str,
++    grantee_user_id: str,
++    delegated_role: str,
++) -> bool:
++    """检查新增 grantor -> grantee 是否会在 active 委托图中形成有向环路。"""
++    stack = [grantor_user_id]
++    seen: set[str] = set()
++    while stack:
++        curr = stack.pop()
++        if curr == grantee_user_id:
++            return True
++        if curr in seen:
++            continue
++        seen.add(curr)
++        for up_gid, d_role, _, _ in cache.delegations_by_grantee.get(curr, ()):
++            if d_role == delegated_role and up_gid not in seen:
++                stack.append(up_gid)
++    return False
+ 
+ 
+ def create_or_revoke_delegation(
+@@ -166,54 +261,65 @@
+     if grantor_user_id == grantee_user_id:
+         raise ValueError("Cannot delegate role to self")
+ 
++    s_ts = parse_strict_int(starts_at, "starts_at")
++    e_ts = parse_strict_int(expires_at, "expires_at")
+     eval_ts = int(now_ts if now_ts is not None else time.time())
+-    conn = open_connection(db_path)
+-    try:
+-        u_check = conn.execute(
+-            "SELECT COUNT(*) AS cnt FROM users WHERE tenant_id = ? AND user_id IN (?, ?) AND active = 1",
+-            (tenant_id, grantor_user_id, grantee_user_id),
+-        ).fetchone()
+-        if not u_check or int(u_check["cnt"]) < 2:
++
++    gw_state = get_gateway_state(db_path)
++    t_state = gw_state.tenant(tenant_id)
++    with t_state.perm_lock:
++        cache = get_perm_cache(gw_state, tenant_id)
++        g_info = cache.users.get(grantor_user_id)
++        e_info = cache.users.get(grantee_user_id)
++        if not g_info or g_info[4] != 1 or not e_info or e_info[4] != 1:
+             raise LookupError("Grantor or grantee not found in tenant")
+ 
+         if action == "create":
+-            if expires_at <= starts_at:
++            if e_ts <= s_ts:
+                 raise ValueError("expires_at must be greater than starts_at")
+-            grantor_native = resolve_base_and_explicit_roles(db_path, tenant_id, grantor_user_id)
++            if _would_create_cycle(cache, grantor_user_id, grantee_user_id, delegated_role):
++                raise ValueError("Delegation cycle detected")
++
++            grantor_native = cache.get_native_roles(grantor_user_id)
+             can_delegate = delegated_role in grantor_native
+             if not can_delegate and MAX_DELEGATION_HOPS >= 2:
+-                upstream = _collect_upstream_grantors(
+-                    db_path,
+-                    tenant_id,
++                upstream = _collect_upstream_grantors_mem(
++                    cache,
+                     grantor_user_id,
+                     delegated_role,
+                     eval_ts,
+                 )
+                 can_delegate = any(
+-                    hop == 1 and delegated_role in resolve_base_and_explicit_roles(db_path, tenant_id, src_uid)
++                    hop == 1 and delegated_role in cache.get_native_roles(src_uid)
+                     for src_uid, hop in upstream
+                 )
+             if not can_delegate:
+                 raise PermissionError("Grantor does not possess delegatable role within hop limit")
+-            conn.execute(
+-                "INSERT INTO delegation_grants("
+-                "tenant_id, grantor_user_id, grantee_user_id, delegated_role, starts_at, expires_at, active, created_at"
+-                ") VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+-                (tenant_id, grantor_user_id, grantee_user_id, delegated_role, int(starts_at), int(expires_at), eval_ts),
+-            )
++
++            with gw_state.pool.borrow() as conn:
++                conn.execute("BEGIN IMMEDIATE")
++                conn.execute(
++                    "INSERT INTO delegation_grants("
++                    "tenant_id, grantor_user_id, grantee_user_id, delegated_role, starts_at, expires_at, active, created_at"
++                    ") VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
++                    (tenant_id, grantor_user_id, grantee_user_id, delegated_role, s_ts, e_ts, eval_ts),
++                )
++                conn.commit()
+             affected = 1
+         elif action == "revoke":
+-            cur = conn.execute(
+-                "UPDATE delegation_grants SET active = 0 "
+-                "WHERE tenant_id = ? AND grantor_user_id = ? AND grantee_user_id = ? AND delegated_role = ? AND active = 1",
+-                (tenant_id, grantor_user_id, grantee_user_id, delegated_role),
+-            )
+-            affected = cur.rowcount
++            with gw_state.pool.borrow() as conn:
++                conn.execute("BEGIN IMMEDIATE")
++                cur = conn.execute(
++                    "UPDATE delegation_grants SET active = 0 "
++                    "WHERE tenant_id = ? AND grantor_user_id = ? AND grantee_user_id = ? AND delegated_role = ? AND active = 1",
++                    (tenant_id, grantor_user_id, grantee_user_id, delegated_role),
++                )
++                affected = cur.rowcount
++                conn.commit()
+         else:
+             raise ValueError("action must be 'create' or 'revoke'")
+-        conn.commit()
+-    finally:
+-        conn.close()
++
++        t_state.perm_epoch += 1
+ 
+     return {
+         "tenant_id": tenant_id,
+
+--- a/aegis_app/doc_indexer.py
++++ b/aegis_app/doc_indexer.py
+@@ -1,30 +1,57 @@
+ # -*- coding: utf-8 -*-
+-"""合规文本分词、相邻查询词最小跨度邻近度加分与词袋相似度计算模块。"""
++"""合规文本分词、双指针相邻词距邻近度加分与集合剪枝相似度计算模块。"""
+ from __future__ import annotations
+ 
++from array import array
+ import re
++from typing import AbstractSet, Sequence
+ 
+ from .config import PROXIMITY_MAX_SPAN
+ 
+ TOKEN_RE = re.compile(r"[a-z0-9_]{2,}")
++_NON_TOKEN_RE = re.compile(r"[^a-zA-Z0-9_]+")
+ 
+ 
+ def tokenize_text(text: str) -> list[str]:
+     if not text:
+         return []
+-    cleaned = re.sub(r"[^a-zA-Z0-9_]+", " ", text).lower()
+-    return [tok for tok in TOKEN_RE.findall(cleaned) if len(tok) >= 2]
++    cleaned = _NON_TOKEN_RE.sub(" ", text).lower()
++    return TOKEN_RE.findall(cleaned)
++
++
++def _min_two_pointer_dist(pos_a: Sequence[int], pos_b: Sequence[int]) -> int | None:
++    """在两个有序下标序列上执行 O(|pos_a| + |pos_b|) 双指针扫描，遇到距离 1 立即早停。"""
++    ia = 0
++    ib = 0
++    na = len(pos_a)
++    nb = len(pos_b)
++    min_dist: int | None = None
++    while ia < na and ib < nb:
++        pa = pos_a[ia]
++        pb = pos_b[ib]
++        dist = pa - pb if pa >= pb else pb - pa
++        if dist >= 1:
++            if min_dist is None or dist < min_dist:
++                min_dist = dist
++                if min_dist == 1:
++                    return 1
++        if pa < pb:
++            ia += 1
++        else:
++            ib += 1
++    return min_dist
+ 
+ 
+ def compute_phrase_proximity_bonus(body_tokens: list[str], query_terms: list[str]) -> float:
+-    """计算相邻查询词对在正文词序列中的最小距离邻近度加分。
+-
+-    规则：若去重查询词序列包含至少 2 个词项 (q_0, q_1, ..., q_{k-1})，
+-    对每个相邻词对 (q_m, q_{m+1})，找出它们在 body_tokens 中出现下标的最小绝对差 d = min |i - j|；
+-    若 1 <= d <= PROXIMITY_MAX_SPAN(6)，则累加 2.4 / d。
+-    """
++    """计算相邻查询词对在正文词序列中的最小距离邻近度加分（双指针 + 早停）。"""
+     if len(query_terms) < 2 or not body_tokens:
+         return 0.0
++
++    wanted = set(query_terms)
++    positions: dict[str, list[int]] = {}
++    for idx, tok in enumerate(body_tokens):
++        if tok in wanted:
++            positions.setdefault(tok, []).append(idx)
+ 
+     bonus = 0.0
+     for idx in range(len(query_terms) - 1):
+@@ -32,37 +59,75 @@
+         term_b = query_terms[idx + 1]
+         if term_a == term_b:
+             continue
+-        pos_a = [i for i, tok in enumerate(body_tokens) if tok == term_a]
+-        pos_b = [j for j, tok in enumerate(body_tokens) if tok == term_b]
++        pos_a = positions.get(term_a)
++        pos_b = positions.get(term_b)
+         if not pos_a or not pos_b:
+             continue
+-
+-        min_dist: int | None = None
+-        for i in pos_a:
+-            for j in pos_b:
+-                dist = abs(i - j)
+-                if dist >= 1 and (min_dist is None or dist < min_dist):
+-                    min_dist = dist
++        min_dist = _min_two_pointer_dist(pos_a, pos_b)
+         if min_dist is not None and 1 <= min_dist <= PROXIMITY_MAX_SPAN:
+             bonus += 2.4 / float(min_dist)
+     return bonus
+ 
+ 
++def compute_phrase_proximity_bonus_from_seq(
++    body_seq: array,
++    query_tids: list[int],
++) -> float:
++    """基于驻留词元 ID 紧凑数组的双指针邻近度加分。"""
++    if len(query_tids) < 2 or not body_seq:
++        return 0.0
++
++    wanted = set(query_tids)
++    positions: dict[int, list[int]] = {}
++    for idx, tid in enumerate(body_seq):
++        if tid in wanted:
++            positions.setdefault(tid, []).append(idx)
++
++    bonus = 0.0
++    for idx in range(len(query_tids) - 1):
++        ta = query_tids[idx]
++        tb = query_tids[idx + 1]
++        if ta == tb:
++            continue
++        pos_a = positions.get(ta)
++        pos_b = positions.get(tb)
++        if not pos_a or not pos_b:
++            continue
++        min_dist = _min_two_pointer_dist(pos_a, pos_b)
++        if min_dist is not None and 1 <= min_dist <= PROXIMITY_MAX_SPAN:
++            bonus += 2.4 / float(min_dist)
++    return bonus
++
++
++def jaccard_similarity_from_sets(
++    set_a: AbstractSet[int],
++    set_b: AbstractSet[int],
++    min_threshold: float = 0.0,
++) -> float:
++    """基于词元 ID 集合与大小比值剪枝的 O(min(|A|, |B|)) Jaccard 相似度计算。"""
++    la = len(set_a)
++    lb = len(set_b)
++    if la == 0 and lb == 0:
++        return 1.0
++    if la == 0 or lb == 0:
++        return 0.0
++    min_l = la if la < lb else lb
++    max_l = lb if la < lb else la
++    if min_threshold > 0.0 and (min_l / max_l) < min_threshold:
++        return 0.0
++    smaller, larger = (set_a, set_b) if la <= lb else (set_b, set_a)
++    inter_cnt = sum(1 for t in smaller if t in larger)
++    union_cnt = la + lb - inter_cnt
++    return inter_cnt / union_cnt if union_cnt > 0 else 0.0
++
++
+ def jaccard_similarity_from_texts(title_a: str, body_a: str, title_b: str, body_b: str) -> float:
+-    tokens_a = tokenize_text(title_a) + tokenize_text(body_a)
+-    tokens_b = tokenize_text(title_b) + tokenize_text(body_b)
+-    uniq_a: list[str] = []
+-    for t in tokens_a:
+-        if t not in uniq_a:
+-            uniq_a.append(t)
+-    uniq_b: list[str] = []
+-    for t in tokens_b:
+-        if t not in uniq_b:
+-            uniq_b.append(t)
+-    if not uniq_a and not uniq_b:
++    set_a = set(tokenize_text(title_a)) | set(tokenize_text(body_a))
++    set_b = set(tokenize_text(title_b)) | set(tokenize_text(body_b))
++    if not set_a and not set_b:
+         return 1.0
+-    inter_cnt = sum(1 for t in uniq_a if t in uniq_b)
+-    union_cnt = len(uniq_a) + sum(1 for t in uniq_b if t not in uniq_a)
+-    if union_cnt == 0:
++    if not set_a or not set_b:
+         return 0.0
+-    return inter_cnt / union_cnt
++    inter_cnt = len(set_a & set_b)
++    union_cnt = len(set_a) + len(set_b) - inter_cnt
++    return inter_cnt / union_cnt if union_cnt > 0 else 0.0
+
+--- /dev/null
++++ b/aegis_app/doc_store.py
+@@ -0,0 +1,315 @@
++# -*- coding: utf-8 -*-
++"""租户级紧凑增量倒排索引与双向有效引用传播图（__slots__ + 驻留词元 ID）。"""
++from __future__ import annotations
++
++from array import array
++from collections import Counter
++from typing import Any
++
++from .doc_indexer import tokenize_text
++from .legacy_compat import canonicalize_regulation_code
++from .state import GatewayState, TenantState, TokenInterner
++
++
++class CompactDocEntry:
++    """单篇合规文档的紧凑内存索引节点（不保留大体积原始全文 body）。"""
++
++    __slots__ = (
++        "doc_id",
++        "category",
++        "regulation_code",
++        "canon_reg",
++        "clearance_level",
++        "risk_weight",
++        "custom_tag",
++        "title",
++        "snippet",
++        "status",
++        "quarantined",
++        "updated_at",
++        "title_tf",
++        "body_tf",
++        "body_seq",
++        "uniq_tokens",
++        "ext_refs",
++        "int_refs",
++        "valid_citation_count",
++    )
++
++    def __init__(
++        self,
++        *,
++        doc_id: str,
++        category: str,
++        regulation_code: str,
++        clearance_level: int,
++        risk_weight: int,
++        custom_tag: str,
++        title: str,
++        snippet: str,
++        status: str,
++        quarantined: int,
++        updated_at: int,
++        title_tf: dict[int, int],
++        body_tf: dict[int, int],
++        body_seq: array,
++        uniq_tokens: frozenset[int],
++    ) -> None:
++        self.doc_id = doc_id
++        self.category = category
++        self.regulation_code = regulation_code
++        self.canon_reg = canonicalize_regulation_code(regulation_code)
++        self.clearance_level = clearance_level
++        self.risk_weight = risk_weight
++        self.custom_tag = custom_tag
++        self.title = title
++        self.snippet = snippet
++        self.status = status
++        self.quarantined = quarantined
++        self.updated_at = updated_at
++        self.title_tf = title_tf
++        self.body_tf = body_tf
++        self.body_seq = body_seq
++        self.uniq_tokens = uniq_tokens
++        self.ext_refs: set[str] = set()
++        self.int_refs: set[str] = set()
++        self.valid_citation_count = 0
++
++
++def _build_entry(
++    interner: TokenInterner,
++    *,
++    doc_id: str,
++    category: str,
++    regulation_code: str,
++    clearance_level: int,
++    risk_weight: int,
++    custom_tag: str,
++    title: str,
++    body: str,
++    status: str,
++    quarantined: int,
++    updated_at: int,
++) -> CompactDocEntry:
++    t_tokens = tokenize_text(title)
++    b_tokens = tokenize_text(body)
++    t_ids = [interner.intern(t) for t in t_tokens]
++    b_ids = [interner.intern(t) for t in b_tokens]
++    title_tf = dict(Counter(t_ids))
++    body_tf = dict(Counter(b_ids))
++    body_seq = array("I", b_ids)
++    uniq_tokens = frozenset(title_tf.keys()) | frozenset(body_tf.keys())
++    return CompactDocEntry(
++        doc_id=doc_id,
++        category=category,
++        regulation_code=regulation_code,
++        clearance_level=clearance_level,
++        risk_weight=risk_weight,
++        custom_tag=custom_tag,
++        title=title,
++        snippet=body[:140],
++        status=status,
++        quarantined=quarantined,
++        updated_at=updated_at,
++        title_tf=title_tf,
++        body_tf=body_tf,
++        body_seq=body_seq,
++        uniq_tokens=uniq_tokens,
++    )
++
++
++class TenantDocIndex:
++    """单租户增量文档倒排索引 + 反向依赖引用图。"""
++
++    def __init__(self, tenant_id: str, interner: TokenInterner) -> None:
++        self.tenant_id = tenant_id
++        self.interner = interner
++        self.docs: dict[str, CompactDocEntry] = {}
++        self.active_doc_ids: set[str] = set()
++        self.inverted_index: dict[int, set[str]] = {}
++        self.reverse_dependents: dict[str, set[str]] = {}
++
++    def _is_valid_source(self, doc_id: str) -> bool:
++        e = self.docs.get(doc_id)
++        return e is not None and e.status == "ACTIVE" and e.quarantined == 0
++
++    def _add_to_inverted(self, entry: CompactDocEntry) -> None:
++        did = entry.doc_id
++        self.active_doc_ids.add(did)
++        inv = self.inverted_index
++        for tid in entry.uniq_tokens:
++            postings = inv.get(tid)
++            if postings is None:
++                inv[tid] = {did}
++            else:
++                postings.add(did)
++
++    def _remove_from_inverted(self, entry: CompactDocEntry) -> None:
++        did = entry.doc_id
++        self.active_doc_ids.discard(did)
++        inv = self.inverted_index
++        for tid in entry.uniq_tokens:
++            postings = inv.get(tid)
++            if postings is not None:
++                postings.discard(did)
++                if not postings:
++                    del inv[tid]
++
++    def _recompute_citation_count(self, entry: CompactDocEntry) -> None:
++        cnt = len(entry.ext_refs)
++        for ref_id in entry.int_refs:
++            if self._is_valid_source(ref_id):
++                cnt += 1
++        entry.valid_citation_count = cnt
++
++    def _propagate_source_flip(self, source_doc_id: str, old_valid: bool, new_valid: bool) -> None:
++        if old_valid == new_valid:
++            return
++        delta = 1 if new_valid else -1
++        for dep_id in self.reverse_dependents.get(source_doc_id, ()):
++            dep_entry = self.docs.get(dep_id)
++            if dep_entry is not None:
++                dep_entry.valid_citation_count += delta
++
++    def load_from_db(self, gw_state: GatewayState) -> None:
++        with gw_state.pool.borrow() as conn:
++            doc_rows = conn.execute(
++                "SELECT doc_id, category, regulation_code, clearance_level, risk_weight, "
++                "custom_tag, title, body, status, quarantined, updated_at "
++                "FROM compliance_docs WHERE tenant_id = ?",
++                (self.tenant_id,),
++            ).fetchall()
++            cite_rows = conn.execute(
++                "SELECT doc_id, cited_by_ref FROM doc_citations WHERE tenant_id = ?",
++                (self.tenant_id,),
++            ).fetchall()
++
++        for r in doc_rows:
++            entry = _build_entry(
++                self.interner,
++                doc_id=r["doc_id"],
++                category=r["category"],
++                regulation_code=r["regulation_code"],
++                clearance_level=int(r["clearance_level"]),
++                risk_weight=int(r["risk_weight"]),
++                custom_tag=r["custom_tag"],
++                title=r["title"],
++                body=r["body"],
++                status=r["status"],
++                quarantined=int(r["quarantined"]),
++                updated_at=int(r["updated_at"]),
++            )
++            self.docs[entry.doc_id] = entry
++            if entry.status == "ACTIVE" and entry.quarantined == 0:
++                self._add_to_inverted(entry)
++
++        for cr in cite_rows:
++            did = cr["doc_id"]
++            ref = str(cr["cited_by_ref"] or "").strip()
++            entry = self.docs.get(did)
++            if entry is None or not ref or ref == did:
++                continue
++            if ref.startswith("doc_"):
++                entry.int_refs.add(ref)
++                self.reverse_dependents.setdefault(ref, set()).add(did)
++            else:
++                entry.ext_refs.add(ref)
++
++        for entry in self.docs.values():
++            self._recompute_citation_count(entry)
++
++    def apply_upsert(
++        self,
++        *,
++        doc_id: str,
++        category: str,
++        regulation_code: str,
++        clearance_level: int,
++        risk_weight: int,
++        custom_tag: str,
++        title: str,
++        body: str,
++        quarantined: int,
++        updated_at: int,
++        new_citations: list[str],
++    ) -> None:
++        old_entry = self.docs.get(doc_id)
++        old_valid = self._is_valid_source(doc_id)
++        if old_entry is not None and old_entry.doc_id in self.active_doc_ids:
++            self._remove_from_inverted(old_entry)
++
++        entry = _build_entry(
++            self.interner,
++            doc_id=doc_id,
++            category=category,
++            regulation_code=regulation_code,
++            clearance_level=clearance_level,
++            risk_weight=risk_weight,
++            custom_tag=custom_tag,
++            title=title,
++            body=body,
++            status="ACTIVE",
++            quarantined=quarantined,
++            updated_at=updated_at,
++        )
++        if old_entry is not None:
++            entry.ext_refs = old_entry.ext_refs
++            entry.int_refs = old_entry.int_refs
++
++        for c_ref in new_citations:
++            ref = str(c_ref or "").strip()
++            if not ref or ref == doc_id:
++                continue
++            if ref.startswith("doc_"):
++                entry.int_refs.add(ref)
++                self.reverse_dependents.setdefault(ref, set()).add(doc_id)
++            else:
++                entry.ext_refs.add(ref)
++
++        self.docs[doc_id] = entry
++        if entry.status == "ACTIVE" and entry.quarantined == 0:
++            self._add_to_inverted(entry)
++        self._recompute_citation_count(entry)
++
++        new_valid = self._is_valid_source(doc_id)
++        self._propagate_source_flip(doc_id, old_valid, new_valid)
++
++    def apply_status_change(
++        self,
++        doc_id: str,
++        *,
++        status: str | None = None,
++        quarantined: int | None = None,
++        updated_at: int,
++    ) -> None:
++        entry = self.docs.get(doc_id)
++        if entry is None:
++            return
++        old_valid = self._is_valid_source(doc_id)
++        if status is not None:
++            entry.status = status
++        if quarantined is not None:
++            entry.quarantined = quarantined
++        entry.updated_at = updated_at
++
++        new_valid = self._is_valid_source(doc_id)
++        if old_valid and not new_valid:
++            self._remove_from_inverted(entry)
++        elif not old_valid and new_valid:
++            self._add_to_inverted(entry)
++
++        self._propagate_source_flip(doc_id, old_valid, new_valid)
++
++
++def get_or_load_doc_index(gw_state: GatewayState, t_state: TenantState) -> TenantDocIndex:
++    """线程安全地懒加载并返回租户增量文档索引。"""
++    idx = t_state.doc_index
++    if idx is not None:
++        return idx
++    with t_state.doc_lock:
++        idx = t_state.doc_index
++        if idx is None:
++            idx = TenantDocIndex(t_state.tenant_id, gw_state.interner)
++            idx.load_from_db(gw_state)
++            t_state.doc_index = idx
++        return idx
+
+--- a/aegis_app/doc_writer.py
++++ b/aegis_app/doc_writer.py
+@@ -1,5 +1,5 @@
+ # -*- coding: utf-8 -*-
+-"""企业合规文档实时流式入库、正文修订（Upsert）与退役归档（Retire）服务。"""
++"""企业合规文档实时流式入库、单篇增量索引更新（Upsert）与退役归档（Retire）服务。"""
+ from __future__ import annotations
+ 
+ import time
+@@ -7,7 +7,12 @@
+ 
+ from .auth import CallerContext
+ from .config import CLEARANCE_LEVELS
+-from .db import open_connection
++from .doc_store import get_or_load_doc_index
++from .state import get_gateway_state
++from .validation import parse_strict_int
++
++MAX_CITATIONS_PER_UPSERT = 200
++MAX_CITATION_REF_LEN = 128
+ 
+ 
+ def _require_editor_clearance(caller: CallerContext, doc_clearance: int) -> None:
+@@ -22,88 +27,130 @@
+     caller: CallerContext,
+     payload: dict[str, Any],
+ ) -> dict[str, Any]:
+-    """实时新增或修订本租户下的合规文档，并同步登记可选引用记录。"""
++    """实时新增或修订本租户下的合规文档，并增量更新倒排索引与双向引用图。"""
+     doc_id = str(payload.get("doc_id") or "").strip()
+     category = str(payload.get("category") or "AML").strip().upper()
+     regulation_code = str(payload.get("regulation_code") or "").strip()
+-    clearance_level = int(payload.get("clearance_level") or 2)
+-    risk_weight = int(payload.get("risk_weight") or 10)
++    clearance_level = parse_strict_int(
++        payload.get("clearance_level", 2) if payload.get("clearance_level") is not None else 2,
++        "clearance_level",
++    )
++    risk_weight = parse_strict_int(
++        payload.get("risk_weight", 10) if payload.get("risk_weight") is not None else 10,
++        "risk_weight",
++        min_val=0,
++        max_val=200,
++    )
+     custom_tag = str(payload.get("custom_tag") or "tag_default").strip()
+     title = str(payload.get("title") or "").strip()
+     body = str(payload.get("body") or "").strip()
+-    updated_at = int(payload.get("updated_at") or caller.request_ts or int(time.time()))
++    raw_upd = payload.get("updated_at")
++    updated_at = (
++        parse_strict_int(raw_upd, "updated_at", min_val=1)
++        if raw_upd is not None
++        else int(caller.request_ts or int(time.time()))
++    )
+     citations = payload.get("citations") or []
+ 
+     if not doc_id or not title or not body:
+         raise ValueError("doc_id, title, and body are required")
+     if clearance_level not in CLEARANCE_LEVELS.values():
+         raise ValueError("clearance_level must be in 1..4")
+-    if risk_weight < 0 or risk_weight > 200:
+-        raise ValueError("risk_weight must be between 0 and 200")
++    if not isinstance(citations, list):
++        raise ValueError("citations must be a list")
++    if len(citations) > MAX_CITATIONS_PER_UPSERT:
++        raise ValueError(f"citations exceeds maximum budget ({MAX_CITATIONS_PER_UPSERT})")
++
++    cleaned_citations: list[str] = []
++    for c_ref in citations:
++        s_ref = str(c_ref or "").strip()
++        if len(s_ref) > MAX_CITATION_REF_LEN:
++            raise ValueError("citation reference exceeds maximum length")
++        if s_ref:
++            cleaned_citations.append(s_ref)
+ 
+     _require_editor_clearance(caller, clearance_level)
+ 
+-    conn = open_connection(db_path)
+-    try:
+-        existing = conn.execute(
+-            "SELECT tenant_id, clearance_level, quarantined FROM compliance_docs WHERE doc_id = ?",
+-            (doc_id,),
+-        ).fetchone()
+-        if existing:
+-            if existing["tenant_id"] != caller.tenant_id:
+-                raise PermissionError("Document ID belongs to another tenant")
+-            if int(existing["clearance_level"]) > caller.max_clearance:
+-                raise PermissionError("Existing document exceeds caller clearance")
+-            keep_q = int(existing["quarantined"])
+-            conn.execute(
+-                "UPDATE compliance_docs SET category = ?, regulation_code = ?, clearance_level = ?, "
+-                "risk_weight = ?, custom_tag = ?, title = ?, body = ?, status = 'ACTIVE', quarantined = ?, updated_at = ? "
+-                "WHERE tenant_id = ? AND doc_id = ?",
+-                (
+-                    category,
+-                    regulation_code,
+-                    clearance_level,
+-                    risk_weight,
+-                    custom_tag,
+-                    title,
+-                    body,
+-                    keep_q,
+-                    updated_at,
+-                    caller.tenant_id,
+-                    doc_id,
+-                ),
+-            )
+-            mode = "updated"
+-        else:
+-            conn.execute(
+-                "INSERT INTO compliance_docs("
+-                "doc_id, tenant_id, category, regulation_code, clearance_level, risk_weight, "
+-                "custom_tag, title, body, status, quarantined, updated_at"
+-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', 0, ?)",
+-                (
+-                    doc_id,
+-                    caller.tenant_id,
+-                    category,
+-                    regulation_code,
+-                    clearance_level,
+-                    risk_weight,
+-                    custom_tag,
+-                    title,
+-                    body,
+-                    updated_at,
+-                ),
+-            )
+-            mode = "created"
++    gw_state = get_gateway_state(db_path)
++    t_state = gw_state.tenant(caller.tenant_id)
++    with t_state.doc_lock:
++        idx = get_or_load_doc_index(gw_state, t_state)
++        with gw_state.pool.borrow() as conn:
++            conn.execute("BEGIN IMMEDIATE")
++            existing = conn.execute(
++                "SELECT tenant_id, clearance_level, quarantined FROM compliance_docs WHERE doc_id = ?",
++                (doc_id,),
++            ).fetchone()
++            if existing:
++                if existing["tenant_id"] != caller.tenant_id:
++                    conn.rollback()
++                    raise PermissionError("Document ID belongs to another tenant")
++                if int(existing["clearance_level"]) > caller.max_clearance:
++                    conn.rollback()
++                    raise PermissionError("Existing document exceeds caller clearance")
++                keep_q = int(existing["quarantined"])
++                conn.execute(
++                    "UPDATE compliance_docs SET category = ?, regulation_code = ?, clearance_level = ?, "
++                    "risk_weight = ?, custom_tag = ?, title = ?, body = ?, status = 'ACTIVE', quarantined = ?, updated_at = ? "
++                    "WHERE tenant_id = ? AND doc_id = ?",
++                    (
++                        category,
++                        regulation_code,
++                        clearance_level,
++                        risk_weight,
++                        custom_tag,
++                        title,
++                        body,
++                        keep_q,
++                        updated_at,
++                        caller.tenant_id,
++                        doc_id,
++                    ),
++                )
++                mode = "updated"
++            else:
++                keep_q = 0
++                conn.execute(
++                    "INSERT INTO compliance_docs("
++                    "doc_id, tenant_id, category, regulation_code, clearance_level, risk_weight, "
++                    "custom_tag, title, body, status, quarantined, updated_at"
++                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', 0, ?)",
++                    (
++                        doc_id,
++                        caller.tenant_id,
++                        category,
++                        regulation_code,
++                        clearance_level,
++                        risk_weight,
++                        custom_tag,
++                        title,
++                        body,
++                        updated_at,
++                    ),
++                )
++                mode = "created"
+ 
+-        if isinstance(citations, list) and citations:
+-            for c_ref in citations:
+-                conn.execute(
++            if cleaned_citations:
++                conn.executemany(
+                     "INSERT INTO doc_citations(tenant_id, doc_id, cited_by_ref, cited_at) VALUES (?, ?, ?, ?)",
+-                    (caller.tenant_id, doc_id, str(c_ref), updated_at),
++                    [(caller.tenant_id, doc_id, s_ref, updated_at) for s_ref in cleaned_citations],
+                 )
+-        conn.commit()
+-    finally:
+-        conn.close()
++            conn.commit()
++
++        idx.apply_upsert(
++            doc_id=doc_id,
++            category=category,
++            regulation_code=regulation_code,
++            clearance_level=clearance_level,
++            risk_weight=risk_weight,
++            custom_tag=custom_tag,
++            title=title,
++            body=body,
++            quarantined=keep_q,
++            updated_at=updated_at,
++            new_citations=cleaned_citations,
++        )
++        t_state.doc_epoch += 1
+ 
+     return {
+         "tenant_id": caller.tenant_id,
+@@ -118,21 +165,28 @@
+     caller: CallerContext,
+     doc_id: str,
+ ) -> dict[str, Any]:
+-    """将指定合规文档置为 RETIRED 退役状态，不再参与常规在线检索。"""
++    """将指定合规文档置为 RETIRED 退役状态，并增量更新倒排索引与被引用方分值。"""
+     if "COMPLIANCE_ADMIN" not in caller.effective_roles:
+         raise PermissionError("COMPLIANCE_ADMIN role required to retire documents")
+     now_ts = int(caller.request_ts or int(time.time()))
+-    conn = open_connection(db_path)
+-    try:
+-        cur = conn.execute(
+-            "UPDATE compliance_docs SET status = 'RETIRED', updated_at = ? WHERE tenant_id = ? AND doc_id = ?",
+-            (now_ts, caller.tenant_id, doc_id),
+-        )
+-        if cur.rowcount == 0:
+-            raise LookupError(f"Document not found in tenant: {doc_id}")
+-        conn.commit()
+-    finally:
+-        conn.close()
++
++    gw_state = get_gateway_state(db_path)
++    t_state = gw_state.tenant(caller.tenant_id)
++    with t_state.doc_lock:
++        idx = get_or_load_doc_index(gw_state, t_state)
++        with gw_state.pool.borrow() as conn:
++            conn.execute("BEGIN IMMEDIATE")
++            cur = conn.execute(
++                "UPDATE compliance_docs SET status = 'RETIRED', updated_at = ? WHERE tenant_id = ? AND doc_id = ?",
++                (now_ts, caller.tenant_id, doc_id),
++            )
++            if cur.rowcount == 0:
++                conn.rollback()
++                raise LookupError(f"Document not found in tenant: {doc_id}")
++            conn.commit()
++
++        idx.apply_status_change(doc_id, status="RETIRED", updated_at=now_ts)
++        t_state.doc_epoch += 1
+ 
+     return {
+         "tenant_id": caller.tenant_id,
+
+--- a/aegis_app/ledger_ops.py
++++ b/aegis_app/ledger_ops.py
+@@ -1,14 +1,30 @@
+ # -*- coding: utf-8 -*-
+-"""租户配额扣减、跨配额池调拨（Quota Transfer）与单次应急放行令牌核销服务。"""
++"""租户配额扣减、跨配额池无死锁原子调拨（Quota Transfer）与单次应急放行令牌核销服务。"""
+ from __future__ import annotations
+ 
+ import json
++import sqlite3
+ import time
+ from typing import Any
+ 
+ from .auth import CallerContext, require_admin
+ from .config import ALERT_QUOTA_BUCKET
+-from .db import open_connection
++from .state import get_gateway_state
++from .validation import parse_strict_int
++
++
++def try_consume_realtime_alert_quota_in_tx(
++    conn: sqlite3.Connection,
++    tenant_id: str,
++    now_ts: int,
++) -> bool:
++    """在已开启的 BEGIN IMMEDIATE 事务内原子扣减 1 点 REALTIME_ALERT_POOL 配额。"""
++    cur = conn.execute(
++        "UPDATE tenant_quotas SET remaining_quota = remaining_quota - 1, updated_at = ? "
++        "WHERE tenant_id = ? AND quota_type = ? AND remaining_quota >= 1",
++        (int(now_ts), tenant_id, ALERT_QUOTA_BUCKET),
++    )
++    return cur.rowcount == 1
+ 
+ 
+ def try_consume_realtime_alert_quota(
+@@ -17,23 +33,14 @@
+     now_ts: int,
+ ) -> bool:
+     """高危风控拦截时从本租户 REALTIME_ALERT_POOL 尝试扣减 1 点实时告警配额。"""
+-    conn = open_connection(db_path)
+-    try:
+-        row = conn.execute(
+-            "SELECT remaining_quota FROM tenant_quotas WHERE tenant_id = ? AND quota_type = ?",
+-            (tenant_id, ALERT_QUOTA_BUCKET),
+-        ).fetchone()
+-        if not row or int(row["remaining_quota"]) < 1:
+-            return False
+-        new_rem = int(row["remaining_quota"]) - 1
+-        conn.execute(
+-            "UPDATE tenant_quotas SET remaining_quota = ?, updated_at = ? WHERE tenant_id = ? AND quota_type = ?",
+-            (new_rem, int(now_ts), tenant_id, ALERT_QUOTA_BUCKET),
+-        )
+-        conn.commit()
+-        return True
+-    finally:
+-        conn.close()
++    gw_state = get_gateway_state(db_path)
++    t_state = gw_state.tenant(tenant_id)
++    with t_state.quota_lock:
++        with gw_state.pool.borrow() as conn:
++            conn.execute("BEGIN IMMEDIATE")
++            ok = try_consume_realtime_alert_quota_in_tx(conn, tenant_id, now_ts)
++            conn.commit()
++            return ok
+ 
+ 
+ def consume_tenant_quota(
+@@ -43,53 +50,62 @@
+     quota_type: str,
+     amount: int = 1,
+ ) -> dict[str, Any]:
+-    """扣减租户指定类型的业务配额并返回剩余额度。"""
+-    if amount <= 0:
+-        raise ValueError("Quota consumption amount must be positive")
++    """扣减租户指定类型的业务配额并返回剩余额度（遵循 quota_lock -> BEGIN IMMEDIATE 锁序）。"""
++    amt = parse_strict_int(amount, "amount", min_val=1)
++    qtype = str(quota_type or "").strip()
++    if not qtype:
++        raise ValueError("quota_type is required")
++
+     now_ts = int(caller.request_ts or int(time.time()))
+-    conn = open_connection(db_path)
+-    try:
+-        row = conn.execute(
+-            "SELECT remaining_quota FROM tenant_quotas WHERE tenant_id = ? AND quota_type = ?",
+-            (caller.tenant_id, quota_type),
+-        ).fetchone()
+-        if not row:
+-            raise LookupError(f"Quota bucket not found: {quota_type}")
+-
+-        current_rem = int(row["remaining_quota"])
+-        if current_rem < amount:
++    gw_state = get_gateway_state(db_path)
++    t_state = gw_state.tenant(caller.tenant_id)
++
++    with t_state.quota_lock:
++        with gw_state.pool.borrow() as conn:
++            conn.execute("BEGIN IMMEDIATE")
++            cur = conn.execute(
++                "UPDATE tenant_quotas SET remaining_quota = remaining_quota - ?, updated_at = ? "
++                "WHERE tenant_id = ? AND quota_type = ? AND remaining_quota >= ?",
++                (amt, now_ts, caller.tenant_id, qtype, amt),
++            )
++            if cur.rowcount == 0:
++                row = conn.execute(
++                    "SELECT remaining_quota FROM tenant_quotas WHERE tenant_id = ? AND quota_type = ?",
++                    (caller.tenant_id, qtype),
++                ).fetchone()
++                conn.rollback()
++                if not row:
++                    raise LookupError(f"Quota bucket not found: {qtype}")
++                return {
++                    "accepted": False,
++                    "quota_type": qtype,
++                    "remaining_quota": int(row["remaining_quota"]),
++                    "reason": "QUOTA_EXHAUSTED",
++                }
++
++            row = conn.execute(
++                "SELECT remaining_quota FROM tenant_quotas WHERE tenant_id = ? AND quota_type = ?",
++                (caller.tenant_id, qtype),
++            ).fetchone()
++            new_rem = int(row["remaining_quota"])
++            conn.execute(
++                "INSERT INTO audit_logs(tenant_id, actor_id, event_type, severity, amount_cents, masked_account, ts, payload_json) "
++                "VALUES (?, ?, 'QUOTA_CONSUME', 'MEDIUM', ?, '****0000', ?, ?)",
++                (
++                    caller.tenant_id,
++                    caller.user_id,
++                    amt,
++                    now_ts,
++                    json.dumps({"quota_type": qtype, "consumed": amt, "remaining": new_rem}),
++                ),
++            )
++            conn.commit()
+             return {
+-                "accepted": False,
+-                "quota_type": quota_type,
+-                "remaining_quota": current_rem,
+-                "reason": "QUOTA_EXHAUSTED",
++                "accepted": True,
++                "quota_type": qtype,
++                "consumed": amt,
++                "remaining_quota": new_rem,
+             }
+-
+-        new_rem = current_rem - amount
+-        conn.execute(
+-            "INSERT INTO audit_logs(tenant_id, actor_id, event_type, severity, amount_cents, masked_account, ts, payload_json) "
+-            "VALUES (?, ?, 'QUOTA_CONSUME', 'MEDIUM', ?, '****0000', ?, ?)",
+-            (
+-                caller.tenant_id,
+-                caller.user_id,
+-                amount,
+-                now_ts,
+-                json.dumps({"quota_type": quota_type, "consumed": amount, "remaining": new_rem}),
+-            ),
+-        )
+-        conn.execute(
+-            "UPDATE tenant_quotas SET remaining_quota = ?, updated_at = ? WHERE tenant_id = ? AND quota_type = ?",
+-            (new_rem, now_ts, caller.tenant_id, quota_type),
+-        )
+-        conn.commit()
+-        return {
+-            "accepted": True,
+-            "quota_type": quota_type,
+-            "consumed": amount,
+-            "remaining_quota": new_rem,
+-        }
+-    finally:
+-        conn.close()
+ 
+ 
+ def transfer_tenant_quota(
+@@ -100,64 +116,71 @@
+     to_quota: str,
+     amount: int,
+ ) -> dict[str, Any]:
+-    """在本租户两个配额池之间调拨额度（须保证总额守恒、余额非负且高并发双向调拨零死锁）。"""
++    """在本租户两个配额池之间原子调拨额度（遵循 quota_lock -> BEGIN IMMEDIATE 偏序，零死锁）。"""
+     require_admin(caller)
+-    if amount <= 0:
+-        raise ValueError("Transfer amount must be positive")
+-    if not from_quota or not to_quota or from_quota == to_quota:
++    amt = parse_strict_int(amount, "amount", min_val=1)
++    src_q = str(from_quota or "").strip()
++    dst_q = str(to_quota or "").strip()
++    if not src_q or not dst_q or src_q == dst_q:
+         raise ValueError("Distinct non-empty from_quota and to_quota are required")
+ 
+     now_ts = int(caller.request_ts or int(time.time()))
+-    conn = open_connection(db_path)
+-    try:
+-        src_row = conn.execute(
+-            "SELECT remaining_quota FROM tenant_quotas WHERE tenant_id = ? AND quota_type = ?",
+-            (caller.tenant_id, from_quota),
+-        ).fetchone()
+-        dst_row = conn.execute(
+-            "SELECT remaining_quota FROM tenant_quotas WHERE tenant_id = ? AND quota_type = ?",
+-            (caller.tenant_id, to_quota),
+-        ).fetchone()
+-        if not src_row or not dst_row:
+-            raise LookupError("Source or destination quota pool not found")
+-
+-        src_rem = int(src_row["remaining_quota"])
+-        dst_rem = int(dst_row["remaining_quota"])
+-        if src_rem < amount:
++    gw_state = get_gateway_state(db_path)
++    t_state = gw_state.tenant(caller.tenant_id)
++
++    with t_state.quota_lock:
++        with gw_state.pool.borrow() as conn:
++            conn.execute("BEGIN IMMEDIATE")
++            src_row = conn.execute(
++                "SELECT remaining_quota FROM tenant_quotas WHERE tenant_id = ? AND quota_type = ?",
++                (caller.tenant_id, src_q),
++            ).fetchone()
++            dst_row = conn.execute(
++                "SELECT remaining_quota FROM tenant_quotas WHERE tenant_id = ? AND quota_type = ?",
++                (caller.tenant_id, dst_q),
++            ).fetchone()
++            if not src_row or not dst_row:
++                conn.rollback()
++                raise LookupError("Source or destination quota pool not found")
++
++            src_rem = int(src_row["remaining_quota"])
++            dst_rem = int(dst_row["remaining_quota"])
++            if src_rem < amt:
++                conn.rollback()
++                return {
++                    "transferred": False,
++                    "from_quota": src_q,
++                    "to_quota": dst_q,
++                    "from_remaining": src_rem,
++                    "to_remaining": dst_rem,
++                    "reason": "INSUFFICIENT_SOURCE_QUOTA",
++                }
++
++            new_src = src_rem - amt
++            new_dst = dst_rem + amt
++            conn.execute(
++                "UPDATE tenant_quotas SET remaining_quota = remaining_quota - ?, updated_at = ? "
++                "WHERE tenant_id = ? AND quota_type = ?",
++                (amt, now_ts, caller.tenant_id, src_q),
++            )
++            conn.execute(
++                "UPDATE tenant_quotas SET remaining_quota = remaining_quota + ?, updated_at = ? "
++                "WHERE tenant_id = ? AND quota_type = ?",
++                (amt, now_ts, caller.tenant_id, dst_q),
++            )
++            conn.execute(
++                "INSERT INTO quota_transfers(tenant_id, actor_id, from_quota, to_quota, amount, ts) VALUES (?, ?, ?, ?, ?, ?)",
++                (caller.tenant_id, caller.user_id, src_q, dst_q, amt, now_ts),
++            )
++            conn.commit()
+             return {
+-                "transferred": False,
+-                "from_quota": from_quota,
+-                "to_quota": to_quota,
+-                "from_remaining": src_rem,
+-                "to_remaining": dst_rem,
+-                "reason": "INSUFFICIENT_SOURCE_QUOTA",
++                "transferred": True,
++                "from_quota": src_q,
++                "to_quota": dst_q,
++                "amount": amt,
++                "from_remaining": new_src,
++                "to_remaining": new_dst,
+             }
+-
+-        new_src = src_rem - amount
+-        new_dst = dst_rem + amount
+-        conn.execute(
+-            "UPDATE tenant_quotas SET remaining_quota = ?, updated_at = ? WHERE tenant_id = ? AND quota_type = ?",
+-            (new_src, now_ts, caller.tenant_id, from_quota),
+-        )
+-        conn.execute(
+-            "UPDATE tenant_quotas SET remaining_quota = ?, updated_at = ? WHERE tenant_id = ? AND quota_type = ?",
+-            (new_dst, now_ts, caller.tenant_id, to_quota),
+-        )
+-        conn.execute(
+-            "INSERT INTO quota_transfers(tenant_id, actor_id, from_quota, to_quota, amount, ts) VALUES (?, ?, ?, ?, ?, ?)",
+-            (caller.tenant_id, caller.user_id, from_quota, to_quota, amount, now_ts),
+-        )
+-        conn.commit()
+-        return {
+-            "transferred": True,
+-            "from_quota": from_quota,
+-            "to_quota": to_quota,
+-            "amount": amount,
+-            "from_remaining": new_src,
+-            "to_remaining": new_dst,
+-        }
+-    finally:
+-        conn.close()
+ 
+ 
+ def redeem_override_token(
+@@ -167,23 +190,39 @@
+     token_id: str,
+     tx_ref: str,
+ ) -> dict[str, Any]:
+-    """核销单次使用的风控应急放行令牌。"""
++    """核销单次使用的风控应急放行令牌（BEGIN IMMEDIATE 条件更新防并发双花）。"""
++    tid = str(token_id or "").strip()
++    if not tid:
++        raise ValueError("token_id is required")
+     now_ts = int(caller.request_ts or int(time.time()))
+-    conn = open_connection(db_path)
+-    try:
+-        row = conn.execute(
+-            "SELECT token_id, tenant_id, purpose, used FROM override_tokens WHERE token_id = ? AND tenant_id = ?",
+-            (token_id, caller.tenant_id),
+-        ).fetchone()
+-        if not row:
+-            raise LookupError("Override token not found")
+-        if int(row["used"]) != 0:
++    gw_state = get_gateway_state(db_path)
++
++    with gw_state.pool.borrow() as conn:
++        conn.execute("BEGIN IMMEDIATE")
++        cur = conn.execute(
++            "UPDATE override_tokens SET used = 1, used_by = ?, used_at = ? "
++            "WHERE token_id = ? AND tenant_id = ? AND used = 0",
++            (caller.user_id, now_ts, tid, caller.tenant_id),
++        )
++        if cur.rowcount == 0:
++            row = conn.execute(
++                "SELECT used FROM override_tokens WHERE token_id = ? AND tenant_id = ?",
++                (tid, caller.tenant_id),
++            ).fetchone()
++            conn.rollback()
++            if not row:
++                raise LookupError("Override token not found")
+             return {
+                 "redeemed": False,
+-                "token_id": token_id,
++                "token_id": tid,
+                 "reason": "TOKEN_ALREADY_USED",
+             }
+ 
++        row = conn.execute(
++            "SELECT purpose FROM override_tokens WHERE token_id = ? AND tenant_id = ?",
++            (tid, caller.tenant_id),
++        ).fetchone()
++        purpose = row["purpose"]
+         conn.execute(
+             "INSERT INTO audit_logs(tenant_id, actor_id, event_type, severity, amount_cents, masked_account, ts, payload_json) "
+             "VALUES (?, ?, 'OVERRIDE_REDEEM', 'HIGH', 0, '****0000', ?, ?)",
+@@ -191,19 +230,13 @@
+                 caller.tenant_id,
+                 caller.user_id,
+                 now_ts,
+-                json.dumps({"token_id": token_id, "tx_ref": tx_ref, "purpose": row["purpose"]}),
++                json.dumps({"token_id": tid, "tx_ref": tx_ref, "purpose": purpose}),
+             ),
+-        )
+-        conn.execute(
+-            "UPDATE override_tokens SET used = 1, used_by = ?, used_at = ? WHERE token_id = ? AND tenant_id = ?",
+-            (caller.user_id, now_ts, token_id, caller.tenant_id),
+         )
+         conn.commit()
+         return {
+             "redeemed": True,
+-            "token_id": token_id,
+-            "purpose": row["purpose"],
++            "token_id": tid,
++            "purpose": purpose,
+             "tx_ref": tx_ref,
+         }
+-    finally:
+-        conn.close()
+
+--- a/aegis_app/middleware.py
++++ b/aegis_app/middleware.py
+@@ -7,8 +7,8 @@
+ from typing import Any
+ 
+ from . import __version__
+-from .config import GATEWAY_INTERNAL_BUILD, MASTER_SIGNING_PEPPER
+-from .db import open_connection
++from .config import GATEWAY_INTERNAL_BUILD
++from .validation import check_json_depth_and_size
+ 
+ 
+ def parse_url_and_query(path: str) -> tuple[str, dict[str, str]]:
+@@ -30,6 +30,7 @@
+         raw = str(body)
+     if not raw.strip():
+         return {}, raw
++    check_json_depth_and_size(raw)
+     data = json.loads(raw)
+     if not isinstance(data, dict):
+         raise ValueError("Request JSON payload must be an object")
+@@ -37,19 +38,8 @@
+ 
+ 
+ def collect_internal_diagnostics(db_path: str, storage_dir: str) -> dict[str, Any]:
+-    conn = open_connection(db_path)
+-    try:
+-        t_rows = conn.execute("SELECT tenant_id, webhook_secret, status FROM tenants").fetchall()
+-        s_rows = conn.execute("SELECT secret_key, secret_value FROM system_secrets").fetchall()
+-        return {
+-            "service": "aegis-gateway",
+-            "version": __version__,
+-            "build": GATEWAY_INTERNAL_BUILD,
+-            "db_path": db_path,
+-            "storage_dir": storage_dir,
+-            "master_signing_pepper": MASTER_SIGNING_PEPPER,
+-            "registered_tenants": [dict(r) for r in t_rows],
+-            "system_secrets": {r["secret_key"]: r["secret_value"] for r in s_rows},
+-        }
+-    finally:
+-        conn.close()
++    return {
++        "service": "aegis-gateway",
++        "version": __version__,
++        "build": GATEWAY_INTERNAL_BUILD,
++    }
+
+--- a/aegis_app/rule_engine.py
++++ b/aegis_app/rule_engine.py
+@@ -1,5 +1,5 @@
+ # -*- coding: utf-8 -*-
+-"""实时交易风控评分、三跳制裁传染耦合、滑动窗口动态中位数与自定义规则树引擎。"""
++"""实时交易风控评分、三跳制裁传染耦合、双堆滑窗中位数、四重强原子批处理与自定义规则树引擎。"""
+ from __future__ import annotations
+ 
+ import json
+@@ -8,45 +8,102 @@
+ from typing import Any
+ 
+ from .auth import CallerContext, require_admin
+-from .config import (
+-    CHANNEL_RISK_WEIGHTS,
+-    SANCTION_HOP_SCORES,
+-    SLIDING_WINDOW_SECONDS,
++from .config import CHANNEL_RISK_WEIGHTS, SANCTION_HOP_SCORES
++from .contagion_graph import compute_hop_from_graph, get_or_load_risk_graph
++from .ledger_ops import try_consume_realtime_alert_quota_in_tx
++from .legacy_compat import apply_sovereign_settlement_adjustment
++from .state import get_gateway_state
++from .validation import (
++    MAX_REGEX_SUBJECT_LEN,
++    compile_safe_regex,
++    parse_strict_int,
++    parse_strict_number,
+ )
+-from .contagion_graph import compute_sanction_contagion_hop
+-from .db import open_connection
+-from .ledger_ops import try_consume_realtime_alert_quota
+-from .legacy_compat import apply_sovereign_settlement_adjustment
+-from .window_stats import compute_exact_median_cents
++from .window_stats import AccountWindowTracker
+ 
+ PARTNER_EMAIL_PATTERN = re.compile(
+-    r"^([a-zA-Z0-9]+([._-][a-zA-Z0-9]+)*)+@([a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+)$"
++    r"^[a-zA-Z0-9]+(?:[._-][a-zA-Z0-9]+)*@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+$"
+ )
++MAX_EMAIL_LEN = 254
++MAX_RULE_DEPTH = 16
++MAX_RULE_NODES = 128
++MAX_RULE_CHILDREN = 32
+ 
+ 
+ def validate_contact_email(email: str) -> bool:
+-    if not isinstance(email, str) or not email:
++    if not isinstance(email, str) or not email or len(email) > MAX_EMAIL_LEN:
+         return False
+     return PARTNER_EMAIL_PATTERN.match(email) is not None
+ 
+ 
+ def load_tenant_policy(db_path: str, tenant_id: str) -> dict[str, Any]:
+-    conn = open_connection(db_path)
+-    try:
+-        row = conn.execute(
+-            "SELECT tenant_id, policy_version, high_amount_cents, velocity_tx_limit, "
+-            "velocity_amount_cents, counterparty_fanout_limit, review_threshold, "
+-            "reject_threshold, custom_rules_json, updated_at "
+-            "FROM tenant_policies WHERE tenant_id = ?",
+-            (tenant_id,),
+-        ).fetchone()
+-        if not row:
+-            raise LookupError(f"Policy configuration missing for {tenant_id}")
+-        policy = dict(row)
+-        policy["custom_rules"] = json.loads(policy["custom_rules_json"])
++    gw_state = get_gateway_state(db_path)
++    t_state = gw_state.tenant(tenant_id)
++    cached = t_state.policy_cache
++    if cached is not None and t_state.policy_cache_epoch == t_state.policy_epoch:
++        return cached
++    with t_state.policy_lock:
++        cached = t_state.policy_cache
++        if cached is not None and t_state.policy_cache_epoch == t_state.policy_epoch:
++            return cached
++        epoch = t_state.policy_epoch
++        with gw_state.pool.borrow() as conn:
++            row = conn.execute(
++                "SELECT tenant_id, policy_version, high_amount_cents, velocity_tx_limit, "
++                "velocity_amount_cents, counterparty_fanout_limit, review_threshold, "
++                "reject_threshold, custom_rules_json, updated_at "
++                "FROM tenant_policies WHERE tenant_id = ?",
++                (tenant_id,),
++            ).fetchone()
++            if not row:
++                raise LookupError(f"Policy configuration missing for {tenant_id}")
++            policy = dict(row)
++            policy["custom_rules"] = json.loads(policy["custom_rules_json"])
++        t_state.policy_cache = policy
++        t_state.policy_cache_epoch = epoch
+         return policy
+-    finally:
+-        conn.close()
++
++
++def _validate_rule_tree(node: Any, depth: int = 0, counter: list[int] | None = None) -> None:
++    if counter is None:
++        counter = [0]
++    if depth > MAX_RULE_DEPTH:
++        raise ValueError(f"Rule tree depth exceeds maximum ({MAX_RULE_DEPTH})")
++    counter[0] += 1
++    if counter[0] > MAX_RULE_NODES:
++        raise ValueError(f"Rule tree node count exceeds maximum ({MAX_RULE_NODES})")
++    if not isinstance(node, dict):
++        raise ValueError("Rule node must be an object")
++    if not node:
++        return
++
++    op = str(node.get("op") or "").upper()
++    if node.get("bonus_score") is not None:
++        parse_strict_int(node.get("bonus_score"), "bonus_score")
++
++    if op in ("AND", "OR", "NOT"):
++        children = node.get("children")
++        if not isinstance(children, list) or not children:
++            raise ValueError(f"Logical operator {op} requires non-empty children list")
++        if len(children) > MAX_RULE_CHILDREN:
++            raise ValueError(f"Rule children count exceeds maximum ({MAX_RULE_CHILDREN})")
++        if op == "NOT" and len(children) != 1:
++            raise ValueError("NOT operator requires exactly 1 child")
++        for ch in children:
++            _validate_rule_tree(ch, depth + 1, counter)
++        return
++
++    field_name = str(node.get("field") or "")
++    if not field_name:
++        raise ValueError("Leaf rule node missing 'field'")
++    if op == "REGEX":
++        target = node.get("value")
++        if isinstance(target, str):
++            compile_safe_regex(target)
++    elif op in ("GT", "GTE", "LT", "LTE"):
++        parse_strict_number(node.get("value"), "rule target")
++    elif op not in ("EQ", "NEQ", "IN", "CONTAINS"):
++        raise ValueError(f"Unsupported rule operator: {op}")
+ 
+ 
+ def update_tenant_policy(
+@@ -55,45 +112,47 @@
+     updates: dict[str, Any],
+ ) -> dict[str, Any]:
+     require_admin(caller)
+-    current = load_tenant_policy(db_path, caller.tenant_id)
+-    high_amt = int(updates.get("high_amount_cents", current["high_amount_cents"]))
+-    vel_tx = int(updates.get("velocity_tx_limit", current["velocity_tx_limit"]))
+-    vel_amt = int(updates.get("velocity_amount_cents", current["velocity_amount_cents"]))
+-    fanout = int(updates.get("counterparty_fanout_limit", current["counterparty_fanout_limit"]))
+-    rev_th = int(updates.get("review_threshold", current["review_threshold"]))
+-    rej_th = int(updates.get("reject_threshold", current["reject_threshold"]))
+-    custom_rules = updates.get("custom_rules", current["custom_rules"])
+-
+-    if high_amt <= 0 or vel_tx <= 0 or rev_th <= 0 or rej_th < rev_th:
+-        raise ValueError("Invalid policy threshold values")
+-    if not isinstance(custom_rules, dict):
+-        raise ValueError("custom_rules must be a JSON object")
+-
+-    new_ver = int(current["policy_version"]) + 1
+-    now_ts = int(caller.request_ts or int(time.time()))
+-    conn = open_connection(db_path)
+-    try:
+-        conn.execute(
+-            "UPDATE tenant_policies SET policy_version = ?, high_amount_cents = ?, "
+-            "velocity_tx_limit = ?, velocity_amount_cents = ?, counterparty_fanout_limit = ?, "
+-            "review_threshold = ?, reject_threshold = ?, custom_rules_json = ?, updated_at = ? "
+-            "WHERE tenant_id = ?",
+-            (
+-                new_ver,
+-                high_amt,
+-                vel_tx,
+-                vel_amt,
+-                fanout,
+-                rev_th,
+-                rej_th,
+-                json.dumps(custom_rules),
+-                now_ts,
+-                caller.tenant_id,
+-            ),
+-        )
+-        conn.commit()
+-    finally:
+-        conn.close()
++    gw_state = get_gateway_state(db_path)
++    t_state = gw_state.tenant(caller.tenant_id)
++    with t_state.policy_lock:
++        current = load_tenant_policy(db_path, caller.tenant_id)
++        high_amt = parse_strict_int(updates.get("high_amount_cents", current["high_amount_cents"]), "high_amount_cents", min_val=1)
++        vel_tx = parse_strict_int(updates.get("velocity_tx_limit", current["velocity_tx_limit"]), "velocity_tx_limit", min_val=1)
++        vel_amt = parse_strict_int(updates.get("velocity_amount_cents", current["velocity_amount_cents"]), "velocity_amount_cents", min_val=0)
++        fanout = parse_strict_int(updates.get("counterparty_fanout_limit", current["counterparty_fanout_limit"]), "counterparty_fanout_limit", min_val=0)
++        rev_th = parse_strict_int(updates.get("review_threshold", current["review_threshold"]), "review_threshold", min_val=1)
++        rej_th = parse_strict_int(updates.get("reject_threshold", current["reject_threshold"]), "reject_threshold", min_val=rev_th)
++        custom_rules = updates.get("custom_rules", current["custom_rules"])
++
++        if not isinstance(custom_rules, dict):
++            raise ValueError("custom_rules must be a JSON object")
++        if custom_rules:
++            _validate_rule_tree(custom_rules)
++
++        new_ver = int(current["policy_version"]) + 1
++        now_ts = int(caller.request_ts or int(time.time()))
++        with gw_state.pool.borrow() as conn:
++            conn.execute("BEGIN IMMEDIATE")
++            conn.execute(
++                "UPDATE tenant_policies SET policy_version = ?, high_amount_cents = ?, "
++                "velocity_tx_limit = ?, velocity_amount_cents = ?, counterparty_fanout_limit = ?, "
++                "review_threshold = ?, reject_threshold = ?, custom_rules_json = ?, updated_at = ? "
++                "WHERE tenant_id = ?",
++                (
++                    new_ver,
++                    high_amt,
++                    vel_tx,
++                    vel_amt,
++                    fanout,
++                    rev_th,
++                    rej_th,
++                    json.dumps(custom_rules),
++                    now_ts,
++                    caller.tenant_id,
++                ),
++            )
++            conn.commit()
++        t_state.policy_epoch += 1
+     return load_tenant_policy(db_path, caller.tenant_id)
+ 
+ 
+@@ -105,20 +164,39 @@
+     return tx.get(field_path)
+ 
+ 
+-def eval_rule_node(node: dict[str, Any], tx: dict[str, Any]) -> tuple[bool, int, list[str]]:
++def eval_rule_node(
++    node: dict[str, Any],
++    tx: dict[str, Any],
++    *,
++    _depth: int = 0,
++    _counter: list[int] | None = None,
++) -> tuple[bool, int, list[str]]:
++    if _counter is None:
++        _counter = [0]
++    if _depth > MAX_RULE_DEPTH:
++        raise ValueError(f"Rule tree depth exceeds maximum ({MAX_RULE_DEPTH})")
++    _counter[0] += 1
++    if _counter[0] > MAX_RULE_NODES:
++        raise ValueError(f"Rule tree node count exceeds maximum ({MAX_RULE_NODES})")
+     if not isinstance(node, dict):
+         raise ValueError("Rule node must be an object")
+ 
+     op = str(node.get("op") or "").upper()
+-    bonus = int(node.get("bonus_score") or 0)
++    raw_bonus = node.get("bonus_score")
++    bonus = parse_strict_int(raw_bonus if raw_bonus is not None else 0, "bonus_score")
+     reason = str(node.get("reason") or "").strip()
+ 
+     if op in ("AND", "OR", "NOT"):
+         children = node.get("children")
+         if not isinstance(children, list) or not children:
+             raise ValueError(f"Logical operator {op} requires non-empty children list")
+-
+-        child_results = [eval_rule_node(ch, tx) for ch in children]
++        if len(children) > MAX_RULE_CHILDREN:
++            raise ValueError(f"Rule children count exceeds maximum ({MAX_RULE_CHILDREN})")
++
++        child_results = [
++            eval_rule_node(ch, tx, _depth=_depth + 1, _counter=_counter)
++            for ch in children
++        ]
+         if op == "AND":
+             matched = all(r[0] for r in child_results)
+         elif op == "OR":
+@@ -152,21 +230,28 @@
+         matched = actual == target
+     elif op == "NEQ":
+         matched = actual != target
+-    elif op == "GT":
+-        matched = actual is not None and float(actual) > float(target)
+-    elif op == "GTE":
+-        matched = actual is not None and float(actual) >= float(target)
+-    elif op == "LT":
+-        matched = actual is not None and float(actual) < float(target)
+-    elif op == "LTE":
+-        matched = actual is not None and float(actual) <= float(target)
++    elif op in ("GT", "GTE", "LT", "LTE"):
++        if actual is not None:
++            a_num = parse_strict_number(actual, field_name)
++            t_num = parse_strict_number(target, "rule target")
++            if op == "GT":
++                matched = a_num > t_num
++            elif op == "GTE":
++                matched = a_num >= t_num
++            elif op == "LT":
++                matched = a_num < t_num
++            else:
++                matched = a_num <= t_num
+     elif op == "IN":
+         matched = isinstance(target, list) and actual in target
+     elif op == "CONTAINS":
+         matched = isinstance(actual, str) and isinstance(target, str) and (target in actual)
+     elif op == "REGEX":
+         if isinstance(actual, str) and isinstance(target, str):
+-            matched = re.search(target, actual) is not None
++            if len(actual) > MAX_REGEX_SUBJECT_LEN:
++                raise ValueError("Regex subject exceeds maximum length")
++            compiled = compile_safe_regex(target)
++            matched = compiled.search(actual) is not None
+     else:
+         raise ValueError(f"Unsupported rule operator: {op}")
+ 
+@@ -237,12 +322,10 @@
+         score += 14
+         reasons.append("COUNTERPARTY_FANOUT")
+ 
+-    # 动态中位数突变检测：窗口满 3 笔且当前交易金额达到窗口中位数的 3 倍及以上
+     if win_tx_count >= 3 and win_median_cents > 0 and amount_cents >= 3 * win_median_cents:
+         score += 11
+         reasons.append("MEDIAN_DEVIATION_SPIKE")
+ 
+-    # 三跳受制裁实体传染加分
+     if sanction_hop in SANCTION_HOP_SCORES:
+         score += SANCTION_HOP_SCORES[sanction_hop]
+         reasons.append(f"SANCTION_HOP_{sanction_hop}")
+@@ -274,163 +357,181 @@
+     batch_id: str,
+     transactions: list[dict[str, Any]],
+ ) -> dict[str, Any]:
+-    """按输入顺序逐笔评估实时交易批次并持久化交易及风控决策记录。"""
++    """按输入顺序逐笔评估实时交易批次（遵循 risk_lock -> quota_lock -> BEGIN IMMEDIATE 四重强原子提交/回滚）。"""
+     if not batch_id or not isinstance(transactions, list) or len(transactions) == 0:
+         raise ValueError("batch_id and non-empty transactions list are required")
+ 
+-    results: list[dict[str, Any]] = []
+-    counts = {"ALLOW": 0, "REVIEW": 0, "REJECT": 0}
+-
++    # 1. 预校验整批字段与严格数值类型，杜绝半截入库
++    parsed_txs: list[dict[str, Any]] = []
+     for item in transactions:
++        if not isinstance(item, dict):
++            raise ValueError("Each transaction must be a JSON object")
+         tx_id = str(item.get("tx_id") or "").strip()
+         account_id = str(item.get("account_id") or "").strip()
+         counterparty_id = str(item.get("counterparty_id") or "").strip()
+-        amount_cents = int(item.get("amount_cents") or 0)
++        amount_cents = parse_strict_int(item.get("amount_cents"), "amount_cents", min_val=1)
+         currency = str(item.get("currency") or "USD").strip()
+         channel = str(item.get("channel") or "POS_CHIP").strip()
+         contact_email = str(item.get("contact_email") or "").strip()
+-        ts = int(item.get("ts") or 0)
++        ts = parse_strict_int(item.get("ts"), "ts", min_val=1)
+         metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+ 
+-        if not tx_id or not account_id or not counterparty_id or amount_cents <= 0 or ts <= 0:
++        if not tx_id or not account_id or not counterparty_id:
+             raise ValueError(f"Invalid required transaction fields for tx_id={tx_id!r}")
+         if not validate_contact_email(contact_email):
+             raise ValueError(f"Invalid contact_email in transaction {tx_id}")
+ 
+-        policy = load_tenant_policy(db_path, caller.tenant_id)
+-        sanction_hop = compute_sanction_contagion_hop(
+-            db_path,
+-            caller.tenant_id,
+-            account_id,
+-            counterparty_id,
+-            ts,
+-        )
+-
+-        conn = open_connection(db_path)
+-        try:
+-            hist_rows = conn.execute(
+-                "SELECT tx_id, account_id, counterparty_id, amount_cents, ts, metadata_json "
+-                "FROM transactions WHERE tenant_id = ?",
+-                (caller.tenant_id,),
+-            ).fetchall()
+-        finally:
+-            conn.close()
+-
+-        win_start = ts - SLIDING_WINDOW_SECONDS
+-        win_tx_count = 1
+-        win_amount_cents = amount_cents
+-        win_amounts_list: list[int] = [amount_cents]
+-        cp_list: list[str] = [counterparty_id]
+-
+-        for hr in hist_rows:
+-            _ = json.loads(hr["metadata_json"])
+-            if hr["account_id"] == account_id and win_start <= int(hr["ts"]) <= ts:
+-                h_amt = int(hr["amount_cents"])
+-                win_tx_count += 1
+-                win_amount_cents += h_amt
+-                win_amounts_list.append(h_amt)
+-                if hr["counterparty_id"] not in cp_list:
+-                    cp_list.append(hr["counterparty_id"])
+-
+-        win_unique_cps = len(cp_list)
+-        win_median_cents = compute_exact_median_cents(win_amounts_list)
+-
+-        tx_eval_obj = {
+-            "tx_id": tx_id,
+-            "account_id": account_id,
+-            "counterparty_id": counterparty_id,
+-            "amount_cents": amount_cents,
+-            "currency": currency,
+-            "channel": channel,
+-            "contact_email": contact_email,
+-            "ts": ts,
+-            "metadata": metadata,
+-        }
+-        risk_score, decision, reasons = compute_single_tx_decision(
+-            tx_eval_obj,
+-            policy,
+-            win_tx_count=win_tx_count,
+-            win_amount_cents=win_amount_cents,
+-            win_unique_cps=win_unique_cps,
+-            win_median_cents=win_median_cents,
+-            sanction_hop=sanction_hop,
+-        )
+-
+-        alert_dispatched = False
+-        if decision == "REJECT":
+-            if try_consume_realtime_alert_quota(db_path, caller.tenant_id, ts):
+-                alert_dispatched = True
+-                reasons.append("ALERT_QUOTA_CONSUMED")
+-            else:
+-                reasons.append("ALERT_POOL_DEPLETED")
+-
+-        decision_id = f"dec_{tx_id}"
+-        conn = open_connection(db_path)
+-        try:
+-            conn.execute(
+-                "INSERT INTO transactions("
+-                "tx_id, tenant_id, batch_id, account_id, counterparty_id, amount_cents, "
+-                "currency, channel, contact_email, ts, metadata_json"
+-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+-                (
+-                    tx_id,
+-                    caller.tenant_id,
+-                    batch_id,
+-                    account_id,
+-                    counterparty_id,
+-                    amount_cents,
+-                    currency,
+-                    channel,
+-                    contact_email,
+-                    ts,
+-                    json.dumps(metadata, sort_keys=True),
+-                ),
+-            )
+-            conn.execute(
+-                "INSERT INTO risk_decisions("
+-                "decision_id, tx_id, tenant_id, account_id, risk_score, decision, "
+-                "win_tx_count, win_amount_cents, win_unique_counterparties, win_median_cents, "
+-                "sanction_hop, reasons_json, evaluated_at"
+-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+-                (
+-                    decision_id,
+-                    tx_id,
+-                    caller.tenant_id,
+-                    account_id,
+-                    risk_score,
+-                    decision,
+-                    win_tx_count,
+-                    win_amount_cents,
+-                    win_unique_cps,
+-                    win_median_cents,
+-                    sanction_hop,
+-                    json.dumps(reasons),
+-                    ts,
+-                ),
+-            )
+-            conn.commit()
+-        finally:
+-            conn.close()
+-
+-        counts[decision] += 1
+-        results.append(
++        parsed_txs.append(
+             {
+-                "decision_id": decision_id,
+                 "tx_id": tx_id,
+                 "account_id": account_id,
+-                "risk_score": risk_score,
+-                "decision": decision,
+-                "sanction_hop": sanction_hop,
+-                "alert_dispatched": alert_dispatched,
+-                "window": {
+-                    "tx_count": win_tx_count,
+-                    "amount_cents": win_amount_cents,
+-                    "unique_counterparties": win_unique_cps,
+-                    "median_cents": win_median_cents,
+-                },
+-                "reasons": reasons,
++                "counterparty_id": counterparty_id,
++                "amount_cents": amount_cents,
++                "currency": currency,
++                "channel": channel,
++                "contact_email": contact_email,
++                "ts": ts,
++                "metadata": metadata,
+             }
+         )
++
++    gw_state = get_gateway_state(db_path)
++    t_state = gw_state.tenant(caller.tenant_id)
++    results: list[dict[str, Any]] = []
++    counts = {"ALLOW": 0, "REVIEW": 0, "REJECT": 0}
++
++    # 2. 严格全局锁偏序：risk_lock -> quota_lock -> SQLite BEGIN IMMEDIATE
++    with t_state.risk_lock:
++        with t_state.quota_lock:
++            policy = load_tenant_policy(db_path, caller.tenant_id)
++            rg = get_or_load_risk_graph(gw_state, t_state)
++
++            undo_win: list[tuple[AccountWindowTracker, tuple[int, int, int, str]]] = []
++            undo_edges: list[tuple[str, str, int]] = []
++
++            with gw_state.pool.borrow() as conn:
++                conn.execute("BEGIN IMMEDIATE")
++                try:
++                    for tx_obj in parsed_txs:
++                        tx_id = tx_obj["tx_id"]
++                        account_id = tx_obj["account_id"]
++                        counterparty_id = tx_obj["counterparty_id"]
++                        amount_cents = tx_obj["amount_cents"]
++                        ts = tx_obj["ts"]
++
++                        sanction_hop = compute_hop_from_graph(
++                            rg.sanctioned,
++                            rg.adj,
++                            account_id,
++                            counterparty_id,
++                            ts,
++                        )
++                        tracker = rg.accounts.get(account_id)
++                        if tracker is None:
++                            tracker = AccountWindowTracker()
++                            rg.accounts[account_id] = tracker
++
++                        win_tx_count, win_amount_cents, win_unique_cps, win_median_cents, undo_rec = (
++                            tracker.push_and_query(ts, amount_cents, counterparty_id)
++                        )
++                        undo_win.append((tracker, undo_rec))
++                        rg.add_edge(account_id, counterparty_id, ts)
++                        undo_edges.append((account_id, counterparty_id, ts))
++
++                        risk_score, decision, reasons = compute_single_tx_decision(
++                            tx_obj,
++                            policy,
++                            win_tx_count=win_tx_count,
++                            win_amount_cents=win_amount_cents,
++                            win_unique_cps=win_unique_cps,
++                            win_median_cents=win_median_cents,
++                            sanction_hop=sanction_hop,
++                        )
++
++                        alert_dispatched = False
++                        if decision == "REJECT":
++                            if try_consume_realtime_alert_quota_in_tx(conn, caller.tenant_id, ts):
++                                alert_dispatched = True
++                                reasons.append("ALERT_QUOTA_CONSUMED")
++                            else:
++                                reasons.append("ALERT_POOL_DEPLETED")
++
++                        decision_id = f"dec_{tx_id}"
++                        conn.execute(
++                            "INSERT INTO transactions("
++                            "tx_id, tenant_id, batch_id, account_id, counterparty_id, amount_cents, "
++                            "currency, channel, contact_email, ts, metadata_json"
++                            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
++                            (
++                                tx_id,
++                                caller.tenant_id,
++                                batch_id,
++                                account_id,
++                                counterparty_id,
++                                amount_cents,
++                                tx_obj["currency"],
++                                tx_obj["channel"],
++                                tx_obj["contact_email"],
++                                ts,
++                                json.dumps(tx_obj["metadata"], sort_keys=True),
++                            ),
++                        )
++                        conn.execute(
++                            "INSERT INTO risk_decisions("
++                            "decision_id, tx_id, tenant_id, account_id, risk_score, decision, "
++                            "win_tx_count, win_amount_cents, win_unique_counterparties, win_median_cents, "
++                            "sanction_hop, reasons_json, evaluated_at"
++                            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
++                            (
++                                decision_id,
++                                tx_id,
++                                caller.tenant_id,
++                                account_id,
++                                risk_score,
++                                decision,
++                                win_tx_count,
++                                win_amount_cents,
++                                win_unique_cps,
++                                win_median_cents,
++                                sanction_hop,
++                                json.dumps(reasons),
++                                ts,
++                            ),
++                        )
++
++                        counts[decision] += 1
++                        results.append(
++                            {
++                                "decision_id": decision_id,
++                                "tx_id": tx_id,
++                                "account_id": account_id,
++                                "risk_score": risk_score,
++                                "decision": decision,
++                                "sanction_hop": sanction_hop,
++                                "alert_dispatched": alert_dispatched,
++                                "window": {
++                                    "tx_count": win_tx_count,
++                                    "amount_cents": win_amount_cents,
++                                    "unique_counterparties": win_unique_cps,
++                                    "median_cents": win_median_cents,
++                                },
++                                "reasons": reasons,
++                            }
++                        )
++
++                    conn.commit()
++                except Exception:
++                    conn.rollback()
++                    rg.rollback_edges(undo_edges)
++                    by_tracker: dict[int, tuple[AccountWindowTracker, list[tuple[int, int, int, str]]]] = {}
++                    for trk, rec in undo_win:
++                        tid = id(trk)
++                        if tid not in by_tracker:
++                            by_tracker[tid] = (trk, [])
++                        by_tracker[tid][1].append(rec)
++                    for trk, recs in by_tracker.values():
++                        trk.rollback_records(recs)
++                    raise
+ 
+     return {
+         "tenant_id": caller.tenant_id,
+@@ -446,14 +547,14 @@
+     caller: CallerContext,
+     decision_id: str,
+ ) -> dict[str, Any]:
+-    conn = open_connection(db_path)
+-    try:
++    gw_state = get_gateway_state(db_path)
++    with gw_state.pool.borrow() as conn:
+         row = conn.execute(
+             "SELECT decision_id, tx_id, tenant_id, account_id, risk_score, decision, "
+             "win_tx_count, win_amount_cents, win_unique_counterparties, win_median_cents, "
+             "sanction_hop, reasons_json, evaluated_at "
+-            "FROM risk_decisions WHERE decision_id = ?",
+-            (decision_id,),
++            "FROM risk_decisions WHERE decision_id = ? AND tenant_id = ?",
++            (decision_id, caller.tenant_id),
+         ).fetchone()
+         if not row:
+             raise LookupError(f"Decision record not found: {decision_id}")
+@@ -476,5 +577,3 @@
+             "reasons": reasons_list,
+             "evaluated_at": int(row["evaluated_at"]),
+         }
+-    finally:
+-        conn.close()
+
+--- a/aegis_app/search_service.py
++++ b/aegis_app/search_service.py
+@@ -1,56 +1,29 @@
+ # -*- coding: utf-8 -*-
+-"""企业合规文档多维检索、邻近度相关性打分、双轨法规簇折叠与密级管控编排服务。"""
++"""企业合规文档增量倒排检索、双指针邻近度打分、集合剪枝簇折叠与密级管控编排服务。"""
+ from __future__ import annotations
+ 
+-from collections import Counter
+ import time
+ from typing import Any
+ 
+-from .auth import (
+-    CallerContext,
+-    is_doc_blocked_by_acl,
+-    require_admin,
+-    resolve_effective_permissions,
+-)
++from .acl_wall import _get_acl_cache, evaluate_wall_rules, get_org_lineage_from_map
++from .auth import CallerContext, require_admin, resolve_effective_permissions
+ from .config import DEDUP_JACCARD_THRESHOLD, DEFAULT_PAGE_LIMIT
+-from .db import open_connection
+ from .doc_indexer import (
+-    compute_phrase_proximity_bonus,
+-    jaccard_similarity_from_texts,
++    compute_phrase_proximity_bonus_from_seq,
++    jaccard_similarity_from_sets,
+     tokenize_text,
+ )
+-from .legacy_compat import canonicalize_regulation_code
++from .doc_store import CompactDocEntry, get_or_load_doc_index
++from .state import get_gateway_state
+ 
+ 
+ def _get_doc_citation_count(db_path: str, tenant_id: str, doc_id: str) -> int:
+-    """统计文档当前有效的唯一引用源数量（内部 doc_ 引用须核验源文档处于 ACTIVE 且未隔离状态）。"""
+-    conn = open_connection(db_path)
+-    try:
+-        rows = conn.execute(
+-            "SELECT cited_by_ref FROM doc_citations WHERE tenant_id = ? AND doc_id = ?",
+-            (tenant_id, doc_id),
+-        ).fetchall()
+-        seen_refs: list[str] = []
+-        for r in rows:
+-            ref = str(r["cited_by_ref"] or "").strip()
+-            if ref and ref != doc_id and ref not in seen_refs:
+-                seen_refs.append(ref)
+-
+-        valid_cnt = 0
+-        for ref in seen_refs:
+-            if ref.startswith("doc_"):
+-                ref_sql = (
+-                    "SELECT status, quarantined FROM compliance_docs "
+-                    f"WHERE doc_id = '{ref}'"
+-                )
+-                ref_row = conn.execute(ref_sql).fetchone()
+-                if ref_row and ref_row["status"] == "ACTIVE" and int(ref_row["quarantined"]) == 0:
+-                    valid_cnt += 1
+-            else:
+-                valid_cnt += 1
+-        return valid_cnt
+-    finally:
+-        conn.close()
++    """获取文档当前有效的唯一引用源数量（优先从增量引用图 O(1) 读取，且严格隔离租户）。"""
++    gw_state = get_gateway_state(db_path)
++    t_state = gw_state.tenant(tenant_id)
++    idx = get_or_load_doc_index(gw_state, t_state)
++    entry = idx.docs.get(doc_id)
++    return entry.valid_citation_count if entry is not None else 0
+ 
+ 
+ def search_documents(
+@@ -66,144 +39,162 @@
+     limit: int = DEFAULT_PAGE_LIMIT,
+     offset: int = 0,
+ ) -> dict[str, Any]:
+-    """执行合规文档检索：融合委托有效密级、三级利益冲突墙、词距邻近度加成与历史双轨法规号折叠。"""
+-    sql_sort_col = "updated_at" if sort_by == "score" else sort_by
+-    sql_sort_dir = sort_dir if sort_dir else "DESC"
+-
+-    where_clauses = [
+-        f"tenant_id = '{caller.tenant_id}'",
+-        "status = 'ACTIVE'",
+-        "quarantined = 0",
+-    ]
+-    params: list[Any] = []
+-    if category:
+-        where_clauses.append("category = ?")
+-        params.append(category)
+-    if tag_filter:
+-        where_clauses.append(f"custom_tag = '{tag_filter}'")
+-
+-    sql = (
+-        "SELECT doc_id, tenant_id, category, regulation_code, clearance_level, "
+-        "risk_weight, custom_tag, title, body, updated_at "
+-        f"FROM compliance_docs WHERE {' AND '.join(where_clauses)} "
+-        f"ORDER BY {sql_sort_col} {sql_sort_dir}"
++    """执行合规文档检索：基于增量倒排索引、独立 ACL 纪元缓存、双指针词距与集合剪枝去重。"""
++    if sort_by not in ("score", "updated_at", "risk_weight"):
++        sort_by = "score"
++    norm_dir = str(sort_dir or "desc").lower()
++    if norm_dir not in ("asc", "desc"):
++        norm_dir = "desc"
++    if offset < 0:
++        offset = 0
++
++    gw_state = get_gateway_state(db_path)
++    t_state = gw_state.tenant(caller.tenant_id)
++    idx = get_or_load_doc_index(gw_state, t_state)
++    acl_cache = _get_acl_cache(gw_state, caller.tenant_id)
++
++    _, live_clearance = resolve_effective_permissions(
++        db_path,
++        caller.tenant_id,
++        caller.user_id,
++        at_ts=caller.request_ts,
+     )
+-
+-    conn = open_connection(db_path)
+-    try:
+-        raw_rows = conn.execute(sql, tuple(params)).fetchall()
+-    finally:
+-        conn.close()
++    user_lineage = get_org_lineage_from_map(acl_cache.org_parents, caller.org_node_id)
+ 
+     query_terms = list(dict.fromkeys(tokenize_text(query)))
+-    candidates: list[dict[str, Any]] = []
+-
+-    for row in raw_rows:
+-        _, live_clearance = resolve_effective_permissions(
+-            db_path,
+-            caller.tenant_id,
+-            caller.user_id,
+-            at_ts=caller.request_ts,
+-        )
+-        if int(row["clearance_level"]) > live_clearance:
+-            continue
+-        if is_doc_blocked_by_acl(db_path, caller.tenant_id, caller.user_id, row["doc_id"]):
+-            continue
+-
+-        title_tokens = tokenize_text(row["title"])
+-        body_tokens = tokenize_text(row["body"])
+-        title_tf = Counter(title_tokens)
+-        body_tf = Counter(body_tokens)
+-
++    query_tids: list[int] = []
++    if query_terms:
++        for t in query_terms:
++            tid = gw_state.interner.lookup(t)
++            query_tids.append(tid if tid is not None else -1)
++
++    with t_state.doc_lock:
+         if query_terms:
+-            hit_any = any((t in title_tf or t in body_tf) for t in query_terms)
+-            if not hit_any:
+-                continue
+-            term_score = sum(
+-                3.5 * min(title_tf.get(t, 0), 5) + 1.0 * min(body_tf.get(t, 0), 12)
+-                for t in query_terms
++            candidate_ids: set[str] = set()
++            inv = idx.inverted_index
++            for tid in query_tids:
++                if tid != -1:
++                    postings = inv.get(tid)
++                    if postings:
++                        candidate_ids.update(postings)
++        else:
++            candidate_ids = set(idx.active_doc_ids)
++
++        cat_upper = category.strip().upper() if category else ""
++        candidates: list[tuple[dict[str, Any], CompactDocEntry]] = []
++        rules_by_doc = acl_cache.rules_by_doc
++
++        for doc_id in candidate_ids:
++            entry = idx.docs.get(doc_id)
++            if entry is None or entry.status != "ACTIVE" or entry.quarantined != 0:
++                continue
++            if cat_upper and entry.category != cat_upper:
++                continue
++            if tag_filter and entry.custom_tag != tag_filter:
++                continue
++            if entry.clearance_level > live_clearance:
++                continue
++            doc_rules = rules_by_doc.get(doc_id)
++            if doc_rules and evaluate_wall_rules(doc_rules, caller.user_id, user_lineage):
++                continue
++
++            if query_tids:
++                t_tf = entry.title_tf
++                b_tf = entry.body_tf
++                term_score = 0.0
++                for tid in query_tids:
++                    if tid == -1:
++                        continue
++                    tc = t_tf.get(tid, 0)
++                    bc = b_tf.get(tid, 0)
++                    if tc:
++                        term_score += 3.5 * (tc if tc <= 5 else 5)
++                    if bc:
++                        term_score += 1.0 * (bc if bc <= 12 else 12)
++                prox_bonus = compute_phrase_proximity_bonus_from_seq(entry.body_seq, query_tids)
++            else:
++                term_score = 0.0
++                prox_bonus = 0.0
++
++            cite_cnt = entry.valid_citation_count
++            risk_w = entry.risk_weight
++            total_score = round(term_score + prox_bonus + 0.25 * cite_cnt + 0.1 * risk_w, 4)
++
++            candidates.append(
++                (
++                    {
++                        "doc_id": entry.doc_id,
++                        "category": entry.category,
++                        "regulation_code": entry.regulation_code,
++                        "clearance_level": entry.clearance_level,
++                        "risk_weight": risk_w,
++                        "custom_tag": entry.custom_tag,
++                        "title": entry.title,
++                        "snippet": entry.snippet,
++                        "citation_count": cite_cnt,
++                        "score": total_score,
++                        "updated_at": entry.updated_at,
++                    },
++                    entry,
++                )
+             )
+-            prox_bonus = compute_phrase_proximity_bonus(body_tokens, query_terms)
+-        else:
+-            term_score = 0.0
+-            prox_bonus = 0.0
+-
+-        cite_cnt = _get_doc_citation_count(db_path, caller.tenant_id, row["doc_id"])
+-        risk_w = int(row["risk_weight"])
+-        total_score = round(term_score + prox_bonus + 0.25 * cite_cnt + 0.1 * risk_w, 4)
+-
+-        candidates.append(
+-            {
+-                "doc_id": row["doc_id"],
+-                "category": row["category"],
+-                "regulation_code": row["regulation_code"],
+-                "_canon_reg": canonicalize_regulation_code(row["regulation_code"]),
+-                "clearance_level": int(row["clearance_level"]),
+-                "risk_weight": risk_w,
+-                "custom_tag": row["custom_tag"],
+-                "title": row["title"],
+-                "snippet": row["body"][:140],
+-                "citation_count": cite_cnt,
+-                "score": total_score,
+-                "updated_at": int(row["updated_at"]),
+-                "_raw_body": row["body"],
+-            }
+-        )
+-
+-    candidates.sort(key=lambda d: (-d["score"], -d["updated_at"], d["doc_id"]))
++
++    candidates.sort(key=lambda pair: (-pair[0]["score"], -pair[0]["updated_at"], pair[0]["doc_id"]))
+ 
+     if deduplicate:
+         kept: list[dict[str, Any]] = []
+         consumed = [False] * len(candidates)
+-        for i in range(len(candidates)):
++        n_cand = len(candidates)
++        for i in range(n_cand):
+             if consumed[i]:
+                 continue
+-            rep = dict(candidates[i])
++            rep_dict, rep_entry = candidates[i]
++            rep_canon = rep_entry.canon_reg
++            rep_tokens = rep_entry.uniq_tokens
+             cluster_size = 1
+-            for j in range(i + 1, len(candidates)):
+-                if consumed[j]:
+-                    continue
+-                same_reg = bool(rep["_canon_reg"]) and (
+-                    rep["_canon_reg"] == candidates[j]["_canon_reg"]
+-                )
+-                sim = jaccard_similarity_from_texts(
+-                    rep["title"],
+-                    rep["_raw_body"],
+-                    candidates[j]["title"],
+-                    candidates[j]["_raw_body"],
+-                )
+-                if same_reg and sim >= DEDUP_JACCARD_THRESHOLD:
+-                    consumed[j] = True
+-                    cluster_size += 1
+-            rep["cluster_size"] = cluster_size
+-            kept.append(rep)
++            if rep_canon:
++                for j in range(i + 1, n_cand):
++                    if consumed[j]:
++                        continue
++                    cand_entry = candidates[j][1]
++                    if cand_entry.canon_reg != rep_canon:
++                        continue
++                    sim = jaccard_similarity_from_sets(
++                        rep_tokens,
++                        cand_entry.uniq_tokens,
++                        min_threshold=DEDUP_JACCARD_THRESHOLD,
++                    )
++                    if sim >= DEDUP_JACCARD_THRESHOLD:
++                        consumed[j] = True
++                        cluster_size += 1
++            rep_out = dict(rep_dict)
++            rep_out["cluster_size"] = cluster_size
++            kept.append(rep_out)
+         final_list = kept
+     else:
+         final_list = []
+-        for item in candidates:
+-            copied = dict(item)
++        for item_dict, _ in candidates:
++            copied = dict(item_dict)
+             copied["cluster_size"] = 1
+             final_list.append(copied)
+ 
+-    reverse_flag = str(sort_dir).lower() != "asc"
+-    sort_field = sort_by if sort_by in ("score", "updated_at", "risk_weight") else "score"
++    reverse_flag = norm_dir != "asc"
+     if reverse_flag:
+-        final_list.sort(key=lambda d: (-d[sort_field], d["doc_id"]))
++        final_list.sort(key=lambda d: (-d[sort_by], d["doc_id"]))
+     else:
+-        final_list.sort(key=lambda d: (d[sort_field], d["doc_id"]))
++        final_list.sort(key=lambda d: (d[sort_by], d["doc_id"]))
+ 
+     total_matched = len(final_list)
+     if limit < 0:
+-        sliced = final_list[max(0, offset):]
++        sliced = final_list[offset:]
+     else:
+-        sliced = final_list[max(0, offset): max(0, offset) + limit]
+-
+-    items_out = [{k: v for k, v in doc.items() if not k.startswith("_")} for doc in sliced]
++        sliced = final_list[offset : offset + limit]
++
+     return {
+         "tenant_id": caller.tenant_id,
+         "total_matched": total_matched,
+-        "returned_count": len(items_out),
+-        "items": items_out,
++        "returned_count": len(sliced),
++        "items": sliced,
+     }
+ 
+ 
+@@ -212,27 +203,42 @@
+     caller: CallerContext,
+     doc_ids: list[str],
+ ) -> dict[str, Any]:
+-    """按文档 ID 列表批量获取完整合规文档内容。"""
++    """按文档 ID 列表批量获取当前租户内调用者有权访问的完整合规文档内容。"""
+     if not isinstance(doc_ids, list) or not doc_ids:
+         raise ValueError("doc_ids must be a non-empty list")
++    if len(doc_ids) > 200:
++        raise ValueError("doc_ids exceeds maximum batch size (200)")
++
++    gw_state = get_gateway_state(db_path)
++    acl_cache = _get_acl_cache(gw_state, caller.tenant_id)
++    _, live_clearance = resolve_effective_permissions(
++        db_path,
++        caller.tenant_id,
++        caller.user_id,
++        at_ts=caller.request_ts,
++    )
++    user_lineage = get_org_lineage_from_map(acl_cache.org_parents, caller.org_node_id)
++    rules_by_doc = acl_cache.rules_by_doc
+ 
+     placeholders = ",".join("?" for _ in doc_ids)
+-    conn = open_connection(db_path)
+-    try:
++    with gw_state.pool.borrow() as conn:
+         rows = conn.execute(
+             f"SELECT doc_id, tenant_id, category, regulation_code, clearance_level, "
+             f"risk_weight, custom_tag, title, body, status, quarantined, updated_at "
+-            f"FROM compliance_docs WHERE doc_id IN ({placeholders})",
+-            tuple(doc_ids),
++            f"FROM compliance_docs WHERE tenant_id = ? AND doc_id IN ({placeholders})",
++            (caller.tenant_id, *doc_ids),
+         ).fetchall()
+-    finally:
+-        conn.close()
+ 
+     by_id = {r["doc_id"]: r for r in rows}
+     items = []
+     for did in doc_ids:
+         r = by_id.get(did)
+-        if not r or r["status"] != "ACTIVE":
++        if not r or r["status"] != "ACTIVE" or int(r["quarantined"]) != 0:
++            continue
++        if int(r["clearance_level"]) > live_clearance:
++            continue
++        doc_rules = rules_by_doc.get(did)
++        if doc_rules and evaluate_wall_rules(doc_rules, caller.user_id, user_lineage):
+             continue
+         items.append(
+             {
+@@ -265,18 +271,25 @@
+     require_admin(caller)
+     now_ts = int(caller.request_ts or int(time.time()))
+     q_val = 1 if quarantined else 0
+-    conn = open_connection(db_path)
+-    try:
+-        cur = conn.execute(
+-            "UPDATE compliance_docs SET quarantined = ?, updated_at = ? "
+-            "WHERE tenant_id = ? AND doc_id = ?",
+-            (q_val, now_ts, caller.tenant_id, doc_id),
+-        )
+-        if cur.rowcount == 0:
+-            raise LookupError(f"Document not found in tenant: {doc_id}")
+-        conn.commit()
+-    finally:
+-        conn.close()
++
++    gw_state = get_gateway_state(db_path)
++    t_state = gw_state.tenant(caller.tenant_id)
++    with t_state.doc_lock:
++        idx = get_or_load_doc_index(gw_state, t_state)
++        with gw_state.pool.borrow() as conn:
++            conn.execute("BEGIN IMMEDIATE")
++            cur = conn.execute(
++                "UPDATE compliance_docs SET quarantined = ?, updated_at = ? "
++                "WHERE tenant_id = ? AND doc_id = ?",
++                (q_val, now_ts, caller.tenant_id, doc_id),
++            )
++            if cur.rowcount == 0:
++                conn.rollback()
++                raise LookupError(f"Document not found in tenant: {doc_id}")
++            conn.commit()
++
++        idx.apply_status_change(doc_id, quarantined=q_val, updated_at=now_ts)
++        t_state.doc_epoch += 1
+ 
+     return {
+         "tenant_id": caller.tenant_id,
+
+--- a/aegis_app/server.py
++++ b/aegis_app/server.py
+@@ -22,9 +22,10 @@
+     configure_doc_acl_rule,
+     manage_role_delegation,
+     process_settlement_webhook,
++    require_admin,
+     revoke_or_grant_role,
+ )
+-from .config import DEFAULT_PAGE_LIMIT, MASTER_SIGNING_PEPPER
++from .config import DEFAULT_PAGE_LIMIT
+ from .contagion_graph import manage_sanctioned_entity
+ from .db import init_schema
+ from .doc_writer import retire_compliance_document, upsert_compliance_document
+@@ -49,6 +50,8 @@
+     search_documents,
+     set_document_quarantine,
+ )
++from .state import register_gateway_state
++from .validation import parse_strict_int
+ 
+ 
+ class AegisGateway:
+@@ -58,6 +61,7 @@
+         self.db_path = str(pathlib.Path(db_path).resolve())
+         self.storage_dir = str(pathlib.Path(storage_dir).resolve())
+         init_schema(self.db_path)
++        self.state = register_gateway_state(self.db_path)
+ 
+     def request(
+         self,
+@@ -80,15 +84,10 @@
+                     "service": "aegis-gateway",
+                     "version": __version__,
+                 }
+-                if query_params.get("debug") == "1":
+-                    payload["diagnostics"] = collect_internal_diagnostics(self.db_path, self.storage_dir)
+                 return 200, resp_headers, payload
+ 
+-            if req_method == "GET" and route == "/api/v1/internal/diagnostics":
+-                return 200, resp_headers, collect_internal_diagnostics(self.db_path, self.storage_dir)
+-
+             now_ov_str = query_params.get("_now_ts")
+-            now_ov = int(now_ov_str) if now_ov_str else None
++            now_ov = parse_strict_int(now_ov_str, "_now_ts") if now_ov_str else None
+ 
+             if req_method == "POST" and route == "/api/v1/webhooks/settlement-callback":
+                 _, raw_body = parse_json_payload(body)
+@@ -101,6 +100,10 @@
+                 return 200, resp_headers, res
+ 
+             caller = authenticate_caller(self.db_path, req_headers, now_override=now_ov)
++
++            if req_method == "GET" and route == "/api/v1/internal/diagnostics":
++                require_admin(caller)
++                return 200, resp_headers, collect_internal_diagnostics(self.db_path, self.storage_dir)
+ 
+             if req_method == "GET" and route == "/api/v1/docs/search":
+                 q = query_params.get("q", "")
+@@ -109,8 +112,8 @@
+                 dedup_flag = query_params.get("deduplicate", "1") != "0"
+                 sort_by = query_params.get("sort_by", "score")
+                 sort_dir = query_params.get("sort_dir", "desc")
+-                limit = int(query_params.get("limit", str(DEFAULT_PAGE_LIMIT)))
+-                offset = int(query_params.get("offset", "0"))
++                limit = parse_strict_int(query_params.get("limit", str(DEFAULT_PAGE_LIMIT)), "limit")
++                offset = parse_strict_int(query_params.get("offset", "0"), "offset")
+                 res = search_documents(
+                     self.db_path,
+                     caller,
+@@ -169,8 +172,8 @@
+                     grantor_user_id=str(data.get("grantor_user_id") or caller.user_id),
+                     grantee_user_id=str(data.get("grantee_user_id") or ""),
+                     delegated_role=str(data.get("delegated_role") or ""),
+-                    starts_at=int(data.get("starts_at") or 0),
+-                    expires_at=int(data.get("expires_at") or 0),
++                    starts_at=parse_strict_int(data.get("starts_at", 0) if data.get("starts_at") is not None else 0, "starts_at"),
++                    expires_at=parse_strict_int(data.get("expires_at", 0) if data.get("expires_at") is not None else 0, "expires_at"),
+                     action=str(data.get("action") or "create"),
+                 )
+                 return 200, resp_headers, res
+@@ -233,7 +236,7 @@
+                     self.db_path,
+                     caller,
+                     quota_type=str(data.get("quota_type") or ""),
+-                    amount=int(data.get("amount", 1)),
++                    amount=parse_strict_int(data.get("amount", 1), "amount"),
+                 )
+                 status_code = 200 if res.get("accepted") else 409
+                 return status_code, resp_headers, res
+@@ -245,7 +248,7 @@
+                     caller,
+                     from_quota=str(data.get("from_quota") or ""),
+                     to_quota=str(data.get("to_quota") or ""),
+-                    amount=int(data.get("amount", 0)),
++                    amount=parse_strict_int(data.get("amount", 0), "amount"),
+                 )
+                 status_code = 200 if res.get("transferred") else 409
+                 return status_code, resp_headers, res
+@@ -262,10 +265,10 @@
+                 return status_code, resp_headers, res
+ 
+             if req_method == "GET" and route == "/api/v1/audit/export-digest":
+-                s_ts = int(query_params["start_ts"]) if query_params.get("start_ts") else None
+-                e_ts = int(query_params["end_ts"]) if query_params.get("end_ts") else None
++                s_ts = parse_strict_int(query_params["start_ts"], "start_ts") if query_params.get("start_ts") else None
++                e_ts = parse_strict_int(query_params["end_ts"], "end_ts") if query_params.get("end_ts") else None
+                 sev = query_params.get("severity", "")
+-                slim = int(query_params.get("sample_limit", "10"))
++                slim = parse_strict_int(query_params.get("sample_limit", "10"), "sample_limit")
+                 res = export_audit_digest(
+                     self.db_path,
+                     caller,
+@@ -284,14 +287,14 @@
+                     template_id=str(data.get("template_id") or ""),
+                     title_format=str(data.get("title_format") or ""),
+                     extra_event_filter=str(data.get("extra_event_filter") or ""),
+-                    sample_limit=int(data.get("sample_limit", 10)),
++                    sample_limit=parse_strict_int(data.get("sample_limit", 10), "sample_limit"),
+                 )
+                 return 200, resp_headers, res
+ 
+             if req_method == "GET" and route == "/api/v1/audit/render-report":
+                 tpl_id = query_params.get("template_id", "")
+-                s_ts = int(query_params["start_ts"]) if query_params.get("start_ts") else None
+-                e_ts = int(query_params["end_ts"]) if query_params.get("end_ts") else None
++                s_ts = parse_strict_int(query_params["start_ts"], "start_ts") if query_params.get("start_ts") else None
++                e_ts = parse_strict_int(query_params["end_ts"], "end_ts") if query_params.get("end_ts") else None
+                 res = render_saved_report(
+                     self.db_path,
+                     caller,
+@@ -316,16 +319,10 @@
+             return 404, resp_headers, {"error": "NOT_FOUND", "message": str(exc)}
+         except (ValueError, KeyError, json.JSONDecodeError) as exc:
+             return 400, resp_headers, {"error": "BAD_REQUEST", "message": str(exc)}
+-        except Exception as exc:
++        except Exception:
+             return 500, resp_headers, {
+                 "error": "INTERNAL_SERVER_ERROR",
+-                "message": str(exc),
+-                "debug_context": {
+-                    "db_path": self.db_path,
+-                    "storage_dir": self.storage_dir,
+-                    "master_pepper": MASTER_SIGNING_PEPPER,
+-                    "traceback": traceback.format_exc(),
+-                },
++                "message": "Internal server error",
+             }
+ 
+ 
+
+--- /dev/null
++++ b/aegis_app/state.py
+@@ -0,0 +1,177 @@
++# -*- coding: utf-8 -*-
++"""网关共享运行时状态、有界连接池、租户级锁偏序与多维解耦纪元管理器。"""
++from __future__ import annotations
++
++from collections import deque
++from contextlib import contextmanager
++import pathlib
++import sqlite3
++import threading
++from typing import Any, Iterator
++
++from .db import open_connection
++
++
++class ConnectionPool:
++    """线程安全的有界 SQLite 连接池。"""
++
++    def __init__(self, db_path: str, max_size: int = 16) -> None:
++        self.db_path = db_path
++        self.max_size = max_size
++        self._lock = threading.Lock()
++        self._pool: deque[sqlite3.Connection] = deque()
++
++    @contextmanager
++    def borrow(self) -> Iterator[sqlite3.Connection]:
++        conn: sqlite3.Connection | None = None
++        with self._lock:
++            if self._pool:
++                conn = self._pool.pop()
++        if conn is None:
++            conn = open_connection(self.db_path)
++        try:
++            yield conn
++        except Exception:
++            try:
++                if conn.in_transaction:
++                    conn.rollback()
++            except sqlite3.Error:
++                pass
++            raise
++        else:
++            try:
++                if conn.in_transaction:
++                    conn.rollback()
++            except sqlite3.Error:
++                pass
++        finally:
++            returned = False
++            with self._lock:
++                if len(self._pool) < self.max_size:
++                    self._pool.append(conn)
++                    returned = True
++            if not returned:
++                try:
++                    conn.close()
++                except sqlite3.Error:
++                    pass
++
++    def close_all(self) -> None:
++        with self._lock:
++            while self._pool:
++                conn = self._pool.popleft()
++                try:
++                    conn.close()
++                except sqlite3.Error:
++                    pass
++
++
++class TokenInterner:
++    """线程安全的词元整数驻留表，用于压缩倒排索引与词序列堆内存。"""
++
++    def __init__(self) -> None:
++        self._lock = threading.Lock()
++        self._str_to_id: dict[str, int] = {}
++        self._next_id = 1
++
++    def intern(self, token: str) -> int:
++        tid = self._str_to_id.get(token)
++        if tid is not None:
++            return tid
++        with self._lock:
++            tid = self._str_to_id.get(token)
++            if tid is None:
++                tid = self._next_id
++                self._next_id += 1
++                self._str_to_id[token] = tid
++            return tid
++
++    def lookup(self, token: str) -> int | None:
++        return self._str_to_id.get(token)
++
++
++class TenantState:
++    """单租户隔离状态：独立细粒度锁偏序、解耦纪元与领域增量索引容器。"""
++
++    def __init__(self, tenant_id: str) -> None:
++        self.tenant_id = tenant_id
++        # 严格全局锁偏序：risk_lock -> quota_lock -> SQLite BEGIN IMMEDIATE
++        self.risk_lock = threading.RLock()
++        self.quota_lock = threading.RLock()
++        self.doc_lock = threading.RLock()
++        self.perm_lock = threading.RLock()
++        self.acl_lock = threading.RLock()
++        self.policy_lock = threading.RLock()
++        self.sanction_lock = threading.RLock()
++
++        # 多维解耦纪元（互不污染）
++        self.doc_epoch = 0
++        self.acl_epoch = 0
++        self.perm_epoch = 0
++        self.policy_epoch = 0
++        self.sanction_epoch = 0
++
++        # 懒加载的领域缓存/增量结构
++        self.doc_index: Any = None
++        self.perm_cache: Any = None
++        self.acl_cache: Any = None
++        self.policy_cache: dict[str, Any] | None = None
++        self.policy_cache_epoch: int = -1
++        self.sanction_set: set[str] | None = None
++        self.sanction_cache_epoch: int = -1
++        self.risk_graph_state: Any = None
++
++
++class GatewayState:
++    """绑定到特定 db_path 的网关运行时状态。"""
++
++    def __init__(self, db_path: str) -> None:
++        self.db_path = str(pathlib.Path(db_path).resolve())
++        self.pool = ConnectionPool(self.db_path, max_size=16)
++        self.interner = TokenInterner()
++        self._tenants_lock = threading.Lock()
++        self._tenants: dict[str, TenantState] = {}
++
++    def tenant(self, tenant_id: str) -> TenantState:
++        ts = self._tenants.get(tenant_id)
++        if ts is not None:
++            return ts
++        with self._tenants_lock:
++            ts = self._tenants.get(tenant_id)
++            if ts is None:
++                ts = TenantState(tenant_id)
++                self._tenants[tenant_id] = ts
++            return ts
++
++
++_STATES_LOCK = threading.Lock()
++_STATES_BY_PATH: dict[str, GatewayState] = {}
++
++
++def get_gateway_state(db_path: str | pathlib.Path) -> GatewayState:
++    resolved = str(pathlib.Path(db_path).resolve())
++    st = _STATES_BY_PATH.get(resolved)
++    if st is not None:
++        return st
++    with _STATES_LOCK:
++        st = _STATES_BY_PATH.get(resolved)
++        if st is None:
++            if len(_STATES_BY_PATH) >= 64:
++                oldest_key = next(iter(_STATES_BY_PATH))
++                old_st = _STATES_BY_PATH.pop(oldest_key)
++                old_st.pool.close_all()
++            st = GatewayState(resolved)
++            _STATES_BY_PATH[resolved] = st
++        return st
++
++
++def register_gateway_state(db_path: str | pathlib.Path) -> GatewayState:
++    """为新创建的 AegisGateway 实例重置并注册干净的 GatewayState（确保复用同路径新库时无陈旧缓存）。"""
++    resolved = str(pathlib.Path(db_path).resolve())
++    with _STATES_LOCK:
++        old = _STATES_BY_PATH.pop(resolved, None)
++        if old is not None:
++            old.pool.close_all()
++        st = GatewayState(resolved)
++        _STATES_BY_PATH[resolved] = st
++        return st
+
+--- /dev/null
++++ b/aegis_app/validation.py
+@@ -0,0 +1,209 @@
++# -*- coding: utf-8 -*-
++"""统一严格类型校验、JSON 嵌套深度预检、正则安全编译与字面模板沙箱模块。"""
++from __future__ import annotations
++
++import math
++import re
++from typing import Any
++
++INT64_MIN = -(1 << 63)
++INT64_MAX = (1 << 63) - 1
++MAX_JSON_BYTES = 2 * 1024 * 1024
++MAX_JSON_DEPTH = 64
++MAX_REGEX_LEN = 256
++MAX_REGEX_SUBJECT_LEN = 4096
++
++ALLOWED_TEMPLATE_PLACEHOLDERS = frozenset({
++    "tenant_id",
++    "total_records",
++    "total_amount_cents",
++})
++EVENT_FILTER_RE = re.compile(r"^[A-Za-z0-9_]{0,64}$")
++_BACKREF_RE = re.compile(r"\\([1-9][0-9]*)|\(\?P=")
++_LOOKAROUND_RE = re.compile(r"\(\?(?:[=!<]|<[=!])")
++_LARGE_BRACE_RE = re.compile(r"\{(\d+)(?:,(\d*))?\}")
++
++
++def parse_strict_int(
++    val: Any,
++    field_name: str,
++    *,
++    min_val: int | None = None,
++    max_val: int | None = None,
++) -> int:
++    """严格解析 64 位有符号整数，拒绝 bool、NaN/Inf、非整数浮点及越界大整数。"""
++    if isinstance(val, bool) or val is None:
++        raise ValueError(f"Invalid integer for {field_name}")
++    if isinstance(val, int):
++        res = val
++    elif isinstance(val, float):
++        if math.isnan(val) or math.isinf(val) or not val.is_integer():
++            raise ValueError(f"Invalid integer for {field_name}")
++        res = int(val)
++    elif isinstance(val, str):
++        s = val.strip()
++        if not s:
++            raise ValueError(f"Invalid integer for {field_name}")
++        if s[0] in ("+", "-"):
++            if len(s) == 1 or not s[1:].isdigit():
++                raise ValueError(f"Invalid integer for {field_name}")
++        elif not s.isdigit():
++            raise ValueError(f"Invalid integer for {field_name}")
++        res = int(s, 10)
++    else:
++        raise ValueError(f"Invalid integer for {field_name}")
++
++    if res < INT64_MIN or res > INT64_MAX:
++        raise ValueError(f"Integer out of 64-bit range for {field_name}")
++    if min_val is not None and res < min_val:
++        raise ValueError(f"{field_name} must be >= {min_val}")
++    if max_val is not None and res > max_val:
++        raise ValueError(f"{field_name} must be <= {max_val}")
++    return res
++
++
++def parse_strict_number(val: Any, field_name: str = "number") -> float:
++    """严格解析有限数值，拒绝 bool、NaN 与 Inf。"""
++    if isinstance(val, bool) or val is None:
++        raise ValueError(f"Invalid number for {field_name}")
++    if isinstance(val, (int, float)):
++        fval = float(val)
++    elif isinstance(val, str):
++        fval = float(val.strip())
++    else:
++        raise ValueError(f"Invalid number for {field_name}")
++    if math.isnan(fval) or math.isinf(fval):
++        raise ValueError(f"Non-finite number not allowed for {field_name}")
++    return fval
++
++
++def check_json_depth_and_size(
++    raw: str,
++    *,
++    max_bytes: int = MAX_JSON_BYTES,
++    max_depth: int = MAX_JSON_DEPTH,
++) -> None:
++    """在调用 json.loads 之前以 O(N) 线性扫描校验字节大小与最大括号嵌套深度。"""
++    if len(raw.encode("utf-8", errors="ignore")) > max_bytes:
++        raise ValueError("JSON payload exceeds maximum allowed size")
++    depth = 0
++    in_string = False
++    escaped = False
++    for ch in raw:
++        if in_string:
++            if escaped:
++                escaped = False
++            elif ch == "\\":
++                escaped = True
++            elif ch == '"':
++                in_string = False
++            continue
++        if ch == '"':
++            in_string = True
++        elif ch in ("{", "["):
++            depth += 1
++            if depth > max_depth:
++                raise ValueError(f"JSON nesting depth exceeds maximum ({max_depth})")
++        elif ch in ("}", "]"):
++            if depth > 0:
++                depth -= 1
++
++
++def _has_nested_quantifier(pattern: str) -> bool:
++    """线性扫描检测分组内含重复量词且分组自身带量词的回溯风险模式。"""
++    stack: list[bool] = []
++    in_class = False
++    i = 0
++    n = len(pattern)
++    while i < n:
++        ch = pattern[i]
++        if ch == "\\":
++            i += 2
++            continue
++        if in_class:
++            if ch == "]":
++                in_class = False
++            i += 1
++            continue
++        if ch == "[":
++            in_class = True
++            i += 1
++            continue
++        if ch == "(":
++            stack.append(False)
++            i += 1
++            continue
++        if ch == ")":
++            has_inner_q = stack.pop() if stack else False
++            nxt_idx = i + 1
++            if nxt_idx < n and pattern[nxt_idx] in ("+", "*", "?", "{"):
++                if has_inner_q:
++                    return True
++                if stack:
++                    stack[-1] = True
++            elif has_inner_q and stack:
++                stack[-1] = True
++            i += 1
++            continue
++        if ch in ("+", "*", "?", "{"):
++            if stack:
++                stack[-1] = True
++        i += 1
++    return False
++
++
++def compile_safe_regex(pattern: str) -> re.Pattern[str]:
++    """校验并编译规则正则，阻断回溯、反向引用、环视与超大上界量词炸弹。"""
++    if not isinstance(pattern, str) or len(pattern) > MAX_REGEX_LEN:
++        raise ValueError("Regex pattern exceeds maximum length")
++    if _BACKREF_RE.search(pattern):
++        raise ValueError("Regex backreferences are not permitted")
++    if _LOOKAROUND_RE.search(pattern):
++        raise ValueError("Regex lookarounds are not permitted")
++    for m in _LARGE_BRACE_RE.finditer(pattern):
++        low = int(m.group(1))
++        high_str = m.group(2)
++        if low > 100 or (high_str is not None and (high_str == "" or int(high_str) > 100)):
++            raise ValueError("Regex quantifier bound exceeds safe limit (100)")
++    if _has_nested_quantifier(pattern):
++        raise ValueError("Nested quantifiers in regex are not permitted")
++    try:
++        return re.compile(pattern)
++    except re.error as exc:
++        raise ValueError(f"Invalid regex pattern: {exc}") from exc
++
++
++def validate_literal_template(title_format: str) -> None:
++    """严格校验报表标题模板，仅允许白名单字面占位符，禁止格式化属性/宽度注入。"""
++    i = 0
++    n = len(title_format)
++    while i < n:
++        ch = title_format[i]
++        if ch == "{":
++            end = title_format.find("}", i + 1)
++            if end == -1:
++                raise ValueError("Unmatched '{' in title_format")
++            token = title_format[i + 1 : end]
++            if token not in ALLOWED_TEMPLATE_PLACEHOLDERS:
++                raise ValueError(f"Unsupported or unsafe template placeholder: {{{token}}}")
++            i = end + 1
++        elif ch == "}":
++            raise ValueError("Unmatched '}' in title_format")
++        else:
++            i += 1
++
++
++def render_literal_template(
++    title_format: str,
++    *,
++    tenant_id: str,
++    total_records: int,
++    total_amount_cents: int,
++) -> str:
++    """使用纯字面替换安全渲染报表标题，完全绕开 str.format。"""
++    validate_literal_template(title_format)
++    return (
++        title_format.replace("{tenant_id}", str(tenant_id))
++        .replace("{total_records}", str(int(total_records)))
++        .replace("{total_amount_cents}", str(int(total_amount_cents)))
++    )
+
+--- a/aegis_app/window_stats.py
++++ b/aegis_app/window_stats.py
+@@ -1,20 +1,217 @@
+ # -*- coding: utf-8 -*-
+-"""24 小时滑动窗口精确统计与动态金额中位数计算模块。"""
++"""24 小时滑动窗口精确统计与动态金额中位数计算模块（双堆 O(log W) + 乱序精确回退）。"""
+ from __future__ import annotations
++
++import bisect
++from collections import Counter, deque
++import heapq
++
++from .config import SLIDING_WINDOW_SECONDS
+ 
+ 
+ def compute_exact_median_cents(amounts: list[int]) -> int:
+     """计算非空整数金额列表的精确中位数（偶数个元素取中间两数的整数均值 (a + b) // 2）。"""
+     if not amounts:
+         return 0
+-    ordered = list(amounts)
+-    # 传统交换排序以获取有序金额序列
++    ordered = sorted(amounts)
+     n = len(ordered)
+-    for i in range(n):
+-        for j in range(0, n - i - 1):
+-            if ordered[j] > ordered[j + 1]:
+-                ordered[j], ordered[j + 1] = ordered[j + 1], ordered[j]
+     mid = n // 2
+     if n % 2 == 1:
+         return int(ordered[mid])
+     return int((ordered[mid - 1] + ordered[mid]) // 2)
++
++
++class _TwoHeapMedian:
++    """支持 O(log W) 插入、懒惰删除与 O(1) 精确中位数查询的双堆维护器。"""
++
++    __slots__ = (
++        "_low",
++        "_high",
++        "_low_active",
++        "_high_active",
++        "_delayed_low",
++        "_delayed_high",
++        "low_size",
++        "high_size",
++    )
++
++    def __init__(self) -> None:
++        self._low: list[int] = []
++        self._high: list[int] = []
++        self._low_active: Counter[int] = Counter()
++        self._high_active: Counter[int] = Counter()
++        self._delayed_low: Counter[int] = Counter()
++        self._delayed_high: Counter[int] = Counter()
++        self.low_size = 0
++        self.high_size = 0
++
++    def _prune_low(self) -> None:
++        while self._low:
++            top = -self._low[0]
++            if self._delayed_low[top] > 0:
++                self._delayed_low[top] -= 1
++                heapq.heappop(self._low)
++            else:
++                break
++
++    def _prune_high(self) -> None:
++        while self._high:
++            top = self._high[0]
++            if self._delayed_high[top] > 0:
++                self._delayed_high[top] -= 1
++                heapq.heappop(self._high)
++            else:
++                break
++
++    def _rebalance(self) -> None:
++        self._prune_low()
++        self._prune_high()
++        if self.low_size > self.high_size + 1:
++            val = -heapq.heappop(self._low)
++            self._low_active[val] -= 1
++            self.low_size -= 1
++            heapq.heappush(self._high, val)
++            self._high_active[val] += 1
++            self.high_size += 1
++            self._prune_low()
++        elif self.high_size > self.low_size:
++            val = heapq.heappop(self._high)
++            self._high_active[val] -= 1
++            self.high_size -= 1
++            heapq.heappush(self._low, -val)
++            self._low_active[val] += 1
++            self.low_size += 1
++            self._prune_high()
++
++    def add(self, val: int) -> None:
++        self._prune_low()
++        if self.low_size == 0 or val <= -self._low[0]:
++            heapq.heappush(self._low, -val)
++            self._low_active[val] += 1
++            self.low_size += 1
++        else:
++            heapq.heappush(self._high, val)
++            self._high_active[val] += 1
++            self.high_size += 1
++        self._rebalance()
++
++    def remove(self, val: int) -> None:
++        if self._low_active[val] > 0:
++            self._low_active[val] -= 1
++            self.low_size -= 1
++            self._delayed_low[val] += 1
++        else:
++            self._high_active[val] -= 1
++            self.high_size -= 1
++            self._delayed_high[val] += 1
++        self._rebalance()
++
++    def median(self) -> int:
++        self._prune_low()
++        self._prune_high()
++        if self.low_size == 0:
++            return 0
++        if self.low_size > self.high_size:
++            return int(-self._low[0])
++        return int((-self._low[0] + self._high[0]) // 2)
++
++
++class AccountWindowTracker:
++    """单账户 24 小时滑动窗口状态，支持单调流 O(log W) 维护、乱序精确回退与事务撤销。"""
++
++    __slots__ = (
++        "records",
++        "_seq",
++        "_mono_valid",
++        "_last_ts",
++        "_active_q",
++        "_win_amount",
++        "_cp_counts",
++        "_median",
++    )
++
++    def __init__(self, initial_records: list[tuple[int, int, str]] | None = None) -> None:
++        self.records: list[tuple[int, int, int, str]] = []
++        self._seq = 0
++        self._mono_valid = False
++        self._last_ts = 0
++        self._active_q: deque[tuple[int, int, int, str]] = deque()
++        self._win_amount = 0
++        self._cp_counts: Counter[str] = Counter()
++        self._median = _TwoHeapMedian()
++        if initial_records:
++            for ts, amt, cp in sorted(initial_records, key=lambda x: x[0]):
++                self._seq += 1
++                self.records.append((ts, self._seq, amt, cp))
++
++    def _rebuild_mono(self, ts: int) -> None:
++        win_start = ts - SLIDING_WINDOW_SECONDS
++        lo = bisect.bisect_left(self.records, (win_start, -1, 0, ""))
++        hi = bisect.bisect_right(self.records, (ts, 1 << 62, 0, ""))
++        self._active_q = deque()
++        self._win_amount = 0
++        self._cp_counts = Counter()
++        self._median = _TwoHeapMedian()
++        for rec in self.records[lo:hi]:
++            self._active_q.append(rec)
++            self._win_amount += rec[2]
++            self._cp_counts[rec[3]] += 1
++            self._median.add(rec[2])
++        self._last_ts = ts
++        self._mono_valid = True
++
++    def push_and_query(self, ts: int, amount_cents: int, counterparty_id: str) -> tuple[int, int, int, int, tuple[int, int, int, str]]:
++        """插入当前交易并返回 (win_tx_count, win_amount_cents, win_unique_cps, win_median_cents, undo_token)。"""
++        self._seq += 1
++        rec = (ts, self._seq, amount_cents, counterparty_id)
++
++        if not self.records or ts >= self.records[-1][0]:
++            self.records.append(rec)
++            if not self._mono_valid:
++                self._rebuild_mono(ts)
++            else:
++                win_start = ts - SLIDING_WINDOW_SECONDS
++                while self._active_q and self._active_q[0][0] < win_start:
++                    old = self._active_q.popleft()
++                    self._win_amount -= old[2]
++                    old_cp = old[3]
++                    self._cp_counts[old_cp] -= 1
++                    if self._cp_counts[old_cp] <= 0:
++                        del self._cp_counts[old_cp]
++                    self._median.remove(old[2])
++                self._active_q.append(rec)
++                self._win_amount += amount_cents
++                self._cp_counts[counterparty_id] += 1
++                self._median.add(amount_cents)
++                self._last_ts = ts
++            return (
++                len(self._active_q),
++                self._win_amount,
++                len(self._cp_counts),
++                self._median.median(),
++                rec,
++            )
++
++        # 乱序时间戳精确回退：插入有序列表并对 [ts - 86400, ts] 切片精确计算
++        bisect.insort(self.records, rec)
++        self._mono_valid = False
++        win_start = ts - SLIDING_WINDOW_SECONDS
++        lo = bisect.bisect_left(self.records, (win_start, -1, 0, ""))
++        hi = bisect.bisect_right(self.records, (ts, 1 << 62, 0, ""))
++        window_slice = self.records[lo:hi]
++        amounts = [r[2] for r in window_slice]
++        cps = {r[3] for r in window_slice}
++        return (
++            len(window_slice),
++            sum(amounts),
++            len(cps),
++            compute_exact_median_cents(amounts),
++            rec,
++        )
++
++    def rollback_records(self, undo_recs: list[tuple[int, int, int, str]]) -> None:
++        if not undo_recs:
++            return
++        undo_set = set(undo_recs)
++        self.records = [r for r in self.records if r not in undo_set]
++        self._mono_valid = False

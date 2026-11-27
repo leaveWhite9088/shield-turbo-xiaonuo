@@ -1,0 +1,18 @@
+{
+  "model": "gemini-4-argon(high)",
+  "model_id": "gemini-4-argon(high)",
+  "pack_id": "fad609252e36",
+  "created_at": "2026-11-26T23:34:09+08:00",
+  "cases": {
+    "case-01": {
+      "run": "gemini-4-argon(high)",
+      "code_sha256": "3e51f1d9d2e3f873219d2b8fc34cbf35fc3486d14808424d0997456630d95ebd",
+      "end_iso": "2026-11-26T23:34:09+08:00",
+      "diff_stats": {
+        "changed_files": 15,
+        "added_lines": 3657,
+        "deleted_lines": 1273
+      }
+    }
+  }
+}
