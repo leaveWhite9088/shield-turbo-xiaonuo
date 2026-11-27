@@ -132,7 +132,7 @@ def main() -> int:
     protocol = {
         "schema_version": 1,
         "benchmark": cfg.get("name", "shield-turbo-xiaonuo"),
-        "version": cfg.get("version", "xiaonuo-v2.0"),
+        "version": cfg.get("version", "xiaonuo-v3.0"),
         "run_name": run_name,
         "model_id": model_id,
         "status": "in_progress",

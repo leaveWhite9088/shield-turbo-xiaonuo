@@ -164,6 +164,7 @@ def manage_role_delegation(
             starts_at=starts_at,
             expires_at=expires_at,
             action=action,
+            now_ts=caller.request_ts,
         )
     except PermissionError as exc:
         raise AuthError(str(exc), 403) from exc

@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""公开基础业务功能回归冒烟测试（smoke_check.py · v2.0）。
+"""公开基础业务功能回归冒烟测试（smoke_check.py · v3.0）。
 
-说明：仅在小规模样本上检验核心业务路由的基础功能正确性，不包含高压性能压测与红队安全攻防载荷。
+说明：仅在小规模样本上检验核心业务路由与跨模块契约的基础功能正确性，不包含高压性能压测与红队安全攻防载荷。
 """
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import pathlib
 import shutil
@@ -33,14 +31,14 @@ def _auth_headers(tenant_id: str, user_info: dict[str, str]) -> dict[str, str]:
 
 
 def run_smoke() -> int:
-    tmp_root = pathlib.Path(tempfile.mkdtemp(prefix="aegis_smoke_v2_"))
+    tmp_root = pathlib.Path(tempfile.mkdtemp(prefix="aegis_smoke_v3_"))
     try:
         db_path = tmp_root / "smoke.db"
         storage_dir = tmp_root / "storage"
         manifest = seed_dataset(
             db_path,
             storage_dir,
-            seed=20261122,
+            seed=20261126,
             num_tenants=2,
             docs_per_tenant=16,
             tx_per_tenant=24,
@@ -59,7 +57,7 @@ def run_smoke() -> int:
         h_specialist = _auth_headers("tenant_alpha", t_alpha["users"]["specialist"])
         h_researcher = _auth_headers("tenant_alpha", t_alpha["users"]["researcher"])
 
-        # 合规检索、词距邻近度与三级隔离墙（ops_team DENY，子部门 ops_special ALLOW）
+        # 1. 合规检索、词距邻近度与三级隔离墙（ops_team DENY，子部门 ops_special ALLOW）
         wall_doc_id = t_alpha["wall_doc_id"]
         _, _, s_spec = gw.request(
             "GET",
@@ -74,7 +72,7 @@ def run_smoke() -> int:
         assert any(d["doc_id"] == wall_doc_id for d in s_spec["items"]), "Sub-unit ALLOW should override parent DENY"
         assert all(d["doc_id"] != wall_doc_id for d in s_ana["items"]), "Parent ops_team DENY should block analyst"
 
-        # 实时文档 Upsert 与 Retire
+        # 2. 实时文档 Upsert、跨文档有效引用联动（隔离源文档自动剥离引用）与二级转借调时效窗口核验
         st_up, _, up_res = gw.request(
             "POST",
             f"/api/v1/docs/upsert?_now_ts={base_ts + 20}",
@@ -88,18 +86,55 @@ def run_smoke() -> int:
                 "custom_tag": "tag_live",
                 "title": "Live Streaming AML Guidance",
                 "body": "wire transfer travel rule live streaming incremental index verification",
-                "citations": ["ref_live_1"],
+                "citations": ["ref_live_1", "doc_alpha_0002"],
             },
         )
         assert st_up == 200 and up_res["operation"] == "created"
-        # researcher 在有效借调期内拥有 SENIOR_AUDITOR(3)，应当能搜到这篇密级 3 文档
-        _, _, s_del = gw.request(
+
+        # researcher（1跳借调）与 specialist（在 base_ts+300 处于 2跳有效借调窗内）均能检索密级 3 文档且包含 2 条有效引用
+        _, _, s_del1 = gw.request(
             "GET",
-            f"/api/v1/docs/search?q=incremental+index+verification&_now_ts={base_ts + 30}",
+            f"/api/v1/docs/search?q=incremental+index+verification&deduplicate=0&_now_ts={base_ts + 30}",
             headers=h_researcher,
         )
-        assert any(d["doc_id"] == "doc_alpha_live_01" for d in s_del["items"])
+        live_hit_1 = [d for d in s_del1["items"] if d["doc_id"] == "doc_alpha_live_01"]
+        assert len(live_hit_1) == 1 and live_hit_1[0]["citation_count"] == 2
 
+        _, _, s_del2 = gw.request(
+            "GET",
+            f"/api/v1/docs/search?q=incremental+index+verification&deduplicate=0&_now_ts={base_ts + 300}",
+            headers=h_specialist,
+        )
+        assert any(d["doc_id"] == "doc_alpha_live_01" for d in s_del2["items"]), "2-hop transitive delegation should grant clearance 3"
+
+        # 在 base_ts+7500 时，虽然 specialist 自身二级借调窗 [+200, +9000) 未到期，但上游 researcher 一级借调窗 [-3600, +7200) 已到期，须自动降级
+        _, _, s_del2_exp = gw.request(
+            "GET",
+            f"/api/v1/docs/search?q=live+streaming+incremental+index&deduplicate=1&_now_ts={base_ts + 7500}",
+            headers=h_specialist,
+        )
+        assert all(d["doc_id"] != "doc_alpha_live_01" for d in s_del2_exp["items"]), "Expired upstream hop-1 must invalidate hop-2"
+
+        # 隔离内部引用源 doc_alpha_0002 后，doc_alpha_live_01 的有效引用计数须立即从 2 降为 1；解封后恢复为 2
+        gw.request(
+            "POST",
+            f"/api/v1/docs/quarantine?_now_ts={base_ts + 35}",
+            headers=h_admin,
+            body={"doc_id": "doc_alpha_0002", "quarantined": True},
+        )
+        _, _, s_q_on = gw.request(
+            "GET",
+            f"/api/v1/docs/search?q=incremental+index+verification&deduplicate=0&_now_ts={base_ts + 36}",
+            headers=h_auditor,
+        )
+        assert [d for d in s_q_on["items"] if d["doc_id"] == "doc_alpha_live_01"][0]["citation_count"] == 1
+
+        gw.request(
+            "POST",
+            f"/api/v1/docs/quarantine?_now_ts={base_ts + 37}",
+            headers=h_admin,
+            body={"doc_id": "doc_alpha_0002", "quarantined": False},
+        )
         st_ret, _, _ = gw.request(
             "POST",
             f"/api/v1/docs/retire?_now_ts={base_ts + 40}",
@@ -108,13 +143,13 @@ def run_smoke() -> int:
         )
         assert st_ret == 200
 
-        # 实时风控批次评估（含精确中位数、三跳受制裁实体传染与主权豁免）
+        # 3. 实时风控批次评估（含精确中位数、三跳受制裁传染、主权豁免与高危 REJECT 实时告警配额联动）
         batch_payload = {
-            "batch_id": "batch_smoke_v2",
+            "batch_id": "batch_smoke_v3",
             "transactions": [
                 {
                     "tx_id": "tx_smk_1",
-                    "account_id": "acct_alpha_002",  # 种子中距离制裁实体 2 跳 -> 本笔交易关联后应命中跳数传染
+                    "account_id": "acct_alpha_002",
                     "counterparty_id": "cp_901",
                     "amount_cents": 120000,
                     "currency": "USD",
@@ -134,6 +169,17 @@ def run_smoke() -> int:
                     "ts": base_ts + 150,
                     "metadata": {"region": "EU"},
                 },
+                {
+                    "tx_id": "tx_smk_3_reject",
+                    "account_id": "acct_alpha_001",
+                    "counterparty_id": t_alpha["sanctioned_entity"],
+                    "amount_cents": 600000,
+                    "currency": "USD",
+                    "channel": "CRYPTO_BRIDGE",
+                    "contact_email": "alert.desk@alpha-corp.com",
+                    "ts": base_ts + 160,
+                    "metadata": {"region": "US"},
+                },
             ],
         }
         st_ev, _, ev_res = gw.request(
@@ -142,21 +188,23 @@ def run_smoke() -> int:
             headers=h_auditor,
             body=batch_payload,
         )
-        assert st_ev == 200 and ev_res["evaluated_count"] == 2
-        assert ev_res["results"][0]["sanction_hop"] == 3
+        assert st_ev == 200 and ev_res["evaluated_count"] == 3
+        assert ev_res["results"][0]["sanction_hop"] == 3 and ev_res["results"][0]["alert_dispatched"] is False
         assert "LEGACY_SOVEREIGN_EXEMPT" in ev_res["results"][1]["reasons"]
+        assert ev_res["results"][2]["decision"] == "REJECT" and ev_res["results"][2]["alert_dispatched"] is True
+        assert "ALERT_QUOTA_CONSUMED" in ev_res["results"][2]["reasons"]
         assert "median_cents" in ev_res["results"][0]["window"]
 
-        # 跨池配额调拨
+        # 4. 跨池配额调拨（REALTIME_ALERT_POOL 刚才被 REJECT 扣了 1 点剩 49，调入 10 点后为 59）
         st_tr, _, tr_res = gw.request(
             "POST",
             "/api/v1/quotas/transfer",
             headers=h_admin,
             body={"from_quota": "RESERVE_BUFFER_POOL", "to_quota": "REALTIME_ALERT_POOL", "amount": 10},
         )
-        assert st_tr == 200 and tr_res["transferred"] is True and tr_res["from_remaining"] == 40 and tr_res["to_remaining"] == 60
+        assert st_tr == 200 and tr_res["transferred"] is True and tr_res["from_remaining"] == 40 and tr_res["to_remaining"] == 59
 
-        # 自定义审计报表模板保存与渲染
+        # 5. 自定义审计报表模板保存与渲染
         st_tp, _, _ = gw.request(
             "PUT",
             "/api/v1/audit/report-template",
@@ -176,7 +224,7 @@ def run_smoke() -> int:
         )
         assert st_rn == 200 and rn_res["rendered_title"].startswith("Report for tenant_alpha:")
 
-        # HTTP Socket 端到端联通验证
+        # 6. HTTP Socket 端到端联通验证
         srv = build_http_server(gw, host="127.0.0.1", port=0)
         port = srv.server_address[1]
         t_srv = threading.Thread(target=srv.serve_forever, daemon=True)
@@ -190,7 +238,7 @@ def run_smoke() -> int:
             srv.shutdown()
             srv.server_close()
 
-        print("[PASS] AegisGate v2.0 基础业务功能冒烟自检全部通过。")
+        print("[PASS] AegisGate v3.0 基础业务功能冒烟自检全部通过。")
         return 0
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)

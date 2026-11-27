@@ -22,14 +22,33 @@ from .doc_indexer import (
 from .legacy_compat import canonicalize_regulation_code
 
 
-def _get_doc_citation_count(db_path: str, doc_id: str) -> int:
+def _get_doc_citation_count(db_path: str, tenant_id: str, doc_id: str) -> int:
+    """统计文档当前有效的唯一引用源数量（内部 doc_ 引用须核验源文档处于 ACTIVE 且未隔离状态）。"""
     conn = open_connection(db_path)
     try:
         rows = conn.execute(
-            "SELECT citation_id, cited_by_ref FROM doc_citations WHERE doc_id = ?",
-            (doc_id,),
+            "SELECT cited_by_ref FROM doc_citations WHERE tenant_id = ? AND doc_id = ?",
+            (tenant_id, doc_id),
         ).fetchall()
-        return len([dict(r) for r in rows])
+        seen_refs: list[str] = []
+        for r in rows:
+            ref = str(r["cited_by_ref"] or "").strip()
+            if ref and ref != doc_id and ref not in seen_refs:
+                seen_refs.append(ref)
+
+        valid_cnt = 0
+        for ref in seen_refs:
+            if ref.startswith("doc_"):
+                ref_sql = (
+                    "SELECT status, quarantined FROM compliance_docs "
+                    f"WHERE doc_id = '{ref}'"
+                )
+                ref_row = conn.execute(ref_sql).fetchone()
+                if ref_row and ref_row["status"] == "ACTIVE" and int(ref_row["quarantined"]) == 0:
+                    valid_cnt += 1
+            else:
+                valid_cnt += 1
+        return valid_cnt
     finally:
         conn.close()
 
@@ -109,7 +128,7 @@ def search_documents(
             term_score = 0.0
             prox_bonus = 0.0
 
-        cite_cnt = _get_doc_citation_count(db_path, row["doc_id"])
+        cite_cnt = _get_doc_citation_count(db_path, caller.tenant_id, row["doc_id"])
         risk_w = int(row["risk_weight"])
         total_score = round(term_score + prox_bonus + 0.25 * cite_cnt + 0.1 * risk_w, 4)
 
