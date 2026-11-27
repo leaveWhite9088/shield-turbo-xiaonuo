@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""客观分（A/B/C）双指纹防篡改缓存与核验（xiaonuo-v2.0）。
+"""客观分（A/B/C）双指纹防篡改缓存与核验（xiaonuo-v3.0）。
 
 核心职责：
 1. 计算两项独立 SHA-256 指纹：
@@ -18,8 +18,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 
-CACHE_SCHEMA_VERSION = 2
-SECRET_ATTESTATION_TAG = "shield-turbo-xiaonuo-v2-objective-seal"
+CACHE_SCHEMA_VERSION = 3
+SECRET_ATTESTATION_TAG = "shield-turbo-xiaonuo-v3-objective-seal"
 
 SCORING_TRACKED_FILES = (
     "configs/benchmark.json",

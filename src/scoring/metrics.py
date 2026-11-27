@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""四维客观分（A 性能压榨 30 + B 守恒与效率 15 + C 红队攻防 25 = 70）连续插值与严苛封顶计分函数（xiaonuo-v2.0）。
+"""四维客观分（A 性能压榨 32 + B 守恒与效率 10 + C 红队攻防 28 = 70）连续插值与严苛封顶计分函数（xiaonuo-v3.0）。
 
-所有权重、分段拐点、尾延迟门限、常驻堆内存预算与半衰期参数均从 configs/benchmark.json 读取。
+所有权重、分段拐点、P95/P99 尾延迟门限、常驻堆内存预算与半衰期参数均从 configs/benchmark.json 读取。
 """
 from __future__ import annotations
 
@@ -117,9 +117,9 @@ def score_heap_budget(
 
 def score_b2_wall_clock(
     e2e_minutes: float,
-    max_score: float = 10.0,
-    full_minutes: float = 6.0,
-    half_life_minutes: float = 8.0,
+    max_score: float = 5.0,
+    full_minutes: float = 8.0,
+    half_life_minutes: float = 22.0,
 ) -> float:
     """端到端墙钟时间衰减曲线：full_minutes 内满分，超出按 half_life_minutes 指数减半。"""
     if e2e_minutes < 0 or math.isnan(e2e_minutes):
@@ -138,7 +138,7 @@ def compute_objective_scores(
     e2e_seconds: float,
     cfg: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """综合 B1 无损守恒、A 性能压榨、C 红队攻防与 B2 端到端耗时计算全部 70 分客观指标。"""
+    """综合 B1 无损守恒、A 性能压榨(32)、C 红队攻防(28)与 B2 端到端耗时(5)计算全部 70 分客观指标。"""
     cfg = cfg or load_benchmark_config()
     sc_cfg = cfg["scoring"]
     a_cfg = sc_cfg["A_detail"]
@@ -152,7 +152,7 @@ def compute_objective_scores(
     conservation_factor = 1.0 if b1_acc >= 1.0 - 1e-9 else (b1_acc ** penalty_exp)
     b1_score = round(float(b_cfg["B1_accuracy_max"]) * conservation_factor, 2)
 
-    # 2. A1 两段式对数加速曲线
+    # 2. A1 两段式对数加速曲线（满分 13.0，拐点 95x 得 8.5 分，260x 满分）
     speedup_a1 = float(perf_report.get("a1_speedup_ratio", 1.0))
     a1_raw = score_piecewise_log_speedup(
         speedup_a1,
@@ -163,7 +163,7 @@ def compute_objective_scores(
         min_ratio=float(a_cfg.get("A1_min_speedup", 1.05)),
     )
 
-    # 3. A2 混合并发吞吐 + P95 尾延迟 + P99 尖刺门控 + 全局大锁退化折算
+    # 3. A2 混合并发吞吐 + P95 尾延迟 + P99 尖刺门控 + 全局大锁退化折算（满分 11.0）
     rps_ratio = float(perf_report.get("a2_rps_ratio", 1.0))
     conc_p95_ms = float(perf_report.get("a2_concurrent_read_p95_ms", 999.0))
     conc_p99_ms = float(perf_report.get("a2_concurrent_read_p99_ms", conc_p95_ms))
@@ -188,8 +188,8 @@ def compute_objective_scores(
         score_latency_p95(
             conc_p99_ms,
             max_score=p99_subw,
-            target_ms=float(a_cfg.get("A2_target_p99_ms", 20.0)),
-            degraded_ms=float(a_cfg.get("A2_degraded_p99_ms", 280.0)),
+            target_ms=float(a_cfg.get("A2_target_p99_ms", 18.0)),
+            degraded_ms=float(a_cfg.get("A2_degraded_p99_ms", 260.0)),
         )
         if p99_subw > 0
         else 0.0
@@ -198,7 +198,7 @@ def compute_objective_scores(
 
     global_lock_penalized = False
     penalty_threshold = float(a_cfg.get("A2_global_lock_serialization_penalty_ratio", 2.4))
-    min_blocked_ms = float(a_cfg.get("A2_global_lock_min_blocked_ms", 20.0))
+    min_blocked_ms = float(a_cfg.get("A2_global_lock_min_blocked_ms", 55.0))
     if probe_p80_ms >= min_blocked_ms and cross_block_ratio >= penalty_threshold:
         global_lock_penalized = True
         degrade_mult = max(0.35, min(0.75, penalty_threshold / cross_block_ratio))
@@ -207,7 +207,7 @@ def compute_objective_scores(
     if conc_error_rate > 0:
         a2_raw *= max(0.0, 1.0 - min(1.0, conc_error_rate * 5.0))
 
-    # 4. A3 SQL 削减率 + 流式导出内存下降率 + 常驻堆内存预算（打击无脑全表进内存）
+    # 4. A3 SQL 削减率 + 流式导出内存下降率 + 收紧常驻堆内存预算（满分 8.0）
     q_red = float(perf_report.get("a3_sql_reduction_ratio", 0.0))
     m_red = float(perf_report.get("a3_mem_reduction_ratio", 0.0))
     resident_heap_mb = float(perf_report.get("a3_resident_heap_mb", 0.0))
@@ -223,13 +223,12 @@ def compute_objective_scores(
         target_reduction=float(a_cfg["A3_target_memory_reduction"]),
     )
     heap_subw = float(a_cfg.get("A3_heap_budget_subweight", 0.0))
-    # 仅在确实取得有效 SQL 削减（已建立索引/缓存机制）时兑现堆内存控制奖励，防止零缓存未优化原版白拿该子项
     if heap_subw > 0:
         raw_heap_score = score_heap_budget(
             resident_heap_mb,
             max_score=heap_subw,
-            budget_mb=float(a_cfg.get("A3_resident_heap_budget_mb", 6.0)),
-            zero_mb=float(a_cfg.get("A3_resident_heap_zero_mb", 24.0)),
+            budget_mb=float(a_cfg.get("A3_resident_heap_budget_mb", 4.5)),
+            zero_mb=float(a_cfg.get("A3_resident_heap_zero_mb", 18.0)),
         )
         eff_gate = min(1.0, max(0.0, q_red / 0.50))
         a3_heap_part = raw_heap_score * eff_gate
@@ -244,7 +243,7 @@ def compute_objective_scores(
     a3_final = round(a3_raw * conservation_factor, 2)
     a_total = round(a1_final + a2_final + a3_final, 2)
 
-    # 5. C 层红队攻防得分
+    # 5. C 层红队攻防得分（满分 28.0 = C1 10.0 + C2 9.0 + C3 9.0）
     c1_raw = float(redteam_report.get("C1_score", 0.0))
     c2_raw = float(redteam_report.get("C2_score", 0.0))
     c3_raw = float(redteam_report.get("C3_score", 0.0))
@@ -254,7 +253,7 @@ def compute_objective_scores(
     c3_final = round(c3_raw * avail_gate, 2)
     c_total = round(c1_final + c2_final + c3_final, 2)
 
-    # 6. B2 端到端优化耗时（受质量得分率、安全完整度二次方与 B1^5 守恒三重封顶）
+    # 6. B2 端到端优化耗时（满分 5.0，8分钟内满分、22分钟半衰期，受质量得分率、安全完整度二次方与 B1^5 封顶）
     e2e_min = max(0.0, float(e2e_seconds) / 60.0)
     b2_unbounded = score_b2_wall_clock(
         e2e_min,
@@ -262,8 +261,8 @@ def compute_objective_scores(
         full_minutes=float(b_cfg["B2_full_score_minutes"]),
         half_life_minutes=float(b_cfg["B2_half_life_minutes"]),
     )
-    qual_denom = float(b_cfg.get("quality_cap_denominator", 55.0))
-    c_max = float(sc_cfg.get("weights", {}).get("C_redteam_security", 25.0))
+    qual_denom = float(b_cfg.get("quality_cap_denominator", 60.0))
+    c_max = float(sc_cfg.get("weights", {}).get("C_redteam_security", 28.0))
     security_integrity_factor = min(1.0, max(0.0, c_total / max(1e-6, c_max))) ** 2
     b2_quality_cap = (
         float(b_cfg["B2_time_max"])
@@ -278,8 +277,8 @@ def compute_objective_scores(
     return {
         "A_performance": a_total,
         "A_detail": {
-            "A1_batch_search12": a1_final,
-            "A2_concurrency10": a2_final,
+            "A1_batch_search13": a1_final,
+            "A2_concurrency11": a2_final,
             "A3_resource8": a3_final,
             "raw_before_b1_cap": round(a1_raw + a2_raw + a3_raw, 2),
             "speedup_ratio": round(speedup_a1, 2),
@@ -295,7 +294,7 @@ def compute_objective_scores(
         "B_conservation_efficiency": b_total,
         "B_detail": {
             "B1_conservation5": b1_score,
-            "B2_time10": b2_final,
+            "B2_time5": b2_final,
             "B2_raw_unbounded": round(b2_unbounded, 2),
             "B2_quality_cap": round(b2_quality_cap, 2),
             "b1_accuracy": round(b1_acc, 6),
@@ -306,9 +305,9 @@ def compute_objective_scores(
         },
         "C_redteam_security": c_total,
         "C_detail": {
-            "C1_access_cache9": c1_final,
-            "C2_toctou_replay8": c2_final,
-            "C3_anti_dos8": c3_final,
+            "C1_access_cache10": c1_final,
+            "C2_toctou_replay9": c2_final,
+            "C3_anti_dos9": c3_final,
             "subchecks": redteam_report.get("details", {}),
         },
         "total_objective_70": total_obj,

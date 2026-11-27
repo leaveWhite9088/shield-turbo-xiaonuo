@@ -7,7 +7,7 @@ import re
 _BATCH_SUFFIX_RE = re.compile(
     r"-(?:"
     r"(?:h|s)(?:[-_]?\d+)?"
-    r"|(?!(?:v|ver|r)[-_]?\d+$)[a-z](?:[-_]?\d+)"
+    r"|(?!(?:v|ver|r|k|m)[-_]?\d+$)[a-z](?:[-_]?\d+)"
     r"|(?:batch|run|round|trial|seed|rep|repeat)(?:[-_]?\d+)?"
     r")$",
     re.IGNORECASE,

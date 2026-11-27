@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -82,8 +83,8 @@ def _run_worker_eval(candidate_ws: Path) -> int:
         "perf_report": perf_rep,
         "redteam_report": rt_rep,
     }
-    print(json.dumps(out, ensure_ascii=False))
-    return 0
+    print(json.dumps(out, ensure_ascii=False), flush=True)
+    os._exit(0)
 
 
 def score_and_finalize_run(
@@ -221,7 +222,7 @@ def main() -> int:
     print(
         f"[{tag}] {Path(args.run_dir).name} -> "
         f"客观总分={sc['total_objective_70']:.2f}/70 "
-        f"(A={sc['A_performance']:.2f}/30, B={sc['B_conservation_efficiency']:.2f}/15, C={sc['C_redteam_security']:.2f}/25)"
+        f"(A={sc['A_performance']:.2f}/32, B={sc['B_conservation_efficiency']:.2f}/10, C={sc['C_redteam_security']:.2f}/28)"
     )
     return 0
 

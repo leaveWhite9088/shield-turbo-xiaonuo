@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""计分公式（xiaonuo-v2.0）、常驻堆内存预算、防篡改双指纹缓存、盲评重评与隔离审计单元测试。"""
+"""计分公式（xiaonuo-v3.0）、常驻堆内存预算、防篡改双指纹缓存、盲评重评与隔离审计单元测试。"""
 from __future__ import annotations
 
 import json
@@ -34,47 +34,47 @@ class TestScoringAndIsolationUnits(unittest.TestCase):
             sanitize_run_name("../evil")
 
     def test_piecewise_speedup_heap_budget_and_conservation_cap(self) -> None:
-        self.assertEqual(metrics.score_piecewise_log_speedup(1.0, 12.0, 200.0, knee_ratio=60.0, knee_score=9.0), 0.0)
+        self.assertEqual(metrics.score_piecewise_log_speedup(1.0, 13.0, 260.0, knee_ratio=95.0, knee_score=8.5), 0.0)
         self.assertAlmostEqual(
-            metrics.score_piecewise_log_speedup(60.0, 12.0, 200.0, knee_ratio=60.0, knee_score=9.0),
-            9.0,
+            metrics.score_piecewise_log_speedup(95.0, 13.0, 260.0, knee_ratio=95.0, knee_score=8.5),
+            8.5,
             places=2,
         )
-        self.assertEqual(metrics.score_piecewise_log_speedup(220.0, 12.0, 200.0, knee_ratio=60.0, knee_score=9.0), 12.0)
+        self.assertEqual(metrics.score_piecewise_log_speedup(280.0, 13.0, 260.0, knee_ratio=95.0, knee_score=8.5), 13.0)
 
-        # 常驻堆内存预算：<= 6MB 满分 2.0，>= 24MB 得 0 分
-        self.assertEqual(metrics.score_heap_budget(2.5, 2.0, 6.0, 24.0), 2.0)
-        self.assertAlmostEqual(metrics.score_heap_budget(15.0, 2.0, 6.0, 24.0), 1.0, places=2)
-        self.assertEqual(metrics.score_heap_budget(30.0, 2.0, 6.0, 24.0), 0.0)
+        # 常驻堆内存预算：<= 4.5MB 满分 2.8，>= 18.0MB 得 0 分
+        self.assertEqual(metrics.score_heap_budget(2.2, 2.8, 4.5, 18.0), 2.8)
+        self.assertAlmostEqual(metrics.score_heap_budget(11.25, 2.8, 4.5, 18.0), 1.4, places=2)
+        self.assertEqual(metrics.score_heap_budget(20.0, 2.8, 4.5, 18.0), 0.0)
 
         # 验证 B1 < 100% 时的 B1_acc ** 5 毁灭性封顶（0.5^5 = 0.03125）
         sc_damaged = metrics.compute_objective_scores(
-            b1_report={"total_checks": 80, "passed_checks": 40},
+            b1_report={"total_checks": 100, "passed_checks": 50},
             perf_report={
-                "a1_speedup_ratio": 250.0,
+                "a1_speedup_ratio": 300.0,
                 "a2_rps_ratio": 200.0,
                 "a2_concurrent_read_p95_ms": 2.0,
                 "a2_concurrent_read_p99_ms": 4.0,
                 "a2_probe_read_p80_ms": 2.0,
                 "a2_cross_tenant_block_ratio": 1.1,
                 "a2_error_rate": 0.0,
-                "a3_sql_reduction_ratio": 0.99,
+                "a3_sql_reduction_ratio": 0.995,
                 "a3_mem_reduction_ratio": 0.95,
-                "a3_resident_heap_mb": 1.5,
+                "a3_resident_heap_mb": 1.8,
             },
-            redteam_report={"C1_score": 9.0, "C2_score": 8.0, "C3_score": 8.0},
+            redteam_report={"C1_score": 10.0, "C2_score": 9.0, "C3_score": 9.0},
             e2e_seconds=180.0,
             cfg=self.cfg,
         )
-        self.assertAlmostEqual(sc_damaged["A_performance"], round(30.0 * (0.5 ** 5), 2), places=1)
-        self.assertLess(sc_damaged["B_detail"]["B2_time10"], 0.5)
+        self.assertAlmostEqual(sc_damaged["A_performance"], round(32.0 * (0.5 ** 5), 2), places=1)
+        self.assertLess(sc_damaged["B_detail"]["B2_time5"], 0.3)
 
     def test_b2_wall_clock_decay_and_white_paper_cap(self) -> None:
-        self.assertAlmostEqual(metrics.score_b2_wall_clock(5.5, 10.0, 6.0, 8.0), 10.0)
-        self.assertAlmostEqual(metrics.score_b2_wall_clock(14.0, 10.0, 6.0, 8.0), 5.0)
+        self.assertAlmostEqual(metrics.score_b2_wall_clock(7.5, 5.0, 8.0, 22.0), 5.0)
+        self.assertAlmostEqual(metrics.score_b2_wall_clock(30.0, 5.0, 8.0, 22.0), 2.5)
 
         sc_lazy = metrics.compute_objective_scores(
-            b1_report={"total_checks": 80, "passed_checks": 80},
+            b1_report={"total_checks": 100, "passed_checks": 100},
             perf_report={
                 "a1_speedup_ratio": 1.0,
                 "a2_rps_ratio": 1.0,
@@ -91,7 +91,7 @@ class TestScoringAndIsolationUnits(unittest.TestCase):
             e2e_seconds=5.0,
             cfg=self.cfg,
         )
-        self.assertLess(sc_lazy["B_detail"]["B2_time10"], 0.5)
+        self.assertLess(sc_lazy["B_detail"]["B2_time5"], 0.3)
         self.assertLess(sc_lazy["total_objective_70"], 7.0)
 
     def test_review_log_append_and_realtime_rescore(self) -> None:
@@ -105,9 +105,9 @@ class TestScoringAndIsolationUnits(unittest.TestCase):
                     "judge_model": "judge-alpha",
                     "pack_id": "aabbccddeeff",
                     "case_id": "case-01",
-                    "D1": 4.8,
-                    "D2": 4.5,
-                    "D3": 4.0,
+                    "D1": 4.6,
+                    "D2": 4.4,
+                    "D3": 3.8,
                     "evidence": "initial review evidence",
                     "note": "mediocre lock",
                 },
@@ -119,11 +119,11 @@ class TestScoringAndIsolationUnits(unittest.TestCase):
                     "judge_model": "judge-alpha",
                     "pack_id": "aabbccddeeff",
                     "case_id": "case-01",
-                    "D1": 9.5,
-                    "D2": 9.0,
-                    "D3": 8.5,
+                    "D1": 9.2,
+                    "D2": 8.8,
+                    "D3": 7.2,
                     "evidence": "updated verified evidence",
-                    "note": "minor edge tradeoff",
+                    "note": "level 8.5 cap check",
                 },
                 reject_duplicate=False,
                 return_prior_count=True,
@@ -134,44 +134,44 @@ class TestScoringAndIsolationUnits(unittest.TestCase):
             self.assertEqual(sup_cnt, 1)
             agg = review_log.aggregate_reviews(deduped, mode="mean")
             self.assertEqual(len(agg), 1)
-            self.assertAlmostEqual(agg[0]["D"], 27.0)
+            self.assertAlmostEqual(agg[0]["D"], 25.2)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_objective_cache_tamper_and_blind_isolation(self) -> None:
         raw = {
-            "A_performance": 28.0,
+            "A_performance": 30.5,
             "A_detail": {},
-            "B_conservation_efficiency": 14.0,
+            "B_conservation_efficiency": 9.5,
             "B_detail": {},
-            "C_redteam_security": 25.0,
+            "C_redteam_security": 28.0,
             "C_detail": {},
-            "total_objective_70": 67.0,
+            "total_objective_70": 68.0,
         }
         sealed = objective_cache.build_objective_record(
             raw,
-            run_summary={"speedupRatio": 90.0},
+            run_summary={"speedupRatio": 190.0},
             code_sha256="abc123def456",
             t0_source="process",
             b2_reliable=True,
-            scoring_hash="shash_002",
-            deliverables_hash="dhash_002",
+            scoring_hash="shash_003",
+            deliverables_hash="dhash_003",
         )
         ok, reason = objective_cache.verify_objective_cache(
             sealed,
             expected_code_sha256="abc123def456",
-            scoring_hash="shash_002",
-            deliverables_hash="dhash_002",
+            scoring_hash="shash_003",
+            deliverables_hash="dhash_003",
         )
         self.assertTrue(ok, reason)
 
         tampered = dict(sealed)
-        tampered["A_performance"] = 30.0
+        tampered["A_performance"] = 32.0
         ok2, reason2 = objective_cache.verify_objective_cache(
             tampered,
             expected_code_sha256="abc123def456",
-            scoring_hash="shash_002",
-            deliverables_hash="dhash_002",
+            scoring_hash="shash_003",
+            deliverables_hash="dhash_003",
         )
         self.assertFalse(ok2)
         self.assertEqual(reason2, "tampered")
@@ -181,8 +181,8 @@ class TestScoringAndIsolationUnits(unittest.TestCase):
         ok3, reason3 = objective_cache.verify_objective_cache(
             contaminated,
             expected_code_sha256="abc123def456",
-            scoring_hash="shash_002",
-            deliverables_hash="dhash_002",
+            scoring_hash="shash_003",
+            deliverables_hash="dhash_003",
         )
         self.assertFalse(ok3)
         self.assertEqual(reason3, "contains_blind_fields")

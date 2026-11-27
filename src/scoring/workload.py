@@ -1,19 +1,19 @@
 # -*- coding: utf-8 -*-
-"""B1 高密度业务零失真对账器（80+ 项全契约核验）+ A1/A2/A3 混合读写高压压测与常驻内存探针。
+"""B1 高密度业务零失真对账器（95+ 项跨模块深水契约核验）+ A1/A2/A3 混合读写高压压测与常驻内存探针（xiaonuo-v3.0）。
 
-设计要点（xiaonuo-v2.0）：
-1. B1 零失真对账：在独立数据库副本上对参考原版与被测沙盒回放完全一致的 80+ 步多租户复杂读写操作序列，
-   覆盖短语词距邻近度加成、历史双轨法规号折叠、三级利益冲突隔离墙（含最近组织节点与个人豁免优先级）、
-   带时效借调委托、文档实时 Upsert/Retire、1~3 跳受制裁资金传染、滑动窗口精确动态中位数、
-   主权央行清算兼容豁免、跨配额池调拨、自定义报表模板渲染与审计滚动 SHA-256。
+设计要点（xiaonuo-v3.0）：
+1. B1 零失真对账：在独立数据库副本上对参考原版与被测沙盒回放完全一致的 95+ 步多租户复杂读写操作序列，
+   覆盖短语词距邻近度加成、历史双轨法规号折叠、跨文档内部有效引用动态剥离与解封恢复、三级利益冲突隔离墙、
+   二级受控转借调双窗口交集与上游到期降级、文档实时 Upsert/Retire、1~3 跳受制裁资金传染、滑动窗口精确动态中位数、
+   主权央行清算兼容豁免、高危 REJECT 实时告警配额耗尽与跨池调拨补给联动、自定义报表模板渲染与审计滚动 SHA-256。
 2. A1/A2/A3 实测压测：
-   - A1 穿插高频文档实时写入（Upsert）与多词邻近度去重检索 + 批量三跳传染与滑窗中位数评估（惩罚每次写入全量重建索引的偷懒方案）；
-   - A2 12 路混合读写（含实时 Upsert 与跨池配额调拨）并发吞吐、P95 与硬性 P99 尾延迟、跨租户全局大锁阻塞探针；
-   - A3 SQLite trace_callback 真实 SQL 削减率、流式导出峰值削减率，以及常驻堆内存增量（Resident Heap Delta）预算核查！
+   - A1 穿插高频文档实时写入（含内部引用）、隔离状态翻转、动态隔离墙切换与多词邻近度去重检索 + 批量三跳传染与滑窗中位数评估；
+   - A2 14 路高并发混合读写（含实时 Upsert、动态 ACL、含 REJECT 批次评估与双向跨池调拨交叉竞争）吞吐、P95 与高权重 P99 尾延迟、跨租户全局大锁阻塞探针；
+   - A3 SQLite trace_callback 真实 SQL 削减率、流式导出峰值削减率，以及收紧至 4.5MB 的常驻堆内存增量预算核查！
 """
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 import gc
 import hashlib
 import hmac
@@ -169,8 +169,9 @@ def _collect_b1_outputs(workspace_dir: pathlib.Path, cfg: dict[str, Any]) -> lis
         h0_res = _headers(t0_id, t0_info["users"]["researcher"])
         h0_ana = _headers(t0_id, t0_info["users"]["analyst"])
         h0_spc = _headers(t0_id, t0_info["users"]["specialist"])
+        h0_vw = _headers(t0_id, t0_info["users"]["viewer"])
 
-        # researcher 在委托过期后（base_ts + 9500 > base_ts + 7200）搜索 CONFIDENTIAL(3) 专属词项应无法看到密级 3 文档
+        # researcher 在一级委托过期后（base_ts + 9500 > base_ts + 7200）搜索 CONFIDENTIAL(3) 专属词项应无法看到密级 3 文档
         st_exp_d, _, exp_d_res = gw.request(
             "GET",
             f"/api/v1/docs/search?q=confidential+internal+audit+exception+remediation&deduplicate=0&_now_ts={base_ts + 9500}",
@@ -178,29 +179,85 @@ def _collect_b1_outputs(workspace_dir: pathlib.Path, cfg: dict[str, Any]) -> lis
         )
         records.append(("delegation_expired_researcher", (st_exp_d, exp_d_res.get("returned_count"))))
 
-        # auditor 将 SENIOR_AUDITOR 在 [base_ts + 300, base_ts + 1500] 借调给 specialist
-        st_del_c, _, del_c_res = gw.request(
-            "POST",
-            f"/api/v1/admin/delegations?_now_ts={base_ts + 250}",
-            headers=h0_aud,
-            body={
-                "grantor_user_id": t0_info["users"]["auditor"]["user_id"],
-                "grantee_user_id": t0_info["users"]["specialist"]["user_id"],
-                "delegated_role": "SENIOR_AUDITOR",
-                "starts_at": base_ts + 300,
-                "expires_at": base_ts + 1500,
-                "action": "create",
-            },
-        )
-        st_spc_in, _, spc_in_res = gw.request(
+        # 验证预置二级转借调链（auditor -> researcher [-3600, +7200) -> specialist [+200, +9000)）：
+        # (a) base_ts + 120（早于二级起点 +200）：不可见密级 3
+        # (b) base_ts + 350（处于两级交集内）：可见密级 3
+        # (c) base_ts + 7600（二级未到期但上游一级已到期）：自动降级不可见密级 3
+        _, _, spc_pre = gw.request(
             "GET",
-            f"/api/v1/docs/search?q=remediation+action+plan&deduplicate=0&_now_ts={base_ts + 600}",
+            f"/api/v1/docs/search?q=confidential+internal+audit+exception&deduplicate=0&limit=11&_now_ts={base_ts + 120}",
+            headers=h0_spc,
+        )
+        _, _, spc_in = gw.request(
+            "GET",
+            f"/api/v1/docs/search?q=remediation+action+plan&deduplicate=0&limit=12&_now_ts={base_ts + 350}",
+            headers=h0_spc,
+        )
+        _, _, spc_up_exp = gw.request(
+            "GET",
+            f"/api/v1/docs/search?q=confidential+internal+audit+exception&deduplicate=1&limit=13&_now_ts={base_ts + 7600}",
             headers=h0_spc,
         )
         records.append(
             (
-                "delegation_active_specialist",
-                (st_del_c, del_c_res.get("affected"), st_spc_in, spc_in_res.get("returned_count")),
+                "delegation_2hop_windows_specialist",
+                (
+                    spc_pre.get("returned_count"),
+                    spc_in.get("returned_count"),
+                    spc_up_exp.get("returned_count"),
+                ),
+            )
+        )
+
+        # 动态验证一级受托人 researcher 发起二级转借调给 viewer（成功），以及二级受托人 viewer 试图发起第 3 跳借调（403 拒绝）
+        st_sub_ok, _, sub_ok_res = gw.request(
+            "POST",
+            f"/api/v1/admin/delegations?_now_ts={base_ts + 240}",
+            headers=h0_res,
+            body={
+                "grantor_user_id": t0_info["users"]["researcher"]["user_id"],
+                "grantee_user_id": t0_info["users"]["viewer"]["user_id"],
+                "delegated_role": "SENIOR_AUDITOR",
+                "starts_at": base_ts + 250,
+                "expires_at": base_ts + 1400,
+                "action": "create",
+            },
+        )
+        st_hop3_rej, _, _ = gw.request(
+            "POST",
+            f"/api/v1/admin/delegations?_now_ts={base_ts + 260}",
+            headers=h0_vw,
+            body={
+                "grantor_user_id": t0_info["users"]["viewer"]["user_id"],
+                "grantee_user_id": t0_info["users"]["analyst"]["user_id"],
+                "delegated_role": "SENIOR_AUDITOR",
+                "starts_at": base_ts + 260,
+                "expires_at": base_ts + 1000,
+                "action": "create",
+            },
+        )
+        _, _, vw_2hop_res = gw.request(
+            "GET",
+            f"/api/v1/docs/search?q=internal+audit+exception+remediation&deduplicate=0&limit=14&_now_ts={base_ts + 280}",
+            headers=h0_vw,
+        )
+        gw.request(
+            "POST",
+            f"/api/v1/admin/delegations?_now_ts={base_ts + 290}",
+            headers=h0_res,
+            body={
+                "grantor_user_id": t0_info["users"]["researcher"]["user_id"],
+                "grantee_user_id": t0_info["users"]["viewer"]["user_id"],
+                "delegated_role": "SENIOR_AUDITOR",
+                "starts_at": base_ts + 250,
+                "expires_at": base_ts + 1400,
+                "action": "revoke",
+            },
+        )
+        records.append(
+            (
+                "delegation_dynamic_2hop_and_hop3_limit",
+                (st_sub_ok, sub_ok_res.get("affected"), st_hop3_rej, vw_2hop_res.get("returned_count")),
             )
         )
 
@@ -263,7 +320,7 @@ def _collect_b1_outputs(workspace_dir: pathlib.Path, cfg: dict[str, Any]) -> lis
                         "Operational scope: settlement clearing nostro vostro escrow chargeback velocity beneficiary."
                     ),
                     "updated_at": base_ts + 300,
-                    "citations": ["ref_live_1", "ref_live_2"],
+                    "citations": ["ref_live_1", "ref_live_1", live_doc_id, f"doc_{sl}_0001", f"doc_{sl}_nonexistent_999"],
                 },
             )
             _, _, s_up1 = gw.request(
@@ -333,12 +390,24 @@ def _collect_b1_outputs(workspace_dir: pathlib.Path, cfg: dict[str, Any]) -> lis
                 )
             )
 
-        # 5. 文档隔离与恢复闭环（3 租户）
+        # 5. 文档隔离与恢复闭环 + 跨文档内部引用（doc_{slug}_0006 引用 doc_{slug}_0002）动态剥离与恢复核验（3 租户）
         for tid in tenant_ids:
             t_info = manifest["tenants"][tid]
             slug = t_info["slug"]
             target_doc = f"doc_{slug}_0002"
+            dependent_doc = f"doc_{slug}_0006"
             h_adm = _headers(tid, t_info["users"]["admin"])
+
+            _, _, s_pre_q = gw.request(
+                "GET",
+                "/api/v1/docs/search?q=asset+freeze+designated&deduplicate=0&limit=50",
+                headers=h_adm,
+            )
+            dep_pre = next(
+                ((d["citation_count"], d["score"]) for d in (s_pre_q.get("items") or []) if d["doc_id"] == dependent_doc),
+                None,
+            )
+
             st_q1, _, _ = gw.request(
                 "POST",
                 "/api/v1/docs/quarantine",
@@ -351,6 +420,16 @@ def _collect_b1_outputs(workspace_dir: pathlib.Path, cfg: dict[str, Any]) -> lis
                 headers=h_adm,
             )
             in_mid = any(d["doc_id"] == target_doc for d in (s_mid.get("items") or []))
+            _, _, s_dep_mid = gw.request(
+                "GET",
+                "/api/v1/docs/search?q=asset+freeze+designated&deduplicate=0&limit=50",
+                headers=h_adm,
+            )
+            dep_mid = next(
+                ((d["citation_count"], d["score"]) for d in (s_dep_mid.get("items") or []) if d["doc_id"] == dependent_doc),
+                None,
+            )
+
             st_q2, _, _ = gw.request(
                 "POST",
                 "/api/v1/docs/quarantine",
@@ -363,7 +442,21 @@ def _collect_b1_outputs(workspace_dir: pathlib.Path, cfg: dict[str, Any]) -> lis
                 headers=h_adm,
             )
             in_after = any(d["doc_id"] == target_doc for d in (s_after.get("items") or []))
-            records.append((f"quarantine_cycle_{tid}", (st_q1, in_mid, st_q2, in_after)))
+            _, _, s_dep_after = gw.request(
+                "GET",
+                "/api/v1/docs/search?q=asset+freeze+designated&deduplicate=0&limit=50",
+                headers=h_adm,
+            )
+            dep_after = next(
+                ((d["citation_count"], d["score"]) for d in (s_dep_after.get("items") or []) if d["doc_id"] == dependent_doc),
+                None,
+            )
+            records.append(
+                (
+                    f"quarantine_and_citation_cascade_{tid}",
+                    (st_q1, in_mid, dep_pre, dep_mid, st_q2, in_after, dep_after),
+                )
+            )
 
         # 6. 策略更新 + 动态制裁名单维护 + 融合 1/2/3 跳传染、动态滑窗中位数突变、主权央行清算豁免的批次风控评估
         rng = random.Random(seed + 99)
@@ -484,6 +577,7 @@ def _collect_b1_outputs(workspace_dir: pathlib.Path, cfg: dict[str, Any]) -> lis
                     r["risk_score"],
                     r["decision"],
                     r["sanction_hop"],
+                    r.get("alert_dispatched"),
                     r["window"]["tx_count"],
                     r["window"]["amount_cents"],
                     r["window"]["unique_counterparties"],
@@ -494,7 +588,7 @@ def _collect_b1_outputs(workspace_dir: pathlib.Path, cfg: dict[str, Any]) -> lis
             ]
             records.append((f"eval_batch_{tid}", (st_ev, ev_res.get("decision_counts"), ev_digest)))
 
-            sample_dec = f"dec_tx_b1_{slug}_sp3"
+            sample_dec = f"dec_tx_b1_{slug}_sp1"
             st_d, _, d_res = gw.request("GET", f"/api/v1/risk/decisions/{sample_dec}", headers=h_aud)
             records.append(
                 (
@@ -504,6 +598,7 @@ def _collect_b1_outputs(workspace_dir: pathlib.Path, cfg: dict[str, Any]) -> lis
                         d_res.get("risk_score"),
                         d_res.get("decision"),
                         d_res.get("sanction_hop"),
+                        d_res.get("alert_dispatched"),
                         d_res.get("window"),
                     ),
                 )
@@ -674,6 +769,89 @@ def _collect_b1_outputs(workspace_dir: pathlib.Path, cfg: dict[str, Any]) -> lis
             )
             records.append((f"snapshot_{tid}", (st_sn, sn_out.get("data"))))
 
+        # 9. 高危 REJECT 实时告警配额耗尽降级与跨池调拨补给恢复闭环核验
+        _, _, probe_alert = gw.request(
+            "POST",
+            f"/api/v1/quotas/consume?_now_ts={base_ts + 900}",
+            headers=h0_adm,
+            body={"quota_type": "REALTIME_ALERT_POOL", "amount": 99999},
+        )
+        cur_alert_rem = int(probe_alert.get("remaining_quota", 0))
+        if cur_alert_rem > 1:
+            gw.request(
+                "POST",
+                f"/api/v1/quotas/consume?_now_ts={base_ts + 901}",
+                headers=h0_adm,
+                body={"quota_type": "REALTIME_ALERT_POOL", "amount": cur_alert_rem - 1},
+            )
+        deplete_batch = [
+            {
+                "tx_id": f"tx_b1_alert_dep_{idx}",
+                "account_id": f"acct_{t0_slug}_alert_chk",
+                "counterparty_id": t0_info["sanctioned_entity"],
+                "amount_cents": 700000,
+                "currency": "USD",
+                "channel": "CRYPTO_BRIDGE",
+                "contact_email": f"alert{idx}@{t0_slug}-bank.com",
+                "ts": base_ts + 910 + idx,
+                "metadata": {},
+            }
+            for idx in range(2)
+        ]
+        st_dep, _, dep_res = gw.request(
+            "POST",
+            "/api/v1/risk/evaluate-batch",
+            headers=h0_aud,
+            body={"batch_id": "b1_alert_deplete", "transactions": deplete_batch},
+        )
+        dep_summary = [
+            (r["decision"], r.get("alert_dispatched"), tuple(r["reasons"]))
+            for r in (dep_res.get("results") or [])
+        ]
+
+        st_refill, _, _ = gw.request(
+            "POST",
+            f"/api/v1/quotas/transfer?_now_ts={base_ts + 915}",
+            headers=h0_adm,
+            body={"from_quota": "RESERVE_BUFFER_POOL", "to_quota": "REALTIME_ALERT_POOL", "amount": 2},
+        )
+        st_rec, _, rec_res = gw.request(
+            "POST",
+            "/api/v1/risk/evaluate-batch",
+            headers=h0_aud,
+            body={
+                "batch_id": "b1_alert_refill",
+                "transactions": [
+                    {
+                        "tx_id": "tx_b1_alert_rec_0",
+                        "account_id": f"acct_{t0_slug}_alert_chk",
+                        "counterparty_id": t0_info["sanctioned_entity"],
+                        "amount_cents": 720000,
+                        "currency": "USD",
+                        "channel": "CRYPTO_BRIDGE",
+                        "contact_email": f"alertrec@{t0_slug}-bank.com",
+                        "ts": base_ts + 920,
+                        "metadata": {},
+                    }
+                ],
+            },
+        )
+        rec_r0 = (rec_res.get("results") or [{}])[0]
+        records.append(
+            (
+                "alert_pool_deplete_and_refill_alpha",
+                (
+                    st_dep,
+                    dep_summary,
+                    st_refill,
+                    st_rec,
+                    rec_r0.get("decision"),
+                    rec_r0.get("alert_dispatched"),
+                    tuple(rec_r0.get("reasons") or []),
+                ),
+            )
+        )
+
         return records
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -778,8 +956,10 @@ def _measure_single_workspace_perf(
             "outbound personal financial security contract",
         ]
         num_queries = int(wl["perf_search_queries"])
-        num_upserts = int(wl.get("perf_interleaved_upserts", 6))
+        num_upserts = int(wl.get("perf_interleaved_upserts", 8))
+        num_acl_flips = int(wl.get("perf_interleaved_acl_flips", 4))
         upsert_every = max(2, num_queries // max(1, num_upserts))
+        acl_every = max(3, num_queries // max(1, num_acl_flips))
         batch_size = int(wl["perf_batch_eval_size"])
         channels = ["WIRE_INTL", "CRYPTO_BRIDGE", "CARD_CNP", "ACH_BATCH", "POS_CHIP"]
 
@@ -790,17 +970,22 @@ def _measure_single_workspace_perf(
             tx_list = []
             for k in range(batch_size):
                 acct = f"acct_{slug}_{(k % 20) + 1:03d}"
-                cp = f"bridge_{slug}_h1" if (k % 9 == 0) else (
-                    f"SOV_CB_BIS_{k % 3}" if (k % 11 == 0) else f"cp_p_{(k % 30) + 1:02d}"
-                )
+                if k % 15 == 0:
+                    cp = t_info["sanctioned_entity"]
+                elif k % 9 == 0:
+                    cp = f"bridge_{slug}_h1"
+                elif k % 11 == 0:
+                    cp = f"SOV_CB_BIS_{k % 3}"
+                else:
+                    cp = f"cp_p_{(k % 30) + 1:02d}"
                 tx_list.append(
                     {
                         "tx_id": f"tx_perf_a1_{slug}_{b_idx}_{k:04d}",
                         "account_id": acct,
                         "counterparty_id": cp,
-                        "amount_cents": 50000 + ((k * 37 + b_idx * 19) % 40) * 25000,
+                        "amount_cents": (720000 if k % 15 == 0 else (50000 + ((k * 37 + b_idx * 19) % 40) * 25000)),
                         "currency": "USD",
-                        "channel": channels[k % len(channels)],
+                        "channel": ("CRYPTO_BRIDGE" if k % 15 == 0 else channels[k % len(channels)]),
                         "contact_email": f"perf.acct{k % 50}@{slug}-fin.org",
                         "ts": base_ts + 100 + k * 10,
                         "metadata": {"region": "APAC", "seq": k},
@@ -814,6 +999,7 @@ def _measure_single_workspace_perf(
         t_a1_start = time.perf_counter()
 
         upsert_seq = 0
+        acl_seq = 0
         for q_i in range(num_queries):
             tid = tenant_ids[q_i % len(tenant_ids)]
             t_info = manifest["tenants"][tid]
@@ -838,10 +1024,28 @@ def _measure_single_workspace_perf(
                             f"escrow reconciliation live revision {upsert_seq}."
                         ),
                         "updated_at": base_ts + 50 + upsert_seq,
+                        "citations": [f"doc_{slug}_0002", f"ext_a1_{upsert_seq}"],
                     },
                 )
                 if st_u != 200:
                     raise RuntimeError(f"A1 interleaved upsert failed with status {st_u}")
+
+            if q_i > 0 and (q_i % acl_every == 0) and acl_seq < num_acl_flips:
+                acl_seq += 1
+                st_acl, _, _ = gw.request(
+                    "POST",
+                    f"/api/v1/admin/doc-acl?_now_ts={base_ts + 70 + acl_seq}",
+                    headers=_headers(tid, t_info["users"]["admin"]),
+                    body={
+                        "doc_id": f"doc_{slug}_0004",
+                        "subject_type": "USER",
+                        "subject_id": t_info["users"]["viewer"]["user_id"],
+                        "effect": "DENY",
+                        "active": bool(acl_seq % 2 == 1),
+                    },
+                )
+                if st_acl != 200:
+                    raise RuntimeError(f"A1 interleaved doc-acl failed with status {st_acl}")
 
             role = "admin" if (q_i % 4 == 0) else ("auditor" if q_i % 4 == 1 else ("specialist" if q_i % 4 == 2 else "analyst"))
             phrase = search_phrases[q_i % len(search_phrases)]
@@ -849,7 +1053,7 @@ def _measure_single_workspace_perf(
             sort_f = "score" if (q_i % 2 == 0) else "risk_weight"
             st, _, _ = gw.request(
                 "GET",
-                f"/api/v1/docs/search?q={phrase.replace(' ', '+')}&deduplicate={dedup}&sort_by={sort_f}&limit=20&_now_ts={base_ts + 80}",
+                f"/api/v1/docs/search?q={phrase.replace(' ', '+')}&deduplicate={dedup}&sort_by={sort_f}&limit=20&_now_ts={base_ts + 250 + q_i}",
                 headers=_headers(tid, t_info["users"][role]),
             )
             if st != 200:
@@ -900,10 +1104,10 @@ def _measure_single_workspace_perf(
                         {
                             "tx_id": f"tx_conc_{w_id}_{step}_{m}",
                             "account_id": f"acct_{w_slug}_{(m % 12) + 1:03d}",
-                            "counterparty_id": f"cp_c_{(m % 10) + 1:02d}",
-                            "amount_cents": 40000 + m * 10000,
+                            "counterparty_id": (w_info["sanctioned_entity"] if m == 5 else f"cp_c_{(m % 10) + 1:02d}"),
+                            "amount_cents": (680000 if m == 5 else (40000 + m * 10000)),
                             "currency": "USD",
-                            "channel": "CARD_CNP",
+                            "channel": ("CRYPTO_BRIDGE" if m == 5 else "CARD_CNP"),
                             "contact_email": f"conc.{w_id}.{m}@{w_slug}.org",
                             "ts": base_ts + 2000 + step * 20 + m,
                             "metadata": {"w": w_id},
@@ -920,8 +1124,8 @@ def _measure_single_workspace_perf(
                         with lat_lock:
                             errors_cnt += 1
                 elif w_id >= (n_threads * 3 // 4) and (step % 3 == 1):
-                    # 混合实时文档修订与跨池调拨
-                    if step % 2 == 1:
+                    # 混合实时文档修订、动态隔离墙切换与跨池调拨
+                    if step % 3 == 1:
                         st_u, _, _ = gw.request(
                             "POST",
                             f"/api/v1/docs/upsert?_now_ts={base_ts + 2500 + step}",
@@ -936,9 +1140,26 @@ def _measure_single_workspace_perf(
                                 "title": f"Concurrent Sanctions Notice {w_id}-{step}",
                                 "body": "blocked entity vessel embargo screening live concurrent update.",
                                 "updated_at": base_ts + 2500 + step,
+                                "citations": [f"doc_{w_slug}_0002"],
                             },
                         )
                         if st_u != 200:
+                            with lat_lock:
+                                errors_cnt += 1
+                    elif step % 2 == 0:
+                        st_acl_c, _, _ = gw.request(
+                            "POST",
+                            f"/api/v1/admin/doc-acl?_now_ts={base_ts + 2600 + step}",
+                            headers=_headers(w_tid, w_info["users"]["admin"]),
+                            body={
+                                "doc_id": f"doc_{w_slug}_0005",
+                                "subject_type": "USER",
+                                "subject_id": w_info["users"]["viewer"]["user_id"],
+                                "effect": "DENY",
+                                "active": bool(w_id % 2 == 0),
+                            },
+                        )
+                        if st_acl_c != 200:
                             with lat_lock:
                                 errors_cnt += 1
                     else:
@@ -987,17 +1208,28 @@ def _measure_single_workspace_perf(
             return local_ops
 
         t_conc_start = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=n_threads) as pool:
-            futs = [pool.submit(_worker, idx) for idx in range(n_threads)]
-            total_ops = sum(f.result() for f in futs)
+        a2_deadlocked = False
+        pool = ThreadPoolExecutor(max_workers=n_threads)
+        futs = [pool.submit(_worker, idx) for idx in range(n_threads)]
+        done, not_done = futures_wait(futs, timeout=20.0)
+        pool.shutdown(wait=False, cancel_futures=True)
         conc_elapsed = max(1e-5, time.perf_counter() - t_conc_start)
 
-        concurrent_rps = total_ops / conc_elapsed
-        sorted_reads = sorted(read_latencies_ms) if read_latencies_ms else [999.0]
-        p95_idx = min(len(sorted_reads) - 1, max(0, int(len(sorted_reads) * 0.95)))
-        p99_idx = min(len(sorted_reads) - 1, max(0, int(len(sorted_reads) * 0.99)))
-        conc_read_p95_ms = sorted_reads[p95_idx]
-        conc_read_p99_ms = sorted_reads[p99_idx]
+        if not_done:
+            a2_deadlocked = True
+            total_ops = max(1, sum(f.result() for f in done if not f.exception()))
+            errors_cnt = total_ops
+            concurrent_rps = 0.0
+            conc_read_p95_ms = 9999.0
+            conc_read_p99_ms = 9999.0
+        else:
+            total_ops = sum(f.result() for f in futs)
+            concurrent_rps = total_ops / conc_elapsed
+            sorted_reads = sorted(read_latencies_ms) if read_latencies_ms else [999.0]
+            p95_idx = min(len(sorted_reads) - 1, max(0, int(len(sorted_reads) * 0.95)))
+            p99_idx = min(len(sorted_reads) - 1, max(0, int(len(sorted_reads) * 0.99)))
+            conc_read_p95_ms = sorted_reads[p95_idx]
+            conc_read_p99_ms = sorted_reads[p99_idx]
 
         # 步骤 A2-3：跨租户全局大锁串行退化探针
         heavy_tid = tenant_ids[-1]
@@ -1047,15 +1279,24 @@ def _measure_single_workspace_perf(
             with lat_lock:
                 probe_read_ms.extend(samples)
 
-        with ThreadPoolExecutor(max_workers=6) as p_pool:
+        if a2_deadlocked:
+            probe_p80_ms = 9999.0
+            cross_block_ratio = 999.0
+        else:
+            p_pool = ThreadPoolExecutor(max_workers=6)
             p_futs = [p_pool.submit(_heavy_writer, i) for i in range(3)] + [
                 p_pool.submit(_light_reader, j) for j in range(3)
             ]
-            for pf in p_futs:
-                pf.result()
-
-        probe_p80_ms = sorted(probe_read_ms)[int(len(probe_read_ms) * 0.80)] if probe_read_ms else solo_read_median_ms
-        cross_block_ratio = probe_p80_ms / max(0.5, solo_read_median_ms)
+            _, p_not_done = futures_wait(p_futs, timeout=20.0)
+            p_pool.shutdown(wait=False, cancel_futures=True)
+            if p_not_done:
+                probe_p80_ms = 9999.0
+                cross_block_ratio = 999.0
+            else:
+                for pf in p_futs:
+                    pf.result()
+                probe_p80_ms = sorted(probe_read_ms)[int(len(probe_read_ms) * 0.80)] if probe_read_ms else solo_read_median_ms
+                cross_block_ratio = probe_p80_ms / max(0.5, solo_read_median_ms)
 
         # ---------- 阶段二（独立开启 tracemalloc 测量常驻堆内存预算与流式导出峰值，绝不干扰阶段一计时） ----------
         del gw
@@ -1065,7 +1306,15 @@ def _measure_single_workspace_perf(
             tracemalloc.stop()
         tracemalloc.start()
 
-        gw_mem = cand_server_fresh.create_gateway(db_path, storage_dir)
+        mem_db_path = db_path
+        if a2_deadlocked:
+            mem_db_path = tmp_dir / "perf_mem_isolated.db"
+            shutil.copy2(db_path, mem_db_path)
+            for ext in ("-wal", "-shm"):
+                src_ext = pathlib.Path(str(db_path) + ext)
+                if src_ext.is_file():
+                    shutil.copy2(src_ext, pathlib.Path(str(mem_db_path) + ext))
+        gw_mem = cand_server_fresh.create_gateway(mem_db_path, storage_dir)
         for tid in tenant_ids:
             ti = manifest["tenants"][tid]
             gw_mem.request(
@@ -1126,11 +1375,15 @@ def run_performance_benchmark(
     cfg: dict[str, Any],
 ) -> dict[str, Any]:
     """同机测量初始未优化模板与被测沙盒的性能对比指标。"""
-    tpl_sig = hashlib.sha256((template_dir / "aegis_app" / "server.py").read_bytes()).hexdigest()[:12]
+    tpl_sig = hashlib.sha256(
+        (template_dir / "aegis_app" / "server.py").read_bytes()
+        + (template_dir / "aegis_app" / "db.py").read_bytes()
+        + (template_dir / "aegis_app" / "rule_engine.py").read_bytes()
+    ).hexdigest()[:12]
     cache_key = hashlib.sha256(
         (tpl_sig + ":" + json.dumps(cfg["workload"], sort_keys=True)).encode("utf-8")
     ).hexdigest()[:16]
-    cal_file = pathlib.Path(tempfile.gettempdir()) / f"st_base_cal_v22_{cache_key}.json"
+    cal_file = pathlib.Path(tempfile.gettempdir()) / f"st_base_cal_v30_{cache_key}.json"
     base_m = _CACHED_BASE_PERF.get(cache_key)
     if base_m is None and cal_file.is_file():
         try:
