@@ -1,4 +1,4 @@
-# 信任域隔离与同仓流转协议（docs/protocol.md）
+# 信任域隔离与同仓流转协议（docs/protocol.md · xiaonuo-v3.0）
 
 ## 1. 两角色信任域划分
 
